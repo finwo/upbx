@@ -1,0 +1,33 @@
+[upbx]
+listen = 0.0.0.0:5060
+rtp_ports = 7000-7099
+daemonize = 0
+# locality = 4
+# emergency = 911
+# emergency = 112
+
+# [plugin:myplugin]
+# exec = /usr/bin/my-plugin-binary
+
+[trunk:mycarrier]
+host = sip.example.com
+port = 5060
+username = myuser
+password = mypass
+did = 15559876543
+# did = 15551234567
+cid = 15559876543
+# cid_name = My Company
+# pattern = ^00(.*)
+# replace = \1
+# pattern = ^0
+# replace = 31
+# overflow_timeout = 30
+# overflow_strategy = none
+# overflow_target =
+# user_agent = upbx/1.0
+# group = 1234
+
+[ext:100]
+# name = Front desk
+secret = my-secret

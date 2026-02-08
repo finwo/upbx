@@ -13,6 +13,8 @@ CPP:=g++
 
 FIND=$(shell which gfind find | head -1)
 SRC+=$(shell $(FIND) src/ -type f -name '*.c')
+# Exclude standalone test programs from main binary
+SRC:=$(filter-out src/AppModule/md5_test.c,$(SRC))
 
 INCLUDES:=
 
@@ -20,10 +22,9 @@ override CFLAGS?=-Wall -O2
 override CFLAGS+=-I src
 override LDFLAGS?=
 
-override CPPFLAGS?=
+override LDFLAGS+=-lresolv -pthread
 
-# override CFLAGS+=-D WEBVIEW_STATIC
-# override CFLAGS+=-D WINTERM
+override CPPFLAGS?=
 
 ifeq ($(OS),Windows_NT)
     # CFLAGS += -D WIN32
@@ -78,23 +79,6 @@ override CPPFLAGS+=$(CFLAGS)
 .PHONY: default
 default: $(BIN)
 
-# tool/bin2c/bin2c-${UNAME_SYSTEM}-${UNAME_MACHINE}:
-# 	bash -c "cd tool/bin2c && make"
-
-# tool/client-jerry/dist/index.js:
-# 	bash -c "cd $$(dirname $$(dirname $@)) && npm i && npm run build"
-
-# tool/overlay-chat/dist/index.bundled.html: tool/client-jerry/dist/index.js
-
-# htmltools:  $(htmltools)
-# $(htmltools):
-# 	bash -c "cd $$(dirname $$(dirname $@)) && npm i && npm run build"
-
-# headertools: $(headertools)
-# # $(headertools): tool/bin2c/bin2c-${UNAME_SYSTEM}-${UNAME_MACHINE} $(htmltools)
-# $(headertools): $(htmltools)
-# 	# tool/bin2c/bin2c-${UNAME_SYSTEM}-${UNAME_MACHINE} < $(@:.h=.html) > $@
-
 # .cc.o:
 # 	$(CPP) $< $(CPPFLAGS) -c -o $@
 
@@ -104,7 +88,11 @@ default: $(BIN)
 $(BIN): $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
+# MD5 test (single-file test program + md5.c)
+md5_test: src/AppModule/md5_test.o src/AppModule/md5.o
+	$(CC) $^ $(CFLAGS) -o $@
+
 .PHONY: clean
 clean:
-	rm -rf $(BIN)
+	rm -rf $(BIN) md5_test
 	rm -rf $(OBJ)
