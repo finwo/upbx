@@ -219,11 +219,15 @@ static int parse_digest_param(const char *val, size_t val_len, const char *key, 
   return 0;
 }
 
-int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, char **realm_out) {
+int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, char **realm_out,
+    char **algorithm_out, char **opaque_out, char **qop_out) {
   const char *val;
   size_t val_len;
   *nonce_out = NULL;
   *realm_out = NULL;
+  if (algorithm_out) *algorithm_out = NULL;
+  if (opaque_out) *opaque_out = NULL;
+  if (qop_out) *qop_out = NULL;
   if (!sip_header_get(buf, len, "WWW-Authenticate", &val, &val_len)) return 0;
   if (val_len < 7 || strncasecmp(val, "Digest ", 7) != 0) return 0;
   val += 7; val_len -= 7;
@@ -233,6 +237,12 @@ int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, ch
     *nonce_out = NULL;
     return 0;
   }
+  if (algorithm_out)
+    parse_digest_param(val, val_len, "algorithm", algorithm_out);
+  if (opaque_out)
+    parse_digest_param(val, val_len, "opaque", opaque_out);
+  if (qop_out)
+    parse_digest_param(val, val_len, "qop", qop_out);
   return 1;
 }
 

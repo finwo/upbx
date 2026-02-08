@@ -2,6 +2,10 @@
  * Trunk registration: SIP client sending periodic REGISTER to upstream trunks over UDP.
  * Runs as a neco coroutine; refresh interval from Contact expires (minus 15s) or default 1800s.
  * Uses minimal SIP parsing (no libosip2) and built-in MD5 for Digest auth.
+ * Digest auth follows RFC 3261 (section 22, HTTP auth) and RFC 2617 (Digest scheme):
+ * - digest uri = Request-URI from request line (same as REGISTER sip:...).
+ * - Match siproxd plugin_upbx.c: use RFC 2069 (no qop) for trunk registration, i.e. response =
+ *   MD5(HA1:nonce:HA2), and do not send nc, cnonce, qop. Many trunks work with this.
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -92,9 +96,10 @@ static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
   if (method) MD5_Update(&ctx, (unsigned char *)method, strlen(method));
   MD5_Update(&ctx, (unsigned char *)":", 1);
   if (uri) MD5_Update(&ctx, (unsigned char *)uri, strlen(uri));
-  if (qop && *qop) {
+  /* RFC 2617: for qop=auth-int only, HA2 = MD5(method:uri:MD5(entity)); for qop=auth, HA2 = MD5(method:uri) */
+  if (qop && strcasecmp(qop, "auth-int") == 0 && hentity) {
     MD5_Update(&ctx, (unsigned char *)":", 1);
-    MD5_Update(&ctx, hentity, HASHHEXLEN);
+    MD5_Update(&ctx, (unsigned char *)hentity, HASHHEXLEN);
   }
   MD5_Final(ha2, &ctx);
   cvt_hex(ha2, ha2hex);
@@ -102,13 +107,19 @@ static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
   MD5_Update(&ctx, ha1, HASHHEXLEN);
   MD5_Update(&ctx, (unsigned char *)":", 1);
   if (nonce) MD5_Update(&ctx, (unsigned char *)nonce, strlen(nonce));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (nc) MD5_Update(&ctx, (unsigned char *)nc, strlen(nc));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (cnonce) MD5_Update(&ctx, (unsigned char *)cnonce, strlen(cnonce));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (qop && *qop) MD5_Update(&ctx, (unsigned char *)qop, strlen(qop));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
+  if (qop && *qop) {
+    /* RFC 2617 with qop: request-digest = KD(H(A1), nonce ":" nc ":" cnonce ":" qop ":" H(A2)) */
+    MD5_Update(&ctx, (unsigned char *)":", 1);
+    if (nc) MD5_Update(&ctx, (unsigned char *)nc, strlen(nc));
+    MD5_Update(&ctx, (unsigned char *)":", 1);
+    if (cnonce) MD5_Update(&ctx, (unsigned char *)cnonce, strlen(cnonce));
+    MD5_Update(&ctx, (unsigned char *)":", 1);
+    MD5_Update(&ctx, (unsigned char *)qop, strlen(qop));
+    MD5_Update(&ctx, (unsigned char *)":", 1);
+  } else {
+    /* RFC 2069: request-digest = KD(H(A1), nonce ":" H(A2)) — need ":" before H(A2) (match siproxd auth.c) */
+    MD5_Update(&ctx, (unsigned char *)":", 1);
+  }
   MD5_Update(&ctx, ha2hex, HASHHEXLEN);
   MD5_Final(resphash, &ctx);
   cvt_hex(resphash, out);
@@ -119,6 +130,9 @@ typedef struct {
   time_t next_refresh;
   char *auth_nonce;
   char *auth_realm;
+  char *auth_algorithm;  /* From WWW-Authenticate; default MD5 */
+  char *auth_opaque;     /* Echo in Authorization if present */
+  char *auth_qop;        /* From WWW-Authenticate; if "auth" or "auth-int" use qop response, else RFC 2069 */
   char *call_id;  /* For matching 401 response when retrying */
 } trunk_state_t;
 
@@ -181,17 +195,20 @@ static size_t build_register(upbx_config *cfg, config_trunk *trunk, trunk_state_
       (trunk->user_agent && trunk->user_agent[0]) ? trunk->user_agent : "upbx/1.0");
 
   if (with_auth && state && state->auth_nonce && state->auth_realm && trunk->password && trunk->password[0]) {
-    HASHHEX cnonce, HA1, Response;
-    unsigned char cnonce_bin[16];
-    int i;
-    for (i = 0; i < 16; i++) cnonce_bin[i] = (unsigned char)(rand() & 0xff);
-    cvt_hex(cnonce_bin, cnonce);
-    digest_calc_ha1("MD5", user, state->auth_realm, trunk->password,
-        state->auth_nonce, (const char *)cnonce, HA1);
-    { HASHHEX hentity = ""; digest_calc_response(HA1, state->auth_nonce, "00000001", (const char *)cnonce, "auth", "REGISTER", uri_str, hentity, Response); }
+    const char *alg = (state->auth_algorithm && state->auth_algorithm[0]) ? state->auth_algorithm : "MD5";
+    /* Use RFC 2069 (no qop) for trunk, matching siproxd plugin_upbx.c: DigestCalcResponse(..., NULL, ...) */
+    HASHHEX HA1, Response;
+    digest_calc_ha1(alg, user, state->auth_realm, trunk->password,
+        state->auth_nonce, NULL, HA1);
+    { HASHHEX hentity = ""; digest_calc_response(HA1, state->auth_nonce, NULL, NULL, NULL, "REGISTER", uri_str, hentity, Response); }
+    /* uri in digest = Request-URI from request line (same as siproxd osip_uri_to_str(req_uri)) */
     p += snprintf(p, (size_t)(end - p),
-        "Authorization: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\",uri=\"%s\",response=\"%s\",cnonce=\"%s\",nc=00000001,qop=auth\r\n",
-        user, state->auth_realm, state->auth_nonce, uri_str, (char *)Response, (char *)cnonce);
+        "Authorization: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\",uri=\"%s\",response=\"%s\"",
+        user, state->auth_realm, state->auth_nonce, uri_str, (char *)Response);
+    if (alg && alg[0]) p += snprintf(p, (size_t)(end - p), ",algorithm=%s", alg);
+    if (state->auth_opaque && state->auth_opaque[0])
+      p += snprintf(p, (size_t)(end - p), ",opaque=\"%s\"", state->auth_opaque);
+    p += snprintf(p, (size_t)(end - p), "\r\n");
   }
 
   if (p >= end) { free(req); return 0; }
@@ -256,6 +273,8 @@ static int register_one_trunk(upbx_config *cfg, size_t trunk_idx, trunk_state_t 
       refresh = -1;
       break;
     }
+    log_trace("trunk_reg: sending %zu bytes to trunk %s (%s:%s)", req_len, trunk->name, trunk->host, port);
+    log_hexdump_trace(req_str, req_len);
     if (sendto(fd, req_str, req_len, 0, ai->ai_addr, ai->ai_addrlen) != (ssize_t)req_len) {
       free(req_str);
       refresh = -1;
@@ -304,16 +323,27 @@ static int register_one_trunk(upbx_config *cfg, size_t trunk_idx, trunk_state_t 
 
     log_trace("trunk_reg: response status_code=%d", status_code);
     if (status_code == 401 && !retried && trunk->password && trunk->password[0]) {
-      log_trace("trunk_reg: before parse_www_authenticate");
+      log_trace("trunk_reg: 401 received, parsing WWW-Authenticate");
       free(state->auth_nonce);
       free(state->auth_realm);
+      free(state->auth_algorithm);
+      free(state->auth_opaque);
+      free(state->auth_qop);
       state->auth_nonce = NULL;
       state->auth_realm = NULL;
-      if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm)) {
-        log_trace("trunk_reg: after parse_www_authenticate ok");
+      state->auth_algorithm = NULL;
+      state->auth_opaque = NULL;
+      state->auth_qop = NULL;
+      if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm,
+              &state->auth_algorithm, &state->auth_opaque, &state->auth_qop)) {
+        log_info("trunk %s: 401 parsed, retrying REGISTER with Digest (realm=%s, algorithm=%s, qop=%s)",
+            trunk->name, state->auth_realm ? state->auth_realm : "(none)",
+            state->auth_algorithm && state->auth_algorithm[0] ? state->auth_algorithm : "MD5",
+            state->auth_qop && state->auth_qop[0] ? state->auth_qop : "(none)");
+        retried = 1;
+        continue;
       }
-      retried = 1;
-      continue;
+      log_warn("trunk %s: 401 but could not parse WWW-Authenticate Digest", trunk->name);
     }
     if (status_code >= 200 && status_code < 300) {
       log_trace("trunk_reg: before get_contact_expires");

@@ -17,8 +17,9 @@ int sip_response_status_code(const char *buf, size_t len);
 /* Find first header with given name (case-insensitive). *value_out points into buf, *value_len_out is length (no NUL). Line folding is merged. Returns 1 if found, 0 otherwise. */
 int sip_header_get(const char *buf, size_t len, const char *name, const char **value_out, size_t *value_len_out);
 
-/* Parse WWW-Authenticate Digest; set *nonce_out and *realm_out (caller frees). Returns 1 if both found. */
-int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, char **realm_out);
+/* Parse WWW-Authenticate Digest; set *nonce_out and *realm_out (caller frees). Optional algorithm_out, opaque_out, qop_out (may be NULL). Returns 1 if nonce and realm found. */
+int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, char **realm_out,
+  char **algorithm_out, char **opaque_out, char **qop_out);
 
 /* Get expires from Contact header (expires= param) or Expires header. Returns seconds or 0 if not found. */
 int sip_response_contact_expires(const char *buf, size_t len);

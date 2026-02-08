@@ -81,7 +81,8 @@ static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
   if (method) MD5_Update(&ctx, (const unsigned char *)method, strlen(method));
   MD5_Update(&ctx, (const unsigned char *)":", 1);
   if (uri) MD5_Update(&ctx, (const unsigned char *)uri, strlen(uri));
-  if (qop && *qop) {
+  /* RFC 2617: for qop=auth-int only, HA2 = MD5(method:uri:MD5(entity)); for qop=auth, HA2 = MD5(method:uri) */
+  if (qop && strcasecmp(qop, "auth-int") == 0 && hentity) {
     MD5_Update(&ctx, (const unsigned char *)":", 1);
     MD5_Update(&ctx, (const unsigned char *)hentity, HASHHEXLEN);
   }
@@ -107,8 +108,9 @@ static char *auth_generate_nonce(void) {
   static char nonce[48];
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
-  snprintf(nonce, sizeof(nonce), "\"%lx%lx%x\"",
-      (long)ts.tv_sec, (long)ts.tv_nsec, rand());
+  /* Unquoted so digest calculation uses the same value we send and we parse back */
+  snprintf(nonce, sizeof(nonce), "%lx%lx%x",
+      (long)ts.tv_sec, (long)ts.tv_nsec, (unsigned)rand());
   return nonce;
 }
 
@@ -129,9 +131,9 @@ static int reg_mutex_initialized;
 
 /* Build WWW-Authenticate header line for 401. Caller frees. */
 static char *build_www_authenticate(void) {
-  char *nonce = auth_generate_nonce();
+  const char *nonce = auth_generate_nonce();
   char *out = NULL;
-  if (asprintf(&out, "WWW-Authenticate: Digest realm=\"%s\", nonce=%s", AUTH_REALM, nonce) < 0)
+  if (asprintf(&out, "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\"", AUTH_REALM, nonce) < 0)
     return NULL;
   return out;
 }
@@ -1161,6 +1163,8 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
     return;
   }
+  log_trace("sip_server: sending %zu bytes to trunk %s (%s:%s)", send_len, trunk->name, trunk->host, port);
+  log_hexdump_trace(send_buf, send_len);
   udp_send_to(ctx->sockfd, res->ai_addr, res->ai_addrlen, send_buf, send_len);
   free(rewritten_buf);
   freeaddrinfo(res);
