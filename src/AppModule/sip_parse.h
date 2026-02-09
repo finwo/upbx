@@ -6,16 +6,17 @@
 /* Siproxd-style raw checks before parsing. Buffer must be \0-terminated. Returns 1 if ok, 0 to reject. */
 int sip_security_check_raw(char *sip_buffer, size_t size);
 
-/* In-place fixup: Asterisk Alert-Info removal, tag=<null>->tag=0, trim trailing blank line, ensure last header ends with CRLF. *len and buf_size in bytes. */
-void sip_fixup_for_parse(char *buf, size_t *len, size_t buf_size);
-
-/* Minimal SIP response parser (no libosip2). Buffer is the raw response (e.g. "SIP/2.0 401 Unauthorized\r\n..."). */
-
 /* Parse status code from first line (SIP/2.0 <code> ...). Returns 0 on parse error. */
 int sip_response_status_code(const char *buf, size_t len);
 
+/* Copy reason phrase from first line (after status code) into out, NUL-terminated. out_size > 0. Returns 1 on success. */
+int sip_response_reason_phrase(const char *buf, size_t len, char *out, size_t out_size);
+
 /* Find first header with given name (case-insensitive). *value_out points into buf, *value_len_out is length (no NUL). Line folding is merged. Returns 1 if found, 0 otherwise. */
 int sip_header_get(const char *buf, size_t len, const char *name, const char **value_out, size_t *value_len_out);
+
+/* Copy first header value into out, NUL-terminated. out_size > 0. Returns 1 if found. */
+int sip_header_copy(const char *buf, size_t len, const char *name, char *out, size_t out_size);
 
 /* Parse WWW-Authenticate Digest; set *nonce_out and *realm_out (caller frees). Optional algorithm_out, opaque_out, qop_out (may be NULL). Returns 1 if nonce and realm found. */
 int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, char **realm_out,
@@ -35,14 +36,51 @@ int sip_parse_authorization_digest(const char *buf, size_t len,
   char **nc_out, char **qop_out, char **uri_out, char **response_out);
 int sip_header_uri_user(const char *buf, size_t len, const char *header_name, char *user_out, size_t user_size);
 
-/* Build response from request; extra_headers is array of "Name: value" strings. Caller frees. If out_len non-NULL, set to length. */
-char *sip_build_response(const char *request_buf, size_t request_len, int status_code, const char *reason_phrase,
-  int copy_contact, const char **extra_headers, size_t n_extra, size_t *out_len);
+/* Split "host" or "host:port" into host and port. If no ':', port set to "5060". */
+int sip_parse_host_port(const char *host_port, char *host_out, size_t host_size, char *port_out, size_t port_size);
+
+/* Format Request-URI into out: sip:user@host[:port] or sip:host[:port]. port omitted if NULL or "5060". out_size > 0. Returns 1 on success. */
+int sip_format_request_uri(const char *user, const char *host, const char *port, char *out, size_t out_size);
+
+/* Format header values (no "Contact: " prefix). port omitted if NULL or "5060". */
+int sip_wrap_angle_uri(const char *uri, char *out, size_t out_size);
+int sip_format_contact_uri_value(const char *user, const char *host, const char *port, char *out, size_t out_size);
+int sip_format_from_to_value(const char *display, const char *user, const char *host, const char *port, char *out, size_t out_size);
+
+/* Build full "WWW-Authenticate: Digest ..." line for 401. Caller frees. */
+char *sip_build_www_authenticate(const char *realm, const char *nonce);
+
+/* Header value helpers: value before first ';', get param (e.g. tag), append ";tag=value". */
+int sip_header_value_before_first_param(const char *buf, size_t len, const char *header_name, char *out, size_t out_size);
+int sip_header_get_param(const char *buf, size_t len, const char *header_name, const char *param_name, char *out, size_t out_size);
+int sip_append_tag_param(char *out, size_t out_size, const char *tag_value);
+
+/* Build Authorization Digest header value. response_hex = 32-char MD5 hex. algorithm/opaque NULL = omit. */
+int sip_build_authorization_digest_value(const char *user, const char *realm, const char *nonce, const char *uri,
+  const char *response_hex, const char *algorithm, const char *opaque, char *out, size_t out_size);
+
+/* Build REGISTER request. All args header values. auth_value NULL = no Authorization. Caller frees. */
+char *sip_build_register_request(const char *request_uri, const char *via_value, const char *to_val, const char *from_val,
+  const char *call_id, const char *cseq, const char *contact_val, int expires, int max_forwards, const char *user_agent,
+  const char *auth_value, size_t *out_len);
+
+/* Build response from explicit parts (no copy from request). All args = header values only (no "Via: " prefix). NULL = omit.
+ * Via is normalised internally (full "Via: ..." line accepted). extra_headers = "Name: value" lines. Caller frees. */
+char *sip_build_response_parts(int status_code, const char *reason,
+  const char *via_val, const char *from_val, const char *to_val,
+  const char *call_id, const char *cseq_val, const char *contact_val, const char *user_agent,
+  const char *body, size_t body_len,
+  const char **extra_headers, size_t n_extra, size_t *out_len);
+
+/* Write Via header value only into out (no "Via: " prefix, no CRLF). Same contract as sip_header_copy(..., "Via", ...). */
+int sip_make_via_line(const char *host, const char *port, char *out, size_t out_size);
+
+/* Build SIP request from parts. method and request_uri required. Via/From/To/etc = header values only. Caller frees. */
+char *sip_build_request_parts(const char *method, const char *request_uri,
+  const char *via_val, const char *from_val, const char *to_val,
+  const char *call_id, const char *cseq_val, const char *contact_val,
+  const char *body, size_t body_len, size_t *out_len);
 
 int sip_request_get_body(const char *buf, size_t len, const char **body_out, size_t *body_len_out);
-char *sip_request_replace_uri(const char *buf, size_t len, const char *user, const char *host, const char *port);
-char *sip_request_add_via(const char *buf, size_t len, const char *host, const char *port);
-char *sip_request_replace_body(const char *buf, size_t len, const char *new_body, size_t new_body_len);
-char *sip_response_strip_first_via(const char *buf, size_t len);
 
 #endif

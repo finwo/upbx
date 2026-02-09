@@ -154,6 +154,9 @@ void rtp_relay_poll(fd_set *read_set) {
     int fd1 = rtp_table[i].rtp_rx_sock;
     int fd2 = rtp_table[i].rtp_con_rx_sock;
     if (FD_ISSET(fd1, read_set) && rtp_table[i].rtp_tx_sock > 0) {
+      /* Skip forward if remote not yet set (e.g. OUTGOING leg allocated before 200 OK) */
+      if (rtp_table[i].remote_port <= 0 || rtp_table[i].remote_ipaddr.s_addr == 0)
+        goto next_rtp;
       ssize_t count = read(fd1, buf, sizeof(buf));
       if (count > 0) {
         struct sockaddr_in dst;
@@ -168,7 +171,8 @@ void rtp_relay_poll(fd_set *read_set) {
           rtp_table[rtp_table[i].opposite_entry].timestamp = now;
       }
     }
-    if (FD_ISSET(fd2, read_set) && rtp_table[i].rtp_con_tx_sock > 0) {
+    if (FD_ISSET(fd2, read_set) && rtp_table[i].rtp_con_tx_sock > 0 &&
+        rtp_table[i].remote_port > 0 && rtp_table[i].remote_ipaddr.s_addr != 0) {
       ssize_t count = read(fd2, buf, sizeof(buf));
       if (count > 0) {
         struct sockaddr_in dst;
@@ -180,6 +184,7 @@ void rtp_relay_poll(fd_set *read_set) {
                (struct sockaddr *)&dst, sizeof(dst));
       }
     }
+ next_rtp: (void)0;
   }
   if (now > last_aging) {
     last_aging = now + 10;

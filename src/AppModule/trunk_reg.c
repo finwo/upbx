@@ -140,86 +140,68 @@ typedef struct {
 
 #define TRUNK_UDP_RECV_TIMEOUT_SEC  10
 
-#define REGISTER_BUF_SIZE 4096
-
 static upbx_config *trunk_reg_cfg;
 static trunk_state_t *trunk_states;
 static size_t trunk_states_n;
 
-/* Build REGISTER request as raw SIP string. Caller frees returned buffer. Returns length or 0 on error. */
+/* Build REGISTER request using sip_parse (all wire formatting there). Caller frees returned buffer. Returns length or 0 on error. */
 static size_t build_register(upbx_config *cfg, config_trunk *trunk, trunk_state_t *state,
     int with_auth, char **out_request) {
   log_trace("%s", __func__);
-  char *req = malloc(REGISTER_BUF_SIZE);
-  if (!req) return 0;
-  char *p = req;
-  char *end = req + REGISTER_BUF_SIZE - 2;
   const char *host = trunk->host;
   const char *port = (trunk->port && trunk->port[0]) ? trunk->port : "5060";
-  time_t now = time(NULL);
-  char uri_str[512];
-  char contact_str[256];
   const char *user = (trunk->username && trunk->username[0]) ? trunk->username : "";
 
-  if (trunk->username && trunk->username[0])
-    snprintf(uri_str, sizeof(uri_str), "sip:%s@%s", trunk->username, host);
-  else
-    snprintf(uri_str, sizeof(uri_str), "sip:%s", host);
-  if (strcmp(port, "5060") != 0) {
-    size_t ulen = strlen(uri_str);
-    snprintf(uri_str + ulen, sizeof(uri_str) - ulen, ":%s", port);
+  char uri_str[512], via_buf[256], to_val[512], from_val[512], contact_val[256], auth_val[512];
+  uri_str[0] = via_buf[0] = to_val[0] = from_val[0] = contact_val[0] = auth_val[0] = '\0';
+
+  sip_format_request_uri(user, host, port, uri_str, sizeof(uri_str));
+  sip_make_via_line(host, port, via_buf, sizeof(via_buf));
+  sip_wrap_angle_uri(uri_str, to_val, sizeof(to_val));
+  {
+    size_t n = strlen(to_val);
+    if (n < sizeof(from_val) - 16) {
+      memcpy(from_val, to_val, n + 1);
+      char tag_str[24];
+      snprintf(tag_str, sizeof(tag_str), "%ld", (long)rand());
+      sip_append_tag_param(from_val, sizeof(from_val), tag_str);
+    }
   }
 
-  p += snprintf(p, (size_t)(end - p), "REGISTER %s SIP/2.0\r\n", uri_str);
-  p += snprintf(p, (size_t)(end - p), "Via: SIP/2.0/UDP %s:%s;branch=z9hG4bK%ld%ld\r\n", host, port, (long)now, (long)rand());
-  p += snprintf(p, (size_t)(end - p), "To: <%s>\r\n", uri_str);
-  p += snprintf(p, (size_t)(end - p), "From: <%s>;tag=%ld\r\n", uri_str, (long)rand());
-  {
-    char cid[128];
-    if (with_auth && state && state->call_id && state->call_id[0]) {
-      snprintf(cid, sizeof(cid), "%s", state->call_id);
-    } else {
-      snprintf(cid, sizeof(cid), "%ld%ld@%s", (long)now, (long)rand(), host);
-      if (state) {
-        free(state->call_id);
-        state->call_id = strdup(cid);
-      }
+  char call_id[128];
+  if (with_auth && state && state->call_id && state->call_id[0]) {
+    strncpy(call_id, state->call_id, sizeof(call_id) - 1);
+    call_id[sizeof(call_id) - 1] = '\0';
+  } else {
+    time_t now = time(NULL);
+    snprintf(call_id, sizeof(call_id), "%ld%ld@%s", (long)now, (long)rand(), host);
+    if (state) {
+      free(state->call_id);
+      state->call_id = strdup(call_id);
     }
-    p += snprintf(p, (size_t)(end - p), "Call-ID: %s\r\n", cid);
   }
-  p += snprintf(p, (size_t)(end - p), "CSeq: 1 REGISTER\r\n");
-  {
-    const char *listen = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
-    const char *contact_user = (trunk->username && trunk->username[0]) ? trunk->username : "upbx";
-    snprintf(contact_str, sizeof(contact_str), "<sip:%s@%s>", contact_user, listen);
-    p += snprintf(p, (size_t)(end - p), "Contact: %s\r\n", contact_str);
-  }
-  p += snprintf(p, (size_t)(end - p), "Expires: %d\r\n", TRUNK_REG_DEFAULT_REFRESH + TRUNK_REG_REFRESH_LEAD);
-  p += snprintf(p, (size_t)(end - p), "Max-Forwards: 70\r\n");
-  p += snprintf(p, (size_t)(end - p), "User-Agent: %s\r\n",
-      (trunk->user_agent && trunk->user_agent[0]) ? trunk->user_agent : "upbx/1.0");
+
+  const char *listen = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
+  char listen_host[256], listen_port[32];
+  if (sip_parse_host_port(listen, listen_host, sizeof(listen_host), listen_port, sizeof(listen_port)))
+    sip_format_contact_uri_value((trunk->username && trunk->username[0]) ? trunk->username : "upbx", listen_host, listen_port, contact_val, sizeof(contact_val));
 
   if (with_auth && state && state->auth_nonce && state->auth_realm && trunk->password && trunk->password[0]) {
     const char *alg = (state->auth_algorithm && state->auth_algorithm[0]) ? state->auth_algorithm : "MD5";
-    /* Use RFC 2069 (no qop) for trunk, matching siproxd plugin_upbx.c: DigestCalcResponse(..., NULL, ...) */
     HASHHEX HA1, Response;
-    digest_calc_ha1(alg, user, state->auth_realm, trunk->password,
-        state->auth_nonce, NULL, HA1);
+    digest_calc_ha1(alg, user, state->auth_realm, trunk->password, state->auth_nonce, NULL, HA1);
     { HASHHEX hentity = ""; digest_calc_response(HA1, state->auth_nonce, NULL, NULL, NULL, "REGISTER", uri_str, hentity, Response); }
-    /* uri in digest = Request-URI from request line (same as siproxd osip_uri_to_str(req_uri)) */
-    p += snprintf(p, (size_t)(end - p),
-        "Authorization: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\",uri=\"%s\",response=\"%s\"",
-        user, state->auth_realm, state->auth_nonce, uri_str, (char *)Response);
-    if (alg && alg[0]) p += snprintf(p, (size_t)(end - p), ",algorithm=%s", alg);
-    if (state->auth_opaque && state->auth_opaque[0])
-      p += snprintf(p, (size_t)(end - p), ",opaque=\"%s\"", state->auth_opaque);
-    p += snprintf(p, (size_t)(end - p), "\r\n");
+    sip_build_authorization_digest_value(user, state->auth_realm, state->auth_nonce, uri_str, (const char *)Response, alg, state->auth_opaque, auth_val, sizeof(auth_val));
   }
 
-  if (p >= end) { free(req); return 0; }
-  p += snprintf(p, (size_t)(end - p), "\r\n");
+  const char *ua = (trunk->user_agent && trunk->user_agent[0]) ? trunk->user_agent : "upbx/1.0";
+  size_t req_len = 0;
+  char *req = sip_build_register_request(uri_str, via_buf, to_val, from_val, call_id, "1 REGISTER",
+    contact_val[0] ? contact_val : NULL, TRUNK_REG_DEFAULT_REFRESH + TRUNK_REG_REFRESH_LEAD, 70, ua,
+    auth_val[0] ? auth_val : NULL, &req_len);
+  if (!req) return 0;
   *out_request = req;
-  return (size_t)(p - req);
+  return req_len;
 }
 
 /* Start registration for one trunk: create socket, send REGISTER, set state to waiting. Returns 0 on success. */
@@ -364,7 +346,6 @@ void trunk_reg_poll(fd_set *read_set) {
     size_t buflen = (size_t)n;
     if (!looks_like_sip(buf, buflen)) continue;
     if (buflen >= 12 && memcmp(buf, "SIP/2.0 100 ", 12) == 0) continue;
-    sip_fixup_for_parse(buf, &buflen, SIP_READ_BUF_SIZE);
     if (!sip_security_check_raw(buf, buflen)) continue;
     log_hexdump_trace(buf, buflen);
     if (sip_response_status_code(buf, buflen) == 100) continue;

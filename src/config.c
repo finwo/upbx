@@ -142,6 +142,11 @@ static int handler(void *user, const char *section, const char *name, const char
       cfg->listen = STRDUP(val);
       return 1;
     }
+    if (strcmp(key, "advertise") == 0) {
+      free(cfg->advertise);
+      cfg->advertise = STRDUP(val);
+      return 1;
+    }
     if (strcmp(key, "rtp_ports") == 0) {
       int low = 0, high = 0;
       if (sscanf(val, "%d-%d", &low, &high) == 2 && low > 0 && high >= low) {
@@ -285,6 +290,7 @@ void config_init(upbx_config *cfg) {
 
 void config_free(upbx_config *cfg) {
   free(cfg->listen);
+  free(cfg->advertise);
   for (size_t i = 0; i < cfg->emergency_count; i++)
     free(cfg->emergency[i]);
   free(cfg->emergency);

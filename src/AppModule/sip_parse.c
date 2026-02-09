@@ -43,91 +43,6 @@ int sip_security_check_raw(char *sip_buffer, size_t size) {
   return 1;
 }
 
-/* Single in-place fixup so osip_message_parse does not crash. Does: drop header lines with no ':',
- * Asterisk Alert-Info removal, tag=<null> -> tag=0, trim trailing blank line, ensure last header ends with CRLF. */
-void sip_fixup_for_parse(char *buf, size_t *len, size_t buf_size) {
-  size_t o = *len;
-  size_t j;
-  size_t i;
-  char *p;
-  char *eol;
-  size_t tail_len;
-  size_t line_start, line_end, line_content_len;
-  int has_colon;
-
-  /* Unfold SIP continuation lines (\r\n followed by space/tab): merge into previous line so libosip2 never sees a line with no colon (-> hname=NULL -> strcmp crash). */
-  for (j = 0; j + 2 < o; j++) {
-    if (buf[j] == '\r' && buf[j + 1] == '\n' && (buf[j + 2] == ' ' || buf[j + 2] == '\t')) {
-      memmove(buf + j, buf + j + 2, o - (j + 2));
-      o -= 2;
-      j--; /* re-check this position (could be another LWS) */
-    }
-  }
-
-  /* Drop any header line (after the status line) that still has no ':' (defensive). */
-  p = (char *)memchr(buf, '\n', o);
-  i = p ? (size_t)(p + 1 - buf) : o; /* skip status line */
-  while (i < o) {
-    p = (char *)memchr(buf + i, '\n', o - i);
-    if (!p) break;
-    line_end = (size_t)(p + 1 - buf);
-    line_content_len = (size_t)(p - buf) - i;
-    if (p > buf && p[-1] == '\r' && line_content_len > 0) line_content_len--;
-    if (line_content_len == 0) break; /* blank line = end of headers */
-    has_colon = 0;
-    for (j = i; j < i + line_content_len; j++) {
-      if (buf[j] == ':') { has_colon = 1; break; }
-    }
-    if (!has_colon) {
-      line_start = i;
-      tail_len = o - line_end;
-      memmove(buf + line_start, buf + line_end, tail_len);
-      o -= (line_end - line_start);
-      continue;
-    }
-    i = line_end;
-  }
-
-  /* Siproxd sip_fixup_asterisk: remove malformed Alert-Info when User-Agent is Asterisk PBX. */
-  if (strstr(buf, "\r\nUser-Agent: Asterisk PBX\r\n")) {
-    p = strstr(buf, "\r\nAlert-Info: ");
-    if (p && (eol = strstr(p + 2, "\r\n")) != NULL) {
-      tail_len = (size_t)(buf + o - eol);
-      memmove(p, eol, tail_len);
-      o = (size_t)(p - buf) + tail_len;
-    }
-  }
-
-  /* tag=<null> -> tag=0; avoid unbalanced brackets and null in parser */
-  for (j = 0; j + 10 <= o; ) {
-    if (memcmp(buf + j, "tag=<null>", 10) == 0) {
-      memcpy(buf + j, "tag=0", 5);
-      memmove(buf + j + 5, buf + j + 10, o - (j + 10));
-      o -= 5;
-      j += 5;
-    } else {
-      j++;
-    }
-  }
-
-  /* Trim trailing blank line so parser does not see empty line (null name -> strcmp crash). */
-  if (o >= 4 && buf[o - 4] == '\r' && buf[o - 3] == '\n' && buf[o - 2] == '\r' && buf[o - 1] == '\n')
-    o -= 2;
-
-  /* Ensure last header ends with CRLF so osip does not parse an empty "next" line. */
-  if (o > 0 && buf[o - 1] != '\n' && o + 2 < buf_size) {
-    buf[o] = '\r';
-    buf[o + 1] = '\n';
-    buf[o + 2] = '\0';
-    o += 2;
-  } else {
-    buf[o] = '\0';
-  }
-  *len = o;
-}
-
-/* --- Minimal SIP response parser --- */
-
 static int header_name_match(const char *line, size_t line_len, const char *name) {
   size_t nlen = strlen(name);
   if (line_len < nlen + 1 || line[nlen] != ':') return 0;
@@ -145,6 +60,21 @@ int sip_response_status_code(const char *buf, size_t len) {
   if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) || !isdigit((unsigned char)p[2]))
     return 0;
   return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
+int sip_response_reason_phrase(const char *buf, size_t len, char *out, size_t out_size) {
+  if (len < 12 || memcmp(buf, "SIP/2.0 ", 8) != 0 || out_size == 0) return 0;
+  const char *p = buf + 8;
+  if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) || !isdigit((unsigned char)p[2]) || p[3] != ' ')
+    return 0;
+  p += 4; /* after "NNN " */
+  const char *start = p;
+  while (p < buf + len && *p != '\r' && *p != '\n') p++;
+  size_t n = (size_t)(p - start);
+  if (n >= out_size) n = out_size - 1;
+  memcpy(out, start, n);
+  out[n] = '\0';
+  return 1;
 }
 
 int sip_header_get(const char *buf, size_t len, const char *name, const char **value_out, size_t *value_len_out) {
@@ -168,18 +98,31 @@ int sip_header_get(const char *buf, size_t len, const char *name, const char **v
       while (val < p && (*val == ' ' || *val == '\t')) val++;
       *value_out = val;
       *value_len_out = (size_t)(p - val);
-      /* merge continuation lines */
-      if (p + 2 < end && p[0] == '\r' && p[1] == '\n' && (p[2] == ' ' || p[2] == '\t')) {
+      /* RFC 3261: unfold continuation lines (\r\n followed by LWS) into this header value */
+      while (p + 2 < end && p[0] == '\r' && p[1] == '\n' && (p[2] == ' ' || p[2] == '\t')) {
         p += 2;
         while (p < end && *p != '\r' && *p != '\n') p++;
         *value_len_out = (size_t)(p - (*value_out));
       }
+      /* Trim trailing LWS so Call-ID and other headers match consistently (no in-place change). */
+      while (*value_len_out > 0 && ((*value_out)[*value_len_out - 1] == ' ' || (*value_out)[*value_len_out - 1] == '\t'))
+        *value_len_out -= 1;
       return 1;
     }
     if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2;
     else if (p < end) p += 1;
   }
   return 0;
+}
+
+int sip_header_copy(const char *buf, size_t len, const char *name, char *out, size_t out_size) {
+  const char *val;
+  size_t val_len;
+  if (!sip_header_get(buf, len, name, &val, &val_len) || out_size == 0) return 0;
+  size_t n = val_len < out_size - 1 ? val_len : out_size - 1;
+  memcpy(out, val, n);
+  out[n] = '\0';
+  return 1;
 }
 
 /* Parse token=value or token="value" from a header value; value_out is malloc'd, caller frees. */
@@ -463,65 +406,306 @@ int sip_header_uri_user(const char *buf, size_t len, const char *header_name, ch
   return header_value_uri_user(val, val_len, user_out, user_size);
 }
 
-/* Append all header lines whose name matches (case-insensitive) from request to dest. */
-static size_t append_header_lines(const char *req, size_t req_len, const char *name, size_t name_len,
-    char *dest, size_t dest_used, size_t dest_size) {
-  const char *p = req;
-  const char *end = req + req_len;
-  while (p < end && *p != '\r' && *p != '\n') p++;
-  if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2; else if (p < end) p++;
-  while (p < end) {
-    const char *line_start = p;
-    while (p < end && *p != '\r' && *p != '\n') p++;
-    if (line_start == p) break;
-    size_t line_len = (size_t)(p - line_start);
-    if (line_len >= name_len + 1 && line_start[name_len] == ':' &&
-        header_name_match(line_start, line_len, name)) {
-      size_t need = line_len + 2;
-      if (dest_used + need > dest_size) break;
-      memcpy(dest + dest_used, line_start, line_len);
-      dest[dest_used + line_len] = '\r';
-      dest[dest_used + line_len + 1] = '\n';
-      dest_used += need;
-    }
-    if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2; else if (p < end) p++;
+/* Split "host" or "host:port" into host and port. If no ':', port is "5060". Returns 1. */
+int sip_parse_host_port(const char *host_port, char *host_out, size_t host_size, char *port_out, size_t port_size) {
+  if (!host_port || !host_out || !port_out || host_size == 0 || port_size == 0) return 0;
+  const char *colon = strchr(host_port, ':');
+  if (colon) {
+    size_t hlen = (size_t)(colon - host_port);
+    if (hlen >= host_size) { host_out[0] = '\0'; port_out[0] = '\0'; return 0; }
+    memcpy(host_out, host_port, hlen);
+    host_out[hlen] = '\0';
+    size_t plen = strlen(colon + 1);
+    if (plen >= port_size) { port_out[0] = '\0'; return 0; }
+    memcpy(port_out, colon + 1, plen + 1);
+  } else {
+    size_t n = strlen(host_port) + 1;
+    if (n > host_size) { host_out[0] = '\0'; port_out[0] = '\0'; return 0; }
+    memcpy(host_out, host_port, n);
+    if (port_size < 5) { port_out[0] = '\0'; return 0; }
+    memcpy(port_out, "5060", 5);
   }
-  return dest_used;
+  return 1;
 }
 
-/* Build SIP response from request. Copies Via, From, To, Call-ID, CSeq; optionally Contact.
- * extra_headers is array of "Name: value" strings (or NULL if n_extra==0). Caller frees returned buffer.
- * If out_len is not NULL, set to response length (excluding trailing NUL). */
-char *sip_build_response(const char *request_buf, size_t request_len, int status_code, const char *reason_phrase,
-    int copy_contact, const char **extra_headers, size_t n_extra, size_t *out_len) {
-  size_t cap = 256 + request_len + 1024;
+/* Format Request-URI: sip:user@host or sip:host (user NULL or ""), port omitted if NULL or "5060". out_size > 0. Returns 1. */
+int sip_format_request_uri(const char *user, const char *host, const char *port, char *out, size_t out_size) {
+  if (!out_size || !host || !host[0]) { if (out_size) out[0] = '\0'; return 0; }
+  int n;
+  int has_port = (port && port[0] && strcmp(port, "5060") != 0);
+  if (user && user[0]) {
+    n = snprintf(out, out_size, "sip:%s@%s%s%s", user, host, has_port ? ":" : "", has_port ? port : "");
+  } else {
+    n = snprintf(out, out_size, "sip:%s%s%s", host, has_port ? ":" : "", has_port ? port : "");
+  }
+  return (n > 0 && (size_t)n < out_size) ? 1 : 0;
+}
+
+/* Wrap URI in angle brackets for To/From when value is already a full URI (e.g. request_uri). */
+int sip_wrap_angle_uri(const char *uri, char *out, size_t out_size) {
+  if (!out_size || !uri) { if (out_size) out[0] = '\0'; return 0; }
+  int n = snprintf(out, out_size, "<%s>", uri);
+  return (n > 0 && (size_t)n < out_size) ? 1 : 0;
+}
+
+/* Format Contact/From/To value: "<sip:user@host[:port]>". port omitted if NULL or "5060". */
+int sip_format_contact_uri_value(const char *user, const char *host, const char *port, char *out, size_t out_size) {
+  if (!out_size || !host || !host[0]) { if (out_size) out[0] = '\0'; return 0; }
+  int has_port = (port && port[0] && strcmp(port, "5060") != 0);
+  int n = snprintf(out, out_size, "<sip:%s@%s%s%s>", user ? user : "", host, has_port ? ":" : "", has_port ? port : "");
+  return (n > 0 && (size_t)n < out_size) ? 1 : 0;
+}
+
+/* Format From/To value: "\"display\" <sip:user@host[:port]>" or "<sip:user@host[:port]>". display NULL = no display. */
+int sip_format_from_to_value(const char *display, const char *user, const char *host, const char *port, char *out, size_t out_size) {
+  if (!out_size || !host || !host[0]) { if (out_size) out[0] = '\0'; return 0; }
+  int has_port = (port && port[0] && strcmp(port, "5060") != 0);
+  int n;
+  if (display && display[0])
+    n = snprintf(out, out_size, "\"%s\" <sip:%s@%s%s%s>", display, user ? user : "", host, has_port ? ":" : "", has_port ? port : "");
+  else
+    n = snprintf(out, out_size, "<sip:%s@%s%s%s>", user ? user : "", host, has_port ? ":" : "", has_port ? port : "");
+  return (n > 0 && (size_t)n < out_size) ? 1 : 0;
+}
+
+/* Build WWW-Authenticate header line for 401 (RFC 2617). Caller frees. Returns NULL on alloc failure. */
+char *sip_build_www_authenticate(const char *realm, const char *nonce) {
+  if (!realm || !nonce) return NULL;
+  char *out = NULL;
+  if (asprintf(&out, "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\", algorithm=MD5", realm, nonce) < 0)
+    return NULL;
+  return out;
+}
+
+/* Copy header value up to (not including) first ';', trim trailing LWS. Returns 1 on success. */
+int sip_header_value_before_first_param(const char *buf, size_t len, const char *header_name, char *out, size_t out_size) {
+  const char *val;
+  size_t val_len;
+  if (!sip_header_get(buf, len, header_name, &val, &val_len) || out_size == 0) { if (out_size) out[0] = '\0'; return 0; }
+  const char *p = val;
+  const char *end = val + val_len;
+  while (p < end && *p != ';') p++;
+  while (p > val && (p[-1] == ' ' || p[-1] == '\t')) p--;
+  size_t n = (size_t)(p - val);
+  if (n >= out_size) { out[0] = '\0'; return 0; }
+  memcpy(out, val, n);
+  out[n] = '\0';
+  return 1;
+}
+
+/* Get first occurrence of param "name=" in header value; copy value (after '=') into out, NUL-term. Returns 1 if found. */
+int sip_header_get_param(const char *buf, size_t len, const char *header_name, const char *param_name, char *out, size_t out_size) {
+  const char *val;
+  size_t val_len;
+  if (!sip_header_get(buf, len, header_name, &val, &val_len) || out_size == 0) { if (out_size) out[0] = '\0'; return 0; }
+  size_t plen = strlen(param_name);
+  const char *end = val + val_len;
+  const char *p = val;
+  while (p + plen + 1 <= end) {
+    if ((p == val || p[-1] == ';') && strncasecmp(p, param_name, plen) == 0 && p[plen] == '=') {
+      const char *v = p + plen + 1;
+      const char *v_end = v;
+      while (v_end < end && *v_end != ';' && *v_end != ' ' && *v_end != '\r' && *v_end != '\n' && *v_end != '\t') v_end++;
+      size_t n = (size_t)(v_end - v);
+      if (n >= out_size) n = out_size - 1;
+      memcpy(out, v, n);
+      out[n] = '\0';
+      return 1;
+    }
+    while (p < end && *p != ';') p++;
+    if (p < end) p++;
+  }
+  out[0] = '\0';
+  return 0;
+}
+
+/* Append ";tag=value" to out. out must be NUL-terminated; out_size is full buffer size. Returns 1 on success. */
+int sip_append_tag_param(char *out, size_t out_size, const char *tag_value) {
+  size_t cur = strlen(out);
+  if (!tag_value) return 1;
+  int n = snprintf(out + cur, out_size - cur, ";tag=%s", tag_value);
+  return (n > 0 && (size_t)n < out_size - cur) ? 1 : 0;
+}
+
+/* Build Authorization header value (Digest). response_hex = 32-char MD5 hex. algorithm/opaque NULL = omit. Returns 1 on success. */
+int sip_build_authorization_digest_value(const char *user, const char *realm, const char *nonce, const char *uri,
+  const char *response_hex, const char *algorithm, const char *opaque, char *out, size_t out_size) {
+  if (!out_size || !user || !realm || !nonce || !uri || !response_hex) { if (out_size) out[0] = '\0'; return 0; }
+  int n = snprintf(out, out_size,
+    "Digest username=\"%s\",realm=\"%s\",nonce=\"%s\",uri=\"%s\",response=\"%s\"",
+    user, realm, nonce, uri, response_hex);
+  if (n < 0 || (size_t)n >= out_size) { if (out_size) out[0] = '\0'; return 0; }
+  size_t used = (size_t)n;
+  if (algorithm && algorithm[0]) {
+    n = snprintf(out + used, out_size - used, ",algorithm=%s", algorithm);
+    if (n > 0 && (size_t)n < out_size - used) used += (size_t)n;
+  }
+  if (opaque && opaque[0]) {
+    n = snprintf(out + used, out_size - used, ",opaque=\"%s\"", opaque);
+    if (n > 0 && (size_t)n < out_size - used) used += (size_t)n;
+  }
+  return 1;
+}
+
+/* Normalise to Via header value only: strip leading "Via:" (case-insensitive) and LWS. */
+static const char *via_value_only(const char *via_line) {
+  if (!via_line || !via_line[0]) return via_line;
+  const char *p = via_line;
+  while (*p == ' ' || *p == '\t') p++;
+  if ((p[0] == 'V' || p[0] == 'v') && (p[1] == 'I' || p[1] == 'i') && (p[2] == 'A' || p[2] == 'a') && p[3] == ':') {
+    p += 4;
+    while (*p == ' ' || *p == '\t') p++;
+  }
+  return p;
+}
+
+/* Build REGISTER request. All args are header values (no "Via: " etc.). auth_value NULL = no Authorization. Caller frees. */
+char *sip_build_register_request(const char *request_uri, const char *via_value, const char *to_val, const char *from_val,
+  const char *call_id, const char *cseq, const char *contact_val, int expires, int max_forwards, const char *user_agent,
+  const char *auth_value, size_t *out_len) {
+  size_t cap = 4096;
   char *out = malloc(cap);
   if (!out) return NULL;
   size_t used = 0;
-  int n = snprintf(out + used, cap - used, "SIP/2.0 %d %s\r\n", status_code, reason_phrase ? reason_phrase : "OK");
+  int n = snprintf(out + used, cap - used, "REGISTER %s SIP/2.0\r\n", request_uri ? request_uri : "");
   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
   used += (size_t)n;
+  if (via_value && via_value[0]) {
+    const char *v = via_value_only(via_value);
+    n = snprintf(out + used, cap - used, "Via: %s\r\n", v);
+    if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+    used += (size_t)n;
+  }
+  if (to_val && to_val[0])   { n = snprintf(out + used, cap - used, "To: %s\r\n", to_val);   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (from_val && from_val[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", from_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (call_id && call_id[0]) { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (cseq && cseq[0])       { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", cseq);       if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (contact_val && contact_val[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", contact_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  n = snprintf(out + used, cap - used, "Expires: %d\r\nMax-Forwards: %d\r\n", expires, max_forwards);
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  if (user_agent && user_agent[0]) { n = snprintf(out + used, cap - used, "User-Agent: %s\r\n", user_agent); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (auth_value && auth_value[0]) { n = snprintf(out + used, cap - used, "Authorization: %s\r\n", auth_value); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  n = snprintf(out + used, cap - used, "\r\n");
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  if (out_len) *out_len = used;
+  char *ret = realloc(out, used + 1);
+  if (ret) { ret[used] = '\0'; return ret; }
+  out[used] = '\0';
+  return out;
+}
 
-  static const char *headers[] = { "Via", "From", "To", "Call-ID", "CSeq" };
-  for (size_t h = 0; h < sizeof(headers)/sizeof(headers[0]); h++) {
-    const char *name = headers[h];
-    size_t nlen = strlen(name);
-    used = append_header_lines(request_buf, request_len, name, nlen, out, used, cap);
+/* Build response from explicit parts (no copy from request). First line by status/reason; headers: Via, From, To, Call-ID, CSeq, Contact, User-Agent, then extra_headers, then Content-Length (if body). Caller frees.
+ * All header args are header values only (no "Via: " etc.); Via is normalised so full line is also accepted. */
+char *sip_build_response_parts(int status_code, const char *reason,
+  const char *via_line, const char *from_val, const char *to_val,
+  const char *call_id, const char *cseq_val, const char *contact_val, const char *user_agent,
+  const char *body, size_t body_len,
+  const char **extra_headers, size_t n_extra, size_t *out_len) {
+  size_t cap = 4096;
+  if (body_len > 0)
+    cap += body_len;
+  char *out = malloc(cap);
+  if (!out) return NULL;
+  size_t used = 0;
+  int n = snprintf(out + used, cap - used, "SIP/2.0 %d %s\r\n",
+    status_code, reason && reason[0] ? reason : "OK");
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  {
+    const char *via_val = via_value_only(via_line);
+    if (via_val && via_val[0]) {
+      n = snprintf(out + used, cap - used, "Via: %s\r\n", via_val);
+      if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+      used += (size_t)n;
+    }
   }
-  if (copy_contact)
-    used = append_header_lines(request_buf, request_len, "Contact", 7, out, used, cap);
-  for (size_t i = 0; i < n_extra && extra_headers[i]; i++) {
-    size_t len = strlen(extra_headers[i]);
-    if (used + len + 2 > cap) break;
-    memcpy(out + used, extra_headers[i], len);
-    used += len;
-    out[used++] = '\r';
-    out[used++] = '\n';
+  if (from_val && from_val[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", from_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (to_val && to_val[0])     { n = snprintf(out + used, cap - used, "To: %s\r\n", to_val);     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (call_id && call_id[0])   { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (cseq_val && cseq_val[0]) { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", cseq_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (contact_val && contact_val[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", contact_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (user_agent && user_agent[0]) { n = snprintf(out + used, cap - used, "User-Agent: %s\r\n", user_agent); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  for (size_t i = 0; i < n_extra && extra_headers && extra_headers[i]; i++) {
+    size_t el = strlen(extra_headers[i]);
+    if (used + el + 2 > cap) break;
+    memcpy(out + used, extra_headers[i], el);
+    used += el;
+    out[used++] = '\r'; out[used++] = '\n';
   }
-  if (used + 2 > cap) { free(out); return NULL; }
-  out[used++] = '\r';
-  out[used++] = '\n';
-  { char *ret = realloc(out, used + 1); if (ret) { ret[used] = '\0'; if (out_len) *out_len = used; return ret; } if (out_len) *out_len = used; return out; }
+
+  n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", body_len);
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  n = snprintf(out + used, cap - used, "\r\n");
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  if (body_len > 0 && body) {
+    if (used + body_len > cap) { free(out); return NULL; }
+    memcpy(out + used, body, body_len);
+    used += body_len;
+  }
+  char *ret = realloc(out, used + 1);
+  if (ret) { ret[used] = '\0'; if (out_len) *out_len = used; return ret; }
+  out[used] = '\0';
+  if (out_len) *out_len = used;
+  return out;
+}
+
+/* Write Via header value only (no "Via: " prefix, no CRLF). Same contract as other header values for sip_build_*_parts. */
+int sip_make_via_line(const char *host, const char *port, char *out, size_t out_size) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  int n = snprintf(out, out_size, "SIP/2.0/UDP %s:%s;rport;branch=z9hG4bK%lx%lx%x",
+    host, port, (long)ts.tv_sec, (long)ts.tv_nsec, (unsigned)rand());
+  return (n > 0 && (size_t)n < out_size) ? 1 : 0;
+}
+
+/* Build SIP request from parts. method and request_uri required. Via/From/To/Call-ID/CSeq/Contact are header values only (no "Via: " etc.). */
+char *sip_build_request_parts(const char *method, const char *request_uri,
+  const char *via_val, const char *from_val, const char *to_val,
+  const char *call_id, const char *cseq_val, const char *contact_val,
+  const char *body, size_t body_len, size_t *out_len) {
+  size_t cap = 4096;
+  if (body_len > 0) cap += body_len;
+  char *out = malloc(cap);
+  if (!out) return NULL;
+  size_t used = 0;
+  int n = snprintf(out + used, cap - used, "%s %s SIP/2.0\r\n", method, request_uri);
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  {
+    const char *v = via_value_only(via_val);
+    if (v && v[0]) {
+      n = snprintf(out + used, cap - used, "Via: %s\r\n", v);
+      if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+      used += (size_t)n;
+    }
+  }
+  if (from_val && from_val[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", from_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (to_val && to_val[0])     { n = snprintf(out + used, cap - used, "To: %s\r\n", to_val);     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (call_id && call_id[0])   { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (cseq_val && cseq_val[0]) { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", cseq_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (contact_val && contact_val[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", contact_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (body_len > 0) {
+    n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", body_len);
+    if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+    used += (size_t)n;
+  }
+  n = snprintf(out + used, cap - used, "\r\n");
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
+  if (body_len > 0 && body) {
+    if (used + body_len > cap) { free(out); return NULL; }
+    memcpy(out + used, body, body_len);
+    used += body_len;
+  }
+  char *ret = realloc(out, used + 1);
+  if (ret) { ret[used] = '\0'; if (out_len) *out_len = used; return ret; }
+  out[used] = '\0';
+  if (out_len) *out_len = used;
+  return out;
 }
 
 /* Get body start and length (after \r\n\r\n). Returns 1 if found. */
@@ -545,142 +729,5 @@ int sip_request_get_body(const char *buf, size_t len, const char **body_out, siz
   return 0;
 }
 
-/* Clone request buffer and replace Request-URI line with sip:user@host:port. Caller frees. */
-char *sip_request_replace_uri(const char *buf, size_t len, const char *user, const char *host, const char *port) {
-  const char *end = buf + len;
-  const char *first_end = buf;
-  while (first_end < end && *first_end != '\r' && *first_end != '\n') first_end++;
-  const char *space1 = buf;
-  while (space1 < first_end && *space1 != ' ') space1++;
-  if (space1 >= first_end) return NULL;
-  const char *uri_start = space1 + 1;
-  const char *space2 = uri_start;
-  while (space2 < first_end && *space2 != ' ') space2++;
-  if (space2 >= first_end) return NULL;
-  size_t method_len = (size_t)(space1 - buf);
-  size_t tail_len = (size_t)(first_end - space2);
-  size_t new_uri_len = 4 + (user ? strlen(user) : 0) + 1 + (host ? strlen(host) : 0) + (port && port[0] ? 1 + strlen(port) : 0);
-  char *new_uri = malloc(new_uri_len + 1);
-  if (!new_uri) return NULL;
-  char *q = new_uri;
-  memcpy(q, "sip:", 4); q += 4;
-  if (user) { size_t u = strlen(user); memcpy(q, user, u); q += u; }
-  *q++ = '@';
-  if (host) { size_t h = strlen(host); memcpy(q, host, h); q += h; }
-  if (port && port[0]) { *q++ = ':'; size_t pn = strlen(port); memcpy(q, port, pn); q += pn; }
-  *q = '\0';
-  size_t rest = (size_t)(end - first_end);
-  size_t new_len = method_len + 1 + new_uri_len + tail_len + rest;
-  char *out = malloc(new_len + 1);
-  if (!out) { free(new_uri); return NULL; }
-  char *o = out;
-  memcpy(o, buf, method_len); o += method_len;
-  *o++ = ' ';
-  memcpy(o, new_uri, new_uri_len); o += new_uri_len;
-  memcpy(o, space2, tail_len + rest);
-  out[new_len] = '\0';
-  free(new_uri);
-  return out;
-}
 
-/* Prepend Via line to request. Caller frees. */
-char *sip_request_add_via(const char *buf, size_t len, const char *host, const char *port) {
-  char via[256];
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  int n = snprintf(via, sizeof(via), "Via: SIP/2.0/UDP %s:%s;rport;branch=z9hG4bK%lx%lx%x\r\n",
-    host, port, (long)ts.tv_sec, (long)ts.tv_nsec, (unsigned)rand());
-  if (n < 0 || n >= (int)sizeof(via)) return NULL;
-  size_t via_len = (size_t)n;
-  size_t first_line = 0;
-  while (first_line < len && buf[first_line] != '\r' && buf[first_line] != '\n') first_line++;
-  size_t rest = len - first_line;
-  char *out = malloc(first_line + via_len + rest + 1);
-  if (!out) return NULL;
-  memcpy(out, buf, first_line);
-  memcpy(out + first_line, via, via_len);
-  memcpy(out + first_line + via_len, buf + first_line, rest);
-  out[first_line + via_len + rest] = '\0';
-  return out;
-}
 
-/* Replace body in request (from \r\n\r\n). new_body may be NULL (removes body). Caller frees. */
-char *sip_request_replace_body(const char *buf, size_t len, const char *new_body, size_t new_body_len) {
-  const char *body_start = NULL;
-  size_t body_len = 0;
-  if (!sip_request_get_body(buf, len, &body_start, &body_len)) {
-    if (!new_body || new_body_len == 0) {
-      char *copy = malloc(len + 1);
-      if (!copy) return NULL;
-      memcpy(copy, buf, len);
-      copy[len] = '\0';
-      return copy;
-    }
-    size_t need = len + 2 + new_body_len + 1;
-    char *out = malloc(need);
-    if (!out) return NULL;
-    memcpy(out, buf, len);
-    out[len] = '\r'; out[len+1] = '\n'; out[len+2] = '\r'; out[len+3] = '\n';
-    memcpy(out + len + 4, new_body, new_body_len);
-    out[len + 4 + new_body_len] = '\0';
-    return out;
-  }
-  size_t header_len = (size_t)(body_start - buf);
-  size_t new_total = header_len + (new_body ? new_body_len : 0);
-  char *out = malloc(new_total + 1);
-  if (!out) return NULL;
-  memcpy(out, buf, header_len);
-  if (new_body && new_body_len) memcpy(out + header_len, new_body, new_body_len);
-  out[new_total] = '\0';
-  /* Update Content-Length header to match new body length (in-place only if new line fits) */
-  {
-    const char *cl = "Content-Length: ";
-    size_t cl_len = 16;
-    char *h = out;
-    while (h + cl_len <= out + header_len) {
-      if (strncasecmp(h, cl, cl_len) == 0) {
-        char *line_end = h;
-        while (line_end < out + header_len && *line_end != '\r' && *line_end != '\n') line_end++;
-        size_t line_len = (size_t)(line_end - h);
-        size_t after = (size_t)(out + header_len - line_end);
-        char new_line[32];
-        int n = snprintf(new_line, sizeof(new_line), "Content-Length: %zu", new_body ? new_body_len : 0);
-        if (n > 0 && (size_t)n <= line_len) {
-          memcpy(h, new_line, (size_t)n);
-          if ((size_t)n < line_len)
-            memmove(h + n, line_end, after);
-        }
-        break;
-      }
-      while (h < out + header_len && *h != '\r' && *h != '\n') h++;
-      if (h + 1 < out + header_len && h[0] == '\r' && h[1] == '\n') h += 2; else if (h < out + header_len) h++;
-    }
-  }
-  return out;
-}
-
-/* Response: strip first Via line. Caller frees. */
-char *sip_response_strip_first_via(const char *buf, size_t len) {
-  const char *p = buf;
-  const char *end = buf + len;
-  while (p < end && *p != '\r' && *p != '\n') p++;
-  if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2; else if (p < end) p++;
-  if (p + 4 >= end || strncasecmp(p, "Via:", 4) != 0) {
-    char *copy = malloc(len + 1);
-    if (!copy) return NULL;
-    memcpy(copy, buf, len);
-    copy[len] = '\0';
-    return copy;
-  }
-  const char *via_start = p;
-  while (p < end && *p != '\r' && *p != '\n') p++;
-  size_t skip = (size_t)(p - via_start);
-  if (p + 1 < end && p[0] == '\r' && p[1] == '\n') skip += 2; else if (p < end) skip += 1;
-  size_t new_len = len - skip;
-  char *out = malloc(new_len + 1);
-  if (!out) return NULL;
-  memcpy(out, buf, (size_t)(via_start - buf));
-  memcpy(out + (size_t)(via_start - buf), via_start + skip, (size_t)(end - (via_start + skip)));
-  out[new_len] = '\0';
-  return out;
-}
