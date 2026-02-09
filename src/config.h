@@ -63,6 +63,9 @@ struct upbx_config {
 /* Load config from file. Returns 0 on success, -1 on file error, >0 line number of first parse error. */
 int config_load(upbx_config *cfg, const char *path);
 
+/* After config_load returned >0, copy the section/key that caused the parse error (for logging). */
+void config_last_parse_error(char *section_out, size_t section_size, char *key_out, size_t key_size);
+
 /* Compile trunk rewrite patterns (POSIX regex). Call after config_load. Returns 0 on success, -1 on compile error. */
 int config_compile_trunk_rewrites(upbx_config *cfg);
 

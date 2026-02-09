@@ -89,7 +89,9 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
       return 1;
     }
     if (r > 0) {
-      log_error("config parse error at line %d", r);
+      char err_sec[256], err_key[256];
+      config_last_parse_error(err_sec, sizeof(err_sec), err_key, sizeof(err_key));
+      log_error("config parse error at line %d: unknown key '%s' in section '%s'", r, err_key[0] ? err_key : "(none)", err_sec[0] ? err_sec : "(none)");
       config_free(&cfg);
       return 1;
     }

@@ -19,7 +19,7 @@ SRC:=$(filter-out src/AppModule/md5_test.c,$(SRC))
 INCLUDES:=
 
 override CFLAGS?=-Wall -O2
-override CFLAGS+=-I src
+override CFLAGS+=-I src -D INI_HANDLER_LINENO=1
 override LDFLAGS?=
 
 override LDFLAGS+=-lresolv -pthread

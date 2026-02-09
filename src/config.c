@@ -4,6 +4,7 @@
 #include <regex.h>
 
 #include "benhoyt/inih.h"
+#include "rxi/log.h"
 #include "config.h"
 
 #define STRDUP(s) ((s) ? strdup(s) : NULL)
@@ -99,7 +100,28 @@ static char *pending_rewrite_pattern;
 #define TRIM_NAME_SIZE    256
 #define TRIM_VALUE_SIZE  2048
 
-static int handler(void *user, const char *section, const char *name, const char *value) {
+/* Last parse error (section/key) when handler returns 0; used for error reporting. */
+static char last_parse_section[TRIM_SECTION_SIZE];
+static char last_parse_key[TRIM_NAME_SIZE];
+
+static void set_last_parse_error(const char *section, const char *name) {
+  if (section) {
+    size_t n = strlen(section);
+    if (n >= sizeof(last_parse_section)) n = sizeof(last_parse_section) - 1;
+    memcpy(last_parse_section, section, n);
+    last_parse_section[n] = '\0';
+  } else
+    last_parse_section[0] = '\0';
+  if (name) {
+    size_t n = strlen(name);
+    if (n >= sizeof(last_parse_key)) n = sizeof(last_parse_key) - 1;
+    memcpy(last_parse_key, name, n);
+    last_parse_key[n] = '\0';
+  } else
+    last_parse_key[0] = '\0';
+}
+
+static int handler(void *user, const char *section, const char *name, const char *value, int lineno) {
   upbx_config *cfg = (upbx_config *)user;
   char sec[TRIM_SECTION_SIZE], key[TRIM_NAME_SIZE], val[TRIM_VALUE_SIZE];
   trim_copy(sec, sizeof(sec), section);
@@ -130,30 +152,32 @@ static int handler(void *user, const char *section, const char *name, const char
     }
     if (strcmp(key, "emergency") == 0) {
       char **p = (char **)realloc(cfg->emergency, (cfg->emergency_count + 1) * sizeof(char *));
-      if (!p) return 0;
+      if (!p) { set_last_parse_error(sec, key); return 0; }
       cfg->emergency = p;
       cfg->emergency[cfg->emergency_count] = STRDUP(val);
-      if (!cfg->emergency[cfg->emergency_count]) return 0;
+      if (!cfg->emergency[cfg->emergency_count]) { set_last_parse_error(sec, key); return 0; }
       cfg->emergency_count++;
       return 1;
     }
-    return 0;
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec[0] ? sec : "(none)");
+    return 1;
   }
 
   if (PREFIX_MATCH(sec, "plugin:")) {
     config_plugin *p = find_or_add_plugin(cfg, SECTION_TAIL(sec, "plugin:"));
-    if (!p) return 0;
+    if (!p) { set_last_parse_error(sec, key); return 0; }
     if (strcmp(key, "exec") == 0) {
       free(p->exec);
       p->exec = STRDUP(val);
       return 1;
     }
-    return 0;
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec[0] ? sec : "(none)");
+    return 1;
   }
 
   if (PREFIX_MATCH(sec, "trunk:")) {
     config_trunk *t = find_or_add_trunk(cfg, SECTION_TAIL(sec, "trunk:"));
-    if (!t) return 0;
+    if (!t) { set_last_parse_error(sec, key); return 0; }
     if (strcmp(key, "host") == 0) {
       free(t->host);
       t->host = STRDUP(val);
@@ -174,8 +198,10 @@ static int handler(void *user, const char *section, const char *name, const char
       t->password = STRDUP(val);
       return 1;
     }
-    if (strcmp(key, "did") == 0)
-      return append_trunk_did(t, val) ? 1 : 0;
+    if (strcmp(key, "did") == 0) {
+      if (!append_trunk_did(t, val)) { set_last_parse_error(sec, key); return 0; }
+      return 1;
+    }
     if (strcmp(key, "cid") == 0) {
       free(t->cid);
       t->cid = STRDUP(val);
@@ -196,9 +222,11 @@ static int handler(void *user, const char *section, const char *name, const char
         int ok = append_trunk_rewrite(t, pending_rewrite_pattern, val);
         free(pending_rewrite_pattern);
         pending_rewrite_pattern = NULL;
-        return ok ? 1 : 0;
+        if (!ok) { set_last_parse_error(sec, key); return 0; }
+        return 1;
       }
-      return 0; /* replace without preceding pattern */
+      log_warn("config line %d: 'replace' without preceding 'pattern' in section '%s'", lineno, sec);
+      return 1;
     }
     if (strcmp(key, "overflow_timeout") == 0) {
       t->overflow_timeout = atoi(val);
@@ -224,12 +252,13 @@ static int handler(void *user, const char *section, const char *name, const char
       t->group_prefix = STRDUP(val);
       return 1;
     }
-    return 0;
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
+    return 1;
   }
 
   if (PREFIX_MATCH(sec, "ext:")) {
     config_extension *e = find_or_add_extension(cfg, SECTION_TAIL(sec, "ext:"));
-    if (!e) return 0;
+    if (!e) { set_last_parse_error(sec, key); return 0; }
     if (strcmp(key, "name") == 0) {
       free(e->name);
       e->name = STRDUP(val);
@@ -240,10 +269,12 @@ static int handler(void *user, const char *section, const char *name, const char
       e->secret = STRDUP(val);
       return 1;
     }
-    return 0;
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
+    return 1;
   }
 
-  return 0; /* unknown section */
+  log_warn("config line %d: unknown section '%s'", lineno, sec[0] ? sec : "(none)");
+  return 1;
 }
 
 void config_init(upbx_config *cfg) {
@@ -305,7 +336,24 @@ void config_free(upbx_config *cfg) {
   config_init(cfg);
 }
 
+void config_last_parse_error(char *section_out, size_t section_size, char *key_out, size_t key_size) {
+  if (section_out && section_size) {
+    size_t n = strlen(last_parse_section);
+    if (n >= section_size) n = section_size - 1;
+    memcpy(section_out, last_parse_section, n);
+    section_out[n] = '\0';
+  }
+  if (key_out && key_size) {
+    size_t n = strlen(last_parse_key);
+    if (n >= key_size) n = key_size - 1;
+    memcpy(key_out, last_parse_key, n);
+    key_out[n] = '\0';
+  }
+}
+
 int config_load(upbx_config *cfg, const char *path) {
+  last_parse_section[0] = '\0';
+  last_parse_key[0] = '\0';
   int r = ini_parse(path, handler, cfg);
   if (r < 0)
     return -1; /* file error */
