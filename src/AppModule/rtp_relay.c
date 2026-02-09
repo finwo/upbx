@@ -16,6 +16,7 @@
 #include "config.h"
 #include "socket_util.h"
 #include "AppModule/rtp_relay.h"
+#include "rxi/log.h"
 
 #define RTP_RELAY_TABLE_SIZE  512
 #define RTP_BUFFER_SIZE       1520
@@ -113,6 +114,8 @@ static int match_socket(int idx) {
     rtp_table[idx].rtp_tx_sock = rtp_table[j].rtp_rx_sock;
     rtp_table[idx].rtp_con_tx_sock = rtp_table[j].rtp_con_rx_sock;
     rtp_table[idx].opposite_entry = j;
+    rtp_table[j].rtp_tx_sock = rtp_table[idx].rtp_rx_sock;
+    rtp_table[j].rtp_con_tx_sock = rtp_table[idx].rtp_con_rx_sock;
     rtp_table[j].opposite_entry = idx;
     return j;
   }
@@ -151,35 +154,35 @@ void rtp_relay_poll(fd_set *read_set) {
 
   for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
     if (rtp_table[i].rtp_rx_sock <= 0) continue;
+    int opp = rtp_table[i].opposite_entry;
     int fd1 = rtp_table[i].rtp_rx_sock;
     int fd2 = rtp_table[i].rtp_con_rx_sock;
-    if (FD_ISSET(fd1, read_set) && rtp_table[i].rtp_tx_sock > 0) {
-      /* Skip forward if remote not yet set (e.g. OUTGOING leg allocated before 200 OK) */
-      if (rtp_table[i].remote_port <= 0 || rtp_table[i].remote_ipaddr.s_addr == 0)
+    if (FD_ISSET(fd1, read_set) && rtp_table[i].rtp_tx_sock > 0 && opp >= 0) {
+      /* Skip forward if opposite leg's remote not yet set (e.g. callee addr learned on 200 OK) */
+      if (rtp_table[opp].remote_port <= 0 || rtp_table[opp].remote_ipaddr.s_addr == 0)
         goto next_rtp;
       ssize_t count = read(fd1, buf, sizeof(buf));
       if (count > 0) {
         struct sockaddr_in dst;
         memset(&dst, 0, sizeof(dst));
         dst.sin_family = AF_INET;
-        dst.sin_addr = rtp_table[i].remote_ipaddr;
-        dst.sin_port = htons((uint16_t)rtp_table[i].remote_port);
+        dst.sin_addr = rtp_table[opp].remote_ipaddr;
+        dst.sin_port = htons((uint16_t)rtp_table[opp].remote_port);
         sendto(rtp_table[i].rtp_tx_sock, buf, (size_t)count, 0,
                (struct sockaddr *)&dst, sizeof(dst));
         rtp_table[i].timestamp = now;
-        if (rtp_table[i].opposite_entry >= 0)
-          rtp_table[rtp_table[i].opposite_entry].timestamp = now;
+        rtp_table[opp].timestamp = now;
       }
     }
-    if (FD_ISSET(fd2, read_set) && rtp_table[i].rtp_con_tx_sock > 0 &&
-        rtp_table[i].remote_port > 0 && rtp_table[i].remote_ipaddr.s_addr != 0) {
+    if (FD_ISSET(fd2, read_set) && rtp_table[i].rtp_con_tx_sock > 0 && opp >= 0 &&
+        rtp_table[opp].remote_port > 0 && rtp_table[opp].remote_ipaddr.s_addr != 0) {
       ssize_t count = read(fd2, buf, sizeof(buf));
       if (count > 0) {
         struct sockaddr_in dst;
         memset(&dst, 0, sizeof(dst));
         dst.sin_family = AF_INET;
-        dst.sin_addr = rtp_table[i].remote_ipaddr;
-        dst.sin_port = htons((uint16_t)(rtp_table[i].remote_port + 1));
+        dst.sin_addr = rtp_table[opp].remote_ipaddr;
+        dst.sin_port = htons((uint16_t)(rtp_table[opp].remote_port + 1));
         sendto(rtp_table[i].rtp_con_tx_sock, buf, (size_t)count, 0,
                (struct sockaddr *)&dst, sizeof(dst));
       }
@@ -228,6 +231,9 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
     rtp_table[i].remote_ipaddr = remote_ip;
     if (cseq > rtp_table[i].cseq) rtp_table[i].cseq = cseq;
     *local_port = rtp_table[i].local_port;
+    log_trace("RTP relay: reusing existing leg dir=%s stream=%d local_port=%d remote=%s:%d",
+        rtp_direction == RTP_RELAY_DIR_INCOMING ? "INCOMING" : "OUTGOING", media_stream_no, rtp_table[i].local_port,
+        remote_port > 0 ? inet_ntoa(remote_ip) : "-", remote_port);
     return 0;
   }
 
@@ -290,6 +296,10 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
   match_socket(freeidx);
   rtp_recreate_fdset();
   *local_port = port;
+  log_info("RTP relay: leg started dir=%s call=%.32s stream=%d local_port=%d remote=%s:%d (RFC 3261: media at answer)",
+      rtp_direction == RTP_RELAY_DIR_INCOMING ? "INCOMING" : "OUTGOING",
+      call_id_number ? call_id_number : "", media_stream_no, port,
+      remote_port > 0 ? inet_ntoa(remote_ip) : "0.0.0.0", remote_port);
   return 0;
 }
 

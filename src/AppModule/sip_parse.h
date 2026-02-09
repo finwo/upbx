@@ -29,6 +29,8 @@ int sip_response_contact_expires(const char *buf, size_t len);
 
 int sip_is_request(const char *buf, size_t len);
 int sip_request_method(const char *buf, size_t len, const char **method_out, size_t *method_len_out);
+/* Copy Request-URI from first line (METHOD REQUEST-URI SIP/2.0) into out, NUL-terminated. out_size > 0. Returns 1 on success. */
+int sip_request_uri_get(const char *buf, size_t len, char *out, size_t out_size);
 int sip_request_uri_user(const char *buf, size_t len, char *user_out, size_t user_size);
 int sip_request_uri_host_port(const char *buf, size_t len, char *host_out, size_t host_size, char *port_out, size_t port_size);
 int sip_parse_authorization_digest(const char *buf, size_t len,
@@ -75,12 +77,43 @@ char *sip_build_response_parts(int status_code, const char *reason,
 /* Write Via header value only into out (no "Via: " prefix, no CRLF). Same contract as sip_header_copy(..., "Via", ...). */
 int sip_make_via_line(const char *host, const char *port, char *out, size_t out_size);
 
-/* Build SIP request from parts. method and request_uri required. Via/From/To/etc = header values only. Caller frees. */
+/* Build SIP request from parts. method and request_uri required. Via/From/To/etc = header values only.
+ * add_alert_info_for_invite: 1 = when method is INVITE, append Alert-Info (ring) so callee UA shows incoming-call UI. */
 char *sip_build_request_parts(const char *method, const char *request_uri,
   const char *via_val, const char *from_val, const char *to_val,
   const char *call_id, const char *cseq_val, const char *contact_val,
+  int add_alert_info_for_invite,
   const char *body, size_t body_len, size_t *out_len);
 
 int sip_request_get_body(const char *buf, size_t len, const char **body_out, size_t *body_len_out);
+
+/* ---- Packet rewrite helpers ----
+ * Each copies buf[0..len-1] to out[0..out_cap-1] with one modification.
+ * Returns new length, or -1 on error. Composable: chain output → input. */
+
+/* Replace Request-URI in first line (METHOD <old> SIP/2.0 → METHOD <new_uri> SIP/2.0). */
+int sip_rewrite_request_uri(const char *buf, size_t len, const char *new_uri, char *out, size_t out_cap);
+
+/* Insert "Via: <via_value>\r\n" after the first line. */
+int sip_prepend_via(const char *buf, size_t len, const char *via_value, char *out, size_t out_cap);
+
+/* Remove the first Via header line. */
+int sip_strip_top_via(const char *buf, size_t len, char *out, size_t out_cap);
+
+/* Replace the value of the first occurrence of header_name (case-insensitive).
+ * E.g. sip_rewrite_header(buf, len, "Contact", "<sip:x@y>", out, cap). */
+int sip_rewrite_header(const char *buf, size_t len, const char *header_name,
+                       const char *new_value, char *out, size_t out_cap);
+
+/* Insert a new header line before the header/body separator.
+ * If header_name already exists, does nothing (copies verbatim). */
+int sip_insert_header(const char *buf, size_t len, const char *header_name,
+                      const char *value, char *out, size_t out_cap);
+
+/* Replace the message body and update Content-Length (and Content-Type if body present).
+ * new_body==NULL or new_body_len==0 removes the body. */
+int sip_rewrite_body(const char *buf, size_t len,
+                     const char *new_body, size_t new_body_len,
+                     char *out, size_t out_cap);
 
 #endif

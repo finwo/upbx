@@ -45,7 +45,6 @@ struct upbx_config {
   int locality;       /* 0 = disabled */
   int daemonize;      /* 0 or 1 */
   char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
-  char *advertise;    /* Optional: host or host:port to use in Via/SDP when listen is 0.0.0.0 (e.g. "192.168.69.49") */
   int rtp_port_low;   /* RTP relay port range (from rtp_ports low-high; default 10000-20000) */
   int rtp_port_high;
   char **emergency;

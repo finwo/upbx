@@ -91,9 +91,11 @@ secret = my-secret
 
 ### `[upbx]`
 
+There is **no** `advertise` (or similar) option. The address used in Via/SDP is learned per extension from that extension's REGISTER; `listen` is used as fallback. Do not add an advertise option.
+
 | Option | Description |
 |--------|-------------|
-| `listen` | SIP UDP bind address (e.g. `0.0.0.0:5060` or `192.168.1.1:5060`). For RTP relay, use a concrete IP so SDP advertises the correct address. |
+| `listen` | SIP UDP bind address (e.g. `0.0.0.0:5060` or `192.168.1.1:5060`). Fallback for Via/SDP when not yet learned from REGISTER. |
 | `rtp_ports` | Port range for the built-in RTP relay, as `low-high` (e.g. `10000-20000`). Default 10000–20000. |
 | `daemonize` | `1` = run in background when started without `-d`/`-D`; `0` = foreground. |
 | `locality` | Number of digits for short-dial / group routing. When set, an extension’s trunk can be chosen by **group**: if the extension number has more than `locality` digits and its prefix matches a trunk’s `group`, that trunk is used for outgoing calls (see `[trunk]` `group`). `0` = disabled. |

@@ -7,6 +7,8 @@
 #include <ctype.h>
 #include <time.h>
 
+#include "AppModule/sip_parse.h"
+
 #define SEC_MINLEN      16
 #define SEC_MAXLINELEN  2048
 
@@ -238,6 +240,23 @@ int sip_request_method(const char *buf, size_t len, const char **method_out, siz
   if (p >= end || *p != ' ') return 0;
   *method_out = buf;
   *method_len_out = (size_t)(p - buf);
+  return 1;
+}
+
+/* Copy Request-URI from first line (METHOD REQUEST-URI SIP/2.0). */
+int sip_request_uri_get(const char *buf, size_t len, char *out, size_t out_size) {
+  if (len < 12 || out_size == 0) return 0;
+  const char *end = buf + len;
+  const char *p = buf;
+  while (p < end && *p != ' ' && *p != '\r' && *p != '\n') p++;
+  if (p >= end || *p != ' ') return 0;
+  p++;
+  const char *start = p;
+  while (p < end && *p != ' ' && *p != '\r' && *p != '\n') p++;
+  size_t n = (size_t)(p - start);
+  if (n == 0 || n >= out_size) return 0;
+  memcpy(out, start, n);
+  out[n] = '\0';
   return 1;
 }
 
@@ -635,6 +654,11 @@ char *sip_build_response_parts(int status_code, const char *reason,
     out[used++] = '\r'; out[used++] = '\n';
   }
 
+  if (body_len > 0) {
+    n = snprintf(out + used, cap - used, "Content-Type: application/sdp\r\n");
+    if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+    used += (size_t)n;
+  }
   n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", body_len);
   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
   used += (size_t)n;
@@ -666,6 +690,7 @@ int sip_make_via_line(const char *host, const char *port, char *out, size_t out_
 char *sip_build_request_parts(const char *method, const char *request_uri,
   const char *via_val, const char *from_val, const char *to_val,
   const char *call_id, const char *cseq_val, const char *contact_val,
+  int add_alert_info_for_invite,
   const char *body, size_t body_len, size_t *out_len) {
   size_t cap = 4096;
   if (body_len > 0) cap += body_len;
@@ -683,13 +708,21 @@ char *sip_build_request_parts(const char *method, const char *request_uri,
       used += (size_t)n;
     }
   }
+  n = snprintf(out + used, cap - used, "Max-Forwards: 70\r\n");
+  if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+  used += (size_t)n;
   if (from_val && from_val[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", from_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
   if (to_val && to_val[0])     { n = snprintf(out + used, cap - used, "To: %s\r\n", to_val);     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
   if (call_id && call_id[0])   { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
   if (cseq_val && cseq_val[0]) { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", cseq_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
   if (contact_val && contact_val[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", contact_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (add_alert_info_for_invite && method && strcmp(method, "INVITE") == 0) {
+    n = snprintf(out + used, cap - used, "Alert-Info: Ring\r\n");
+    if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
+    used += (size_t)n;
+  }
   if (body_len > 0) {
-    n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", body_len);
+    n = snprintf(out + used, cap - used, "Content-Type: application/sdp\r\nContent-Length: %zu\r\n", body_len);
     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
     used += (size_t)n;
   }
@@ -729,5 +762,252 @@ int sip_request_get_body(const char *buf, size_t len, const char **body_out, siz
   return 0;
 }
 
+/* ==== Packet rewrite helpers ====
+ *
+ * Each function copies buf→out with one targeted modification.
+ * Returns new length, or -1 on overflow/error. */
 
+/* Helper: append n bytes from src to out. Returns 0 on success, -1 if it would overflow. */
+static int rw_append(char *out, size_t cap, size_t *used, const char *src, size_t n) {
+  if (*used + n > cap) return -1;
+  memcpy(out + *used, src, n);
+  *used += n;
+  return 0;
+}
 
+/* Helper: find end of first line (before \r\n or \n). */
+static const char *rw_first_line_end(const char *buf, size_t len) {
+  const char *p = buf;
+  while (p < buf + len && *p != '\r' && *p != '\n') p++;
+  return p;
+}
+
+/* Helper: advance past \r\n or \n. */
+static const char *rw_skip_eol(const char *p, const char *end) {
+  if (p < end && *p == '\r') p++;
+  if (p < end && *p == '\n') p++;
+  return p;
+}
+
+/* Replace Request-URI: "METHOD <old> SIP/2.0\r\n" → "METHOD <new_uri> SIP/2.0\r\n". */
+int sip_rewrite_request_uri(const char *buf, size_t len, const char *new_uri,
+                            char *out, size_t out_cap) {
+  /* Find the two spaces that delimit the Request-URI on the first line:
+   * METHOD<sp>REQUEST-URI<sp>SIP/2.0 */
+  const char *end = buf + len;
+  const char *sp1 = memchr(buf, ' ', len);
+  if (!sp1 || sp1 + 1 >= end) return -1;
+  const char *sp2 = memchr(sp1 + 1, ' ', (size_t)(end - sp1 - 1));
+  if (!sp2) return -1;
+
+  size_t used = 0;
+  /* Copy: "METHOD " */
+  if (rw_append(out, out_cap, &used, buf, (size_t)(sp1 + 1 - buf))) return -1;
+  /* Write new URI. */
+  size_t uri_len = strlen(new_uri);
+  if (rw_append(out, out_cap, &used, new_uri, uri_len)) return -1;
+  /* Copy: " SIP/2.0\r\n..." (from sp2 onwards). */
+  size_t tail = (size_t)(end - sp2);
+  if (rw_append(out, out_cap, &used, sp2, tail)) return -1;
+  return (int)used;
+}
+
+/* Insert "Via: <via_value>\r\n" right after the first line. */
+int sip_prepend_via(const char *buf, size_t len, const char *via_value,
+                    char *out, size_t out_cap) {
+  const char *end = buf + len;
+  const char *le  = rw_first_line_end(buf, len);
+  const char *after_eol = rw_skip_eol(le, end);
+
+  size_t used = 0;
+  /* Copy first line + its EOL. */
+  if (rw_append(out, out_cap, &used, buf, (size_t)(after_eol - buf))) return -1;
+  /* Insert Via header. */
+  int n = snprintf(out + used, out_cap - used, "Via: %s\r\n", via_value);
+  if (n < 0 || used + (size_t)n >= out_cap) return -1;
+  used += (size_t)n;
+  /* Copy rest of the message. */
+  size_t rest = (size_t)(end - after_eol);
+  if (rw_append(out, out_cap, &used, after_eol, rest)) return -1;
+  return (int)used;
+}
+
+/* Remove the first Via header line (our Via). */
+int sip_strip_top_via(const char *buf, size_t len, char *out, size_t out_cap) {
+  const char *end = buf + len;
+  const char *p = buf;
+  /* Skip first line. */
+  const char *le = rw_first_line_end(buf, len);
+  p = rw_skip_eol(le, end);
+
+  /* Scan for first "Via:" header. */
+  const char *via_start = NULL, *via_end = NULL;
+  while (p < end) {
+    const char *ls = p;
+    const char *ll_end = ls;
+    while (ll_end < end && *ll_end != '\r' && *ll_end != '\n') ll_end++;
+    size_t ll = (size_t)(ll_end - ls);
+    if (ll == 0) { p = rw_skip_eol(ll_end, end); break; } /* blank line = headers done */
+    if (!via_start && ll >= 4 &&
+        (ls[0] == 'V' || ls[0] == 'v') && (ls[1] == 'I' || ls[1] == 'i') &&
+        (ls[2] == 'A' || ls[2] == 'a') && ls[3] == ':') {
+      via_start = ls;
+      via_end   = rw_skip_eol(ll_end, end);
+    }
+    p = rw_skip_eol(ll_end, end);
+  }
+  if (!via_start) {
+    /* No Via found; copy verbatim. */
+    if (len > out_cap) return -1;
+    memcpy(out, buf, len);
+    return (int)len;
+  }
+  size_t used = 0;
+  /* Copy everything before the Via line. */
+  if (rw_append(out, out_cap, &used, buf, (size_t)(via_start - buf))) return -1;
+  /* Skip the Via line, copy everything after. */
+  size_t rest = (size_t)(end - via_end);
+  if (rw_append(out, out_cap, &used, via_end, rest)) return -1;
+  return (int)used;
+}
+
+/* Replace the value of the first occurrence of header_name. */
+int sip_rewrite_header(const char *buf, size_t len, const char *header_name,
+                       const char *new_value, char *out, size_t out_cap) {
+  size_t name_len = strlen(header_name);
+  const char *end = buf + len;
+  const char *p = buf;
+  /* Skip first line. */
+  const char *le = rw_first_line_end(buf, len);
+  p = rw_skip_eol(le, end);
+
+  while (p < end) {
+    const char *ls = p;
+    const char *ll_end = ls;
+    while (ll_end < end && *ll_end != '\r' && *ll_end != '\n') ll_end++;
+    size_t ll = (size_t)(ll_end - ls);
+    if (ll == 0) break; /* blank line = end of headers */
+
+    /* Case-insensitive match: "Header-Name:" */
+    if (ll > name_len && ls[name_len] == ':' &&
+        strncasecmp(ls, header_name, name_len) == 0) {
+      size_t used = 0;
+      /* Copy everything before this line. */
+      if (rw_append(out, out_cap, &used, buf, (size_t)(ls - buf))) return -1;
+      /* Write replacement: "Header-Name: <new_value>\r\n" */
+      int n = snprintf(out + used, out_cap - used, "%s: %s\r\n", header_name, new_value);
+      if (n < 0 || used + (size_t)n >= out_cap) return -1;
+      used += (size_t)n;
+      /* Copy everything after this line. */
+      const char *after = rw_skip_eol(ll_end, end);
+      size_t rest = (size_t)(end - after);
+      if (rw_append(out, out_cap, &used, after, rest)) return -1;
+      return (int)used;
+    }
+    p = rw_skip_eol(ll_end, end);
+  }
+  /* Header not found; copy verbatim. */
+  if (len > out_cap) return -1;
+  memcpy(out, buf, len);
+  return (int)len;
+}
+
+/* Insert a new header line before the header/body separator.
+ * If the header already exists, copy verbatim (no duplicate). */
+int sip_insert_header(const char *buf, size_t len, const char *header_name,
+                      const char *value, char *out, size_t out_cap) {
+  size_t name_len = strlen(header_name);
+  const char *end = buf + len;
+  const char *p = buf;
+  /* Skip first line. */
+  const char *le = rw_first_line_end(buf, len);
+  p = rw_skip_eol(le, end);
+  /* Check if header already exists. */
+  while (p < end) {
+    const char *ls = p;
+    const char *ll_end = ls;
+    while (ll_end < end && *ll_end != '\r' && *ll_end != '\n') ll_end++;
+    size_t ll = (size_t)(ll_end - ls);
+    if (ll == 0) break; /* blank line */
+    if (ll > name_len && ls[name_len] == ':' &&
+        strncasecmp(ls, header_name, name_len) == 0) {
+      /* Already exists; copy verbatim. */
+      if (len > out_cap) return -1;
+      memcpy(out, buf, len);
+      return (int)len;
+    }
+    p = rw_skip_eol(ll_end, end);
+  }
+  /* p now points at the blank line (or end). Insert header before it. */
+  size_t used = 0;
+  size_t prefix = (size_t)(p - buf);
+  if (rw_append(out, out_cap, &used, buf, prefix)) return -1;
+  int n = snprintf(out + used, out_cap - used, "%s: %s\r\n", header_name, value);
+  if (n < 0 || used + (size_t)n >= out_cap) return -1;
+  used += (size_t)n;
+  size_t rest = (size_t)(end - p);
+  if (rw_append(out, out_cap, &used, p, rest)) return -1;
+  return (int)used;
+}
+
+/* Replace message body and update Content-Length (+ Content-Type). */
+int sip_rewrite_body(const char *buf, size_t len,
+                     const char *new_body, size_t new_body_len,
+                     char *out, size_t out_cap) {
+  /* Find the header/body separator (\r\n\r\n). */
+  const char *sep = NULL;
+  for (const char *p = buf; p + 3 < buf + len; p++) {
+    if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
+      sep = p;
+      break;
+    }
+  }
+  if (!sep) {
+    /* No separator found; treat entire message as headers, append body. */
+    sep = buf + len;
+  }
+
+  /* Copy headers up to (but not including) the separator, skipping existing
+   * Content-Length and Content-Type lines (we'll rewrite them).
+   * Use sep+2 as the scan limit so the last header's trailing \r\n is
+   * included (sep points at the first \r of \r\n\r\n). */
+  size_t used = 0;
+  const char *hdr_end = (sep < buf + len) ? sep + 2 : sep;
+  const char *p = buf;
+  while (p < hdr_end) {
+    const char *ls = p;
+    const char *le = ls;
+    while (le < hdr_end && *le != '\r' && *le != '\n') le++;
+    size_t ll = (size_t)(le - ls);
+    if (ll == 0) break; /* blank line = header/body boundary */
+    const char *after = rw_skip_eol(le, hdr_end);
+
+    /* Skip Content-Length and Content-Type headers. */
+    if ((ll >= 15 && strncasecmp(ls, "Content-Length:", 15) == 0) ||
+        (ll >= 13 && strncasecmp(ls, "Content-Type:",  13) == 0)) {
+      p = after;
+      continue;
+    }
+    if (rw_append(out, out_cap, &used, ls, (size_t)(after - ls))) return -1;
+    p = after;
+  }
+
+  /* Append Content-Type + Content-Length + blank line + body. */
+  int n;
+  if (new_body && new_body_len > 0) {
+    n = snprintf(out + used, out_cap - used,
+                 "Content-Type: application/sdp\r\n"
+                 "Content-Length: %zu\r\n\r\n",
+                 new_body_len);
+  } else {
+    n = snprintf(out + used, out_cap - used,
+                 "Content-Length: 0\r\n\r\n");
+  }
+  if (n < 0 || used + (size_t)n >= out_cap) return -1;
+  used += (size_t)n;
+
+  if (new_body && new_body_len > 0) {
+    if (rw_append(out, out_cap, &used, new_body, new_body_len)) return -1;
+  }
+  return (int)used;
+}

@@ -1,136 +1,154 @@
 /*
- * SDP (Session Description Protocol) parser and builder.
- * Used in SIP bodies to describe RTP sessions; format is independent of SIP.
+ * SDP helpers: parse media info and rewrite addresses.
+ *
+ * These operate on raw SDP text. No SDP is rebuilt from scratch — only
+ * c= IP addresses and m= ports are substituted. Everything else passes
+ * through verbatim so endpoint-specific attributes are preserved.
  */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
 
 #include "AppModule/sdp_parse.h"
 
-int sdp_parse_all_media(const char *body, size_t body_len, sdp_media_block_t *blocks, size_t max_blocks, size_t *n_out) {
+/* ---- Internal helpers ---- */
+
+/* Advance *p past \r\n or \n. */
+static void skip_eol(const char **p, const char *end) {
+  if (*p < end && **p == '\r') (*p)++;
+  if (*p < end && **p == '\n') (*p)++;
+}
+
+/* Return pointer to end of current line (before \r or \n). */
+static const char *line_end(const char *p, const char *end) {
+  while (p < end && *p != '\r' && *p != '\n') p++;
+  return p;
+}
+
+/* ---- Parse ---- */
+
+int sdp_parse_media(const char *body, size_t body_len,
+                    sdp_media_t *media, size_t max_media, size_t *n_out) {
   *n_out = 0;
   const char *p = body, *end = body + body_len;
-  const char *session_c = NULL;
-  size_t session_c_len = 0;
-  while (p < end && *n_out < max_blocks) {
-    const char *line_start = p;
-    while (p < end && *p != '\r' && *p != '\n') p++;
-    size_t line_len = (size_t)(p - line_start);
-    if (line_len >= 2 && line_start[0] == 'c' && line_start[1] == '=') {
-      if (!session_c && line_len >= 12 && strncmp(line_start, "c=IN IP4 ", 9) == 0) {
-        session_c = line_start + 9;
-        session_c_len = line_len - 9;
-        while (session_c_len > 0 && (session_c[session_c_len - 1] == '\r' || session_c[session_c_len - 1] == '\n'))
-          session_c_len--;
-      }
-    } else if (line_len >= 2 && line_start[0] == 'm' && line_start[1] == '=') {
-      sdp_media_block_t *out = &blocks[*n_out];
-      memset(out, 0, sizeof(*out));
-      const char *m_rest = line_start + 2;
-      while (m_rest < line_start + line_len && (*m_rest == ' ' || *m_rest == '\t')) m_rest++;
-      const char *media_end = m_rest;
-      while (media_end < line_start + line_len && *media_end != ' ' && *media_end != '\t') media_end++;
-      out->m_media = m_rest;
-      out->m_media_len = (size_t)(media_end - m_rest);
-      m_rest = media_end;
-      while (m_rest < line_start + line_len && (*m_rest == ' ' || *m_rest == '\t')) m_rest++;
-      const char *port_start = m_rest;
-      while (port_start < line_start + line_len && *port_start >= '0' && *port_start <= '9') port_start++;
-      if (port_start > m_rest) {
-        out->m_port = atoi(m_rest);
-        out->m_rest = port_start;
-        while (out->m_rest < line_start + line_len && (*out->m_rest == ' ' || *out->m_rest == '\t')) out->m_rest++;
-        out->m_rest_len = (size_t)((line_start + line_len) - out->m_rest);
-      }
-      if (session_c) {
-        out->c_addr = session_c;
-        out->c_addr_len = session_c_len;
-      }
-      if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2;
-      else if (p < end) p++;
-      size_t a_used = 0, a_cap = 2048;
-      out->a_block = malloc(a_cap);
-      if (!out->a_block) goto fail;
-      while (p < end) {
-        const char *a_start = p;
-        while (p < end && *p != '\r' && *p != '\n') p++;
-        if (a_start == p) break;
-        size_t a_len = (size_t)(p - a_start);
-        if (a_len >= 2 && a_start[0] == 'a' && a_start[1] == '=') {
-          if (a_used + a_len + 2 <= a_cap) {
-            memcpy(out->a_block + a_used, a_start, a_len);
-            out->a_block[a_used + a_len] = '\r';
-            out->a_block[a_used + a_len + 1] = '\n';
-            a_used += a_len + 2;
-          }
-        } else if (a_len >= 2 && a_start[0] == 'm' && a_start[1] == '=')
-          break;
-        if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2;
-        else if (p < end) p++;
-      }
-      out->a_block_len = a_used;
+  char session_ip[64] = {0};
+
+  while (p < end) {
+    const char *ls = p;
+    const char *le = line_end(p, end);
+    size_t ll = (size_t)(le - ls);
+
+    /* Session-level c= (before first m=). */
+    if (*n_out == 0 && ll >= 12 && ls[0] == 'c' && ls[1] == '=' &&
+        strncmp(ls, "c=IN IP4 ", 9) == 0) {
+      size_t iplen = ll - 9;
+      if (iplen >= sizeof(session_ip)) iplen = sizeof(session_ip) - 1;
+      memcpy(session_ip, ls + 9, iplen);
+      session_ip[iplen] = '\0';
+    }
+
+    /* m= line: start of a new media section. */
+    if (ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
+      if (*n_out >= max_media) break;
+      sdp_media_t *m = &media[*n_out];
+      memset(m, 0, sizeof(*m));
+
+      /* Copy session-level IP as default. */
+      if (session_ip[0])
+        snprintf(m->ip, sizeof(m->ip), "%s", session_ip);
+
+      /* Parse port: m=<type> <port> ... */
+      const char *q = ls + 2;
+      while (q < le && *q != ' ') q++;   /* skip media type */
+      while (q < le && *q == ' ') q++;    /* skip space */
+      if (q < le) m->port = atoi(q);
+
       (*n_out)++;
+
+      /* Scan following lines for media-level c= (overrides session-level). */
+      p = le; skip_eol(&p, end);
+      while (p < end) {
+        const char *als = p;
+        const char *ale = line_end(p, end);
+        size_t all = (size_t)(ale - als);
+        if (all >= 2 && als[0] == 'm' && als[1] == '=') break; /* next media */
+        if (all >= 12 && strncmp(als, "c=IN IP4 ", 9) == 0) {
+          size_t iplen = all - 9;
+          if (iplen >= sizeof(m->ip)) iplen = sizeof(m->ip) - 1;
+          memcpy(m->ip, als + 9, iplen);
+          m->ip[iplen] = '\0';
+        }
+        p = ale; skip_eol(&p, end);
+      }
+      continue;
     }
-    if (p + 1 < end && p[0] == '\r' && p[1] == '\n') p += 2;
-    else if (p < end) p++;
+    p = le; skip_eol(&p, end);
   }
-  return (*n_out) > 0 ? 0 : -1;
-fail:
-  for (size_t i = 0; i < *n_out; i++)
-    free(blocks[i].a_block);
-  *n_out = 0;
-  return -1;
+  return (*n_out > 0) ? 0 : -1;
 }
 
-void sdp_media_blocks_free(sdp_media_block_t *blocks, size_t n) {
-  for (size_t i = 0; i < n; i++)
-    free(blocks[i].a_block);
-}
+/* ---- Rewrite ---- */
 
-int sdp_build(const char *session_addr, const sdp_media_block_t *blocks, size_t n_blocks,
-  const int *port_per_media, int skip_media_with_port_le_zero,
-  char **out_body, size_t *out_len) {
-  if (!session_addr || !out_body || !out_len) return -1;
-  size_t cap = 256;
-  for (size_t i = 0; i < n_blocks; i++)
-    cap += 128 + blocks[i].m_rest_len + (blocks[i].a_block_len ? blocks[i].a_block_len : 0);
-  char *out = malloc(cap);
-  if (!out) return -1;
+int sdp_rewrite_addr(const char *body, size_t body_len,
+                     const char *new_ip, int new_port,
+                     char *out, size_t out_cap) {
+  const char *p = body, *end = body + body_len;
   size_t used = 0;
-  unsigned long o_sess = (unsigned long)time(NULL);
-  int n = snprintf(out + used, cap - used, "v=0\r\no=- %lu %lu IN IP4 %s\r\ns=-\r\nc=IN IP4 %s\r\nt=0 0\r\n",
-    o_sess, o_sess, session_addr, session_addr);
-  if (n <= 0 || (size_t)n >= cap) {
-    free(out);
-    return -1;
-  }
-  used += (size_t)n;
-  int any_written = 0;
-  for (size_t i = 0; i < n_blocks; i++) {
-    int port = port_per_media ? port_per_media[i] : blocks[i].m_port;
-    if (skip_media_with_port_le_zero && port <= 0) continue;
-    if (port < 0) port = 0;
-    const sdp_media_block_t *b = &blocks[i];
-    n = snprintf(out + used, cap - used, "m=%.*s %d %.*s\r\n",
-      (int)b->m_media_len, b->m_media, port, (int)b->m_rest_len, b->m_rest);
-    if (n <= 0 || (size_t)(used + n) >= cap) {
-      free(out);
-      return -1;
+  int port_rewritten = 0; /* only rewrite first audio m= port */
+
+  /* Macro: append n bytes; fail if overflows. */
+  #define APPEND(src, n) do { \
+    if (used + (n) > out_cap) return -1; \
+    memcpy(out + used, (src), (n)); \
+    used += (n); \
+  } while (0)
+
+  while (p < end) {
+    const char *ls = p;
+    const char *le = line_end(p, end);
+    size_t ll = (size_t)(le - ls);
+
+    /* Rewrite c=IN IP4 <addr> lines. */
+    if (ll >= 12 && ls[0] == 'c' && ls[1] == '=' &&
+        strncmp(ls, "c=IN IP4 ", 9) == 0) {
+      int n = snprintf(out + used, out_cap - used, "c=IN IP4 %s", new_ip);
+      if (n < 0 || used + (size_t)n >= out_cap) return -1;
+      used += (size_t)n;
     }
-    used += (size_t)n;
-    if (b->a_block && b->a_block_len && used + b->a_block_len <= cap) {
-      memcpy(out + used, b->a_block, b->a_block_len);
-      used += b->a_block_len;
+    /* Rewrite port on the first m= line (any media type: audio, video, etc.). */
+    else if (!port_rewritten && ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
+      const char *q = ls + 2;
+      while (q < le && *q != ' ') q++;  /* skip media type */
+      if (q < le) {
+        q++;  /* skip space after type */
+        /* Copy "m=<type> " prefix verbatim. */
+        size_t prefix = (size_t)(q - ls);
+        APPEND(ls, prefix);
+        /* Skip old port digits. */
+        while (q < le && *q >= '0' && *q <= '9') q++;
+        /* Write new port. */
+        int n = snprintf(out + used, out_cap - used, "%d", new_port);
+        if (n < 0 || used + (size_t)n >= out_cap) return -1;
+        used += (size_t)n;
+        /* Append rest of m= line (e.g. " RTP/AVP 8 0 101"). */
+        size_t rest = (size_t)(le - q);
+        APPEND(q, rest);
+        port_rewritten = 1;
+      } else {
+        /* Malformed m= line (no space); copy verbatim. */
+        APPEND(ls, ll);
+      }
     }
-    any_written = 1;
+    /* All other lines: copy verbatim. */
+    else {
+      APPEND(ls, ll);
+    }
+
+    /* Copy the line ending (preserve \r\n or \n). */
+    p = le;
+    if (p < end && *p == '\r') { APPEND(p, 1); p++; }
+    if (p < end && *p == '\n') { APPEND(p, 1); p++; }
   }
-  if (!any_written && skip_media_with_port_le_zero) {
-    free(out);
-    return -1;
-  }
-  *out_body = out;
-  *out_len = used;
-  return 0;
+  #undef APPEND
+  return (int)used;
 }

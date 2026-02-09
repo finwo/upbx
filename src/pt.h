@@ -20,10 +20,12 @@
 
 /* ---------------------------------------------------------------------------
  * Internal: unique labels for continuation points (GCC addrlabels).
- * Same pattern as lc-addrlabels.h: two-level concat so __LINE__ expands.
+ * Not for direct use; merged into PT_BEGIN / PT_WAIT_UNTIL / PT_YIELD etc.
  * --------------------------------------------------------------------------- */
 #define PT_CONCAT2(s1, s2)   s1##s2
 #define PT_CONCAT(s1, s2)    PT_CONCAT2(s1, s2)
+
+/** Resume continuation for \a pt if set; otherwise fall through. */
 
 #define PT_RESUME(pt) \
   do { \
@@ -31,6 +33,7 @@
       goto *(pt)->lc; \
   } while (0)
 
+/** Set continuation for \a pt at current line. */
 #define PT_SET(pt) \
   do { \
     PT_CONCAT(PT_LABEL, __LINE__): \
