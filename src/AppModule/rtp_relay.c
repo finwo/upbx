@@ -1,6 +1,6 @@
 /*
- * Built-in RTP relay (AppModule): runs as a neco coroutine; uses neco_wait_dl
- * on RTP/RTCP sockets and forwards packets between the two legs of a call.
+ * Built-in RTP relay (AppModule): single-threaded; sockets are non-blocking.
+ * Main loop calls rtp_relay_fill_fds() then select(); then rtp_relay_poll() to read/forward.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -8,12 +8,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "tidwall/neco.h"
 #include "config.h"
+#include "socket_util.h"
 #include "AppModule/rtp_relay.h"
 
 #define RTP_RELAY_TABLE_SIZE  512
@@ -42,8 +43,6 @@ typedef struct {
 } rtp_relay_entry_t;
 
 static rtp_relay_entry_t rtp_table[RTP_RELAY_TABLE_SIZE];
-static neco_mutex rtp_mutex;
-static int rtp_mutex_initialized;
 static int rtp_port_low = 10000;
 static int rtp_port_high = 20000;
 static int rtp_prev_port = 0;
@@ -73,6 +72,10 @@ static int sockbind(struct in_addr addr, int port) {
   sa.sin_addr = addr;
   sa.sin_port = htons((uint16_t)port);
   if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    close(sock);
+    return -1;
+  }
+  if (set_socket_nonblocking(sock, 1) != 0) {
     close(sock);
     return -1;
   }
@@ -116,96 +119,71 @@ static int match_socket(int idx) {
   return -1;
 }
 
-/* Neco coroutine: wait on relay sockets with neco_wait_dl, forward packets, age idle streams. */
-void rtp_relay_coro(int argc, void *argv[]) {
-  (void)argc;
-  (void)argv;
+void rtp_relay_fill_fds(fd_set *read_set, int *maxfd) {
+  for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
+    if (rtp_table[i].rtp_rx_sock > 0) {
+      FD_SET(rtp_table[i].rtp_rx_sock, read_set);
+      if (rtp_table[i].rtp_rx_sock > *maxfd) *maxfd = rtp_table[i].rtp_rx_sock;
+      FD_SET(rtp_table[i].rtp_con_rx_sock, read_set);
+      if (rtp_table[i].rtp_con_rx_sock > *maxfd) *maxfd = rtp_table[i].rtp_con_rx_sock;
+    }
+  }
+}
+
+static void rtp_relay_age_idle(void) {
+  time_t now = time(NULL);
+  for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
+    if (rtp_table[i].rtp_rx_sock <= 0) continue;
+    if (rtp_table[i].timestamp + RTP_TIMEOUT_SEC >= now) continue;
+    if (rtp_table[i].rtp_rx_sock > 0) close(rtp_table[i].rtp_rx_sock);
+    if (rtp_table[i].rtp_con_rx_sock > 0) close(rtp_table[i].rtp_con_rx_sock);
+    if (rtp_table[i].opposite_entry >= 0)
+      rtp_table[rtp_table[i].opposite_entry].opposite_entry = -1;
+    memset(&rtp_table[i], 0, sizeof(rtp_table[i]));
+  }
+  rtp_recreate_fdset();
+}
+
+void rtp_relay_poll(fd_set *read_set) {
+  static time_t last_aging = 0;
   char buf[RTP_BUFFER_SIZE];
-  time_t last_aging = 0;
+  time_t now = time(NULL);
 
-  if (!rtp_mutex_initialized)
-    return;
-
-  for (;;) {
-    int64_t deadline = neco_now() + 5000000000; /* 5 s */
-    int processed = 0;
-
-    for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
-      int fd1 = -1, fd2 = -1;
-      neco_mutex_lock(&rtp_mutex);
-      if (rtp_table[i].rtp_rx_sock <= 0) {
-        neco_mutex_unlock(&rtp_mutex);
-        continue;
-      }
-      fd1 = rtp_table[i].rtp_rx_sock;
-      fd2 = rtp_table[i].rtp_con_rx_sock;
-      neco_mutex_unlock(&rtp_mutex);
-
-      int r = neco_wait_dl(fd1, NECO_WAIT_READ, deadline);
-      if (r == NECO_OK) {
-        neco_mutex_lock(&rtp_mutex);
-        if (rtp_table[i].rtp_rx_sock == fd1 && rtp_table[i].rtp_tx_sock > 0) {
-          ssize_t count = read(fd1, buf, sizeof(buf));
-          if (count > 0) {
-            struct sockaddr_in dst;
-            memset(&dst, 0, sizeof(dst));
-            dst.sin_family = AF_INET;
-            dst.sin_addr = rtp_table[i].remote_ipaddr;
-            dst.sin_port = htons((uint16_t)rtp_table[i].remote_port);
-            sendto(rtp_table[i].rtp_tx_sock, buf, (size_t)count, 0,
-                   (struct sockaddr *)&dst, sizeof(dst));
-            rtp_table[i].timestamp = time(NULL);
-            if (rtp_table[i].opposite_entry >= 0)
-              rtp_table[rtp_table[i].opposite_entry].timestamp = rtp_table[i].timestamp;
-          }
-        }
-        neco_mutex_unlock(&rtp_mutex);
-        processed = 1;
-        break;
-      }
-      if (r == NECO_TIMEDOUT)
-        break;
-
-      r = neco_wait_dl(fd2, NECO_WAIT_READ, deadline);
-      if (r == NECO_OK) {
-        neco_mutex_lock(&rtp_mutex);
-        if (rtp_table[i].rtp_con_rx_sock == fd2 && rtp_table[i].rtp_con_tx_sock > 0) {
-          ssize_t count = read(fd2, buf, sizeof(buf));
-          if (count > 0) {
-            struct sockaddr_in dst;
-            memset(&dst, 0, sizeof(dst));
-            dst.sin_family = AF_INET;
-            dst.sin_addr = rtp_table[i].remote_ipaddr;
-            dst.sin_port = htons((uint16_t)(rtp_table[i].remote_port + 1));
-            sendto(rtp_table[i].rtp_con_tx_sock, buf, (size_t)count, 0,
-                   (struct sockaddr *)&dst, sizeof(dst));
-          }
-        }
-        neco_mutex_unlock(&rtp_mutex);
-        processed = 1;
-        break;
-      }
-      if (r == NECO_TIMEDOUT)
-        break;
-    }
-
-    /* Age out idle streams */
-    time_t now = time(NULL);
-    if (now > last_aging && !processed) {
-      last_aging = now + 10;
-      neco_mutex_lock(&rtp_mutex);
-      for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
-        if (rtp_table[i].rtp_rx_sock <= 0) continue;
-        if (rtp_table[i].timestamp + RTP_TIMEOUT_SEC >= now) continue;
-        if (rtp_table[i].rtp_rx_sock > 0) close(rtp_table[i].rtp_rx_sock);
-        if (rtp_table[i].rtp_con_rx_sock > 0) close(rtp_table[i].rtp_con_rx_sock);
+  for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
+    if (rtp_table[i].rtp_rx_sock <= 0) continue;
+    int fd1 = rtp_table[i].rtp_rx_sock;
+    int fd2 = rtp_table[i].rtp_con_rx_sock;
+    if (FD_ISSET(fd1, read_set) && rtp_table[i].rtp_tx_sock > 0) {
+      ssize_t count = read(fd1, buf, sizeof(buf));
+      if (count > 0) {
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_addr = rtp_table[i].remote_ipaddr;
+        dst.sin_port = htons((uint16_t)rtp_table[i].remote_port);
+        sendto(rtp_table[i].rtp_tx_sock, buf, (size_t)count, 0,
+               (struct sockaddr *)&dst, sizeof(dst));
+        rtp_table[i].timestamp = now;
         if (rtp_table[i].opposite_entry >= 0)
-          rtp_table[rtp_table[i].opposite_entry].opposite_entry = -1;
-        memset(&rtp_table[i], 0, sizeof(rtp_table[i]));
+          rtp_table[rtp_table[i].opposite_entry].timestamp = now;
       }
-      rtp_recreate_fdset();
-      neco_mutex_unlock(&rtp_mutex);
     }
+    if (FD_ISSET(fd2, read_set) && rtp_table[i].rtp_con_tx_sock > 0) {
+      ssize_t count = read(fd2, buf, sizeof(buf));
+      if (count > 0) {
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_addr = rtp_table[i].remote_ipaddr;
+        dst.sin_port = htons((uint16_t)(rtp_table[i].remote_port + 1));
+        sendto(rtp_table[i].rtp_con_tx_sock, buf, (size_t)count, 0,
+               (struct sockaddr *)&dst, sizeof(dst));
+      }
+    }
+  }
+  if (now > last_aging) {
+    last_aging = now + 10;
+    rtp_relay_age_idle();
   }
 }
 
@@ -220,11 +198,6 @@ int rtp_relay_init(struct upbx_config *cfg) {
   rtp_prev_port = rtp_port_high;
   memset(rtp_table, 0, sizeof(rtp_table));
   FD_ZERO(&rtp_master_fdset);
-  if (!rtp_mutex_initialized) {
-    if (neco_mutex_init(&rtp_mutex) != 0)
-      return -1;
-    rtp_mutex_initialized = 1;
-  }
   return 0;
 }
 
@@ -239,8 +212,6 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
   if (call_id_number && strlen(call_id_number) >= CALLID_NUM_SIZE) return -1;
   if (call_id_host && strlen(call_id_host) >= CALLID_HOST_SIZE) return -1;
 
-  neco_mutex_lock(&rtp_mutex);
-
   /* Already active? (e.g. duplicate INVITE) */
   for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
     if (rtp_table[i].rtp_rx_sock <= 0) continue;
@@ -252,7 +223,6 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
     rtp_table[i].remote_ipaddr = remote_ip;
     if (cseq > rtp_table[i].cseq) rtp_table[i].cseq = cseq;
     *local_port = rtp_table[i].local_port;
-    neco_mutex_unlock(&rtp_mutex);
     return 0;
   }
 
@@ -260,10 +230,8 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
   for (int j = 0; j < RTP_RELAY_TABLE_SIZE; j++) {
     if (rtp_table[j].rtp_rx_sock == 0) { freeidx = j; break; }
   }
-  if (freeidx < 0) {
-    neco_mutex_unlock(&rtp_mutex);
+  if (freeidx < 0)
     return -1;
-  }
 
   int num_ports = rtp_port_high - rtp_port_low + 1;
   if (num_ports <= 0) num_ports = 1;
@@ -294,10 +262,8 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
     break;
   }
 
-  if (port == 0 || sock < 0 || sock_con < 0) {
-    neco_mutex_unlock(&rtp_mutex);
+  if (port == 0 || sock < 0 || sock_con < 0)
     return -1;
-  }
 
   rtp_table[freeidx].rtp_rx_sock = sock;
   rtp_table[freeidx].rtp_con_rx_sock = sock_con;
@@ -319,13 +285,11 @@ int rtp_relay_start_fwd(struct upbx_config *cfg,
   match_socket(freeidx);
   rtp_recreate_fdset();
   *local_port = port;
-  neco_mutex_unlock(&rtp_mutex);
   return 0;
 }
 
 int rtp_relay_stop_fwd(const char *call_id_number, const char *call_id_host,
   int rtp_direction, int media_stream_no, int cseq) {
-  neco_mutex_lock(&rtp_mutex);
   int found = 0;
   for (int i = 0; i < RTP_RELAY_TABLE_SIZE; i++) {
     if (rtp_table[i].rtp_rx_sock <= 0) continue;
@@ -343,6 +307,5 @@ int rtp_relay_stop_fwd(const char *call_id_number, const char *call_id_host,
     found = 1;
   }
   if (found) rtp_recreate_fdset();
-  neco_mutex_unlock(&rtp_mutex);
   return found ? 0 : -1;
 }

@@ -2,6 +2,7 @@
 #define UPBX_RTP_RELAY_H
 
 #include <stddef.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 
 struct upbx_config;
@@ -15,12 +16,14 @@ struct upbx_config;
 #define RTP_RELAY_CALL_OUTGOING  1
 
 /* Initialize built-in RTP relay (port range, table). Uses cfg->rtp_port_low/high.
- * Call once at startup. Then start rtp_relay_coro with neco_start(rtp_relay_coro, 1, cfg).
- * Returns 0 on success, -1 on error. */
+ * Call once at startup. Returns 0 on success, -1 on error. */
 int rtp_relay_init(struct upbx_config *cfg);
 
-/* Neco coroutine: RTP relay loop (wait on sockets, forward, age). argv[0] = upbx_config* (unused; init already set ports). */
-void rtp_relay_coro(int argc, void *argv[]);
+/* Add all active RTP/RTCP socket fds to the set for select(). */
+void rtp_relay_fill_fds(fd_set *read_set, int *maxfd);
+
+/* For each fd in read_set that is an RTP relay socket, read and forward. Call after select(). */
+void rtp_relay_poll(fd_set *read_set);
 
 /* Start one RTP relay leg. local_ip: we bind to this (e.g. INADDR_ANY).
  * remote_ip/remote_port: the UA we're receiving from / sending to.

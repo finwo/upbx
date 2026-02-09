@@ -1,7 +1,7 @@
 /*
  * SIP server: listen on UDP, receive datagrams, parse SIP with minimal parser (no libosip2),
  * handle REGISTER (extension auth, registration store) and INVITE (call routing).
- * All I/O via tidwall/neco.
+ * Single-threaded: select() loop and protothreads (pt.h); UDP sockets are non-blocking.
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -11,12 +11,15 @@
 #include <unistd.h>
 #include <time.h>
 #include <regex.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <ifaddrs.h>
 
-#include "tidwall/neco.h"
+#include "pt.h"
+#include "socket_util.h"
 #include "AppModule/rtp_relay.h"
 #include "rxi/log.h"
 #include "config.h"
@@ -132,7 +135,7 @@ static ext_reg_t *reg_list;
 static size_t reg_count;
 static size_t reg_cap;
 static int reg_list_ready;
-static int reg_list_notify_pending;  /* set by handle_register; drained in main loop to avoid neco_write from child coroutine */
+static int reg_list_notify_pending;  /* set by handle_register; drained in main loop */
 
 /* Build WWW-Authenticate for 401. Legacy only (no qop) for maximum compatibility. Caller frees. */
 static char *build_www_authenticate(void) {
@@ -426,6 +429,7 @@ typedef struct incoming_call {
   char *source_str;   /* DID (for CALL.ANSWER/HANGUP) */
   char *dest_str;     /* answering extension (set on 2xx) */
   time_t answered_at; /* when 2xx was received (for duration) */
+  time_t created_at;  /* when call was created (for overflow timeout) */
 } incoming_call_t;
 
 static int sockaddr_match(const struct sockaddr_storage *a, socklen_t alen, const struct sockaddr_storage *b, socklen_t blen) {
@@ -434,28 +438,22 @@ static int sockaddr_match(const struct sockaddr_storage *a, socklen_t alen, cons
 }
 
 static incoming_call_t *call_list;
-static neco_mutex call_mutex;
-static int call_mutex_initialized;
 
 __attribute__((unused))
 static incoming_call_t *call_find(const char *call_id) {
   incoming_call_t *c;
-  if (!call_id || !call_mutex_initialized) return NULL;
-  neco_mutex_lock(&call_mutex);
+  if (!call_id) return NULL;
   for (c = call_list; c; c = c->next)
-    if (c->call_id && strcmp(c->call_id, call_id) == 0) break;
-  neco_mutex_unlock(&call_mutex);
+    if (c->call_id && strcmp(c->call_id, call_id) == 0) return c;
   return c;
 }
 
-/* Find call by Call-ID with mutex held; caller must unlock. Returns NULL with mutex released. */
+/* Find call by Call-ID. Single-threaded: no lock. */
 static incoming_call_t *call_find_locked(const char *call_id) {
   incoming_call_t *c;
-  if (!call_id || !call_mutex_initialized) return NULL;
-  neco_mutex_lock(&call_mutex);
+  if (!call_id) return NULL;
   for (c = call_list; c; c = c->next)
     if (c->call_id && strcmp(c->call_id, call_id) == 0) return c;
-  neco_mutex_unlock(&call_mutex);
   return NULL;
 }
 
@@ -485,7 +483,7 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
   plugin_notify_event("CALL.HANGUP", 4, argv);
 }
 
-/* Unlink and free call; expects call_mutex held. Emits CALL.HANGUP before free. */
+/* Unlink and free call. Emits CALL.HANGUP before free. */
 static void call_remove_locked(incoming_call_t *call) {
   if (!call || !call_list) return;
   int duration = 0;
@@ -513,10 +511,8 @@ static void call_remove_locked(incoming_call_t *call) {
 
 __attribute__((unused))
 static void call_remove(incoming_call_t *call) {
-  if (!call || !call_mutex_initialized) return;
-  neco_mutex_lock(&call_mutex);
+  if (!call) return;
   call_remove_locked(call);
-  neco_mutex_unlock(&call_mutex);
 }
 
 /* Get one extension registration by trunk and number. Caller does not free. */
@@ -921,36 +917,20 @@ static void handle_invite_route_to_targets(upbx_config *cfg, const char *req_buf
 
 static int parse_listen_addr(const char *addr, char *host, size_t host_size, char *port, size_t port_size);
 
-/* Overflow timer coroutine: after timeout, apply strategy (busy/add/redirect) if not answered. */
-static void overflow_timer_coro(int argc, void *argv[]) {
-  incoming_call_t *call = (incoming_call_t *)argv[0];
-  upbx_config *cfg = (upbx_config *)argv[1];
-  int sockfd = (int)(intptr_t)argv[2];
-  if (argc < 3 || !call || !cfg) return;
-  if (!call->trunk) return; /* ext-to-ext calls have no overflow */
+/* Apply overflow action for one call (busy/redirect/include). Single-threaded. */
+static void overflow_apply_one(incoming_call_t *call, upbx_config *cfg, int sockfd) {
+  if (!call || !call->trunk) return;
+  if (call->answered || call->overflow_done) return;
   int timeout_sec = call->trunk->overflow_timeout;
   if (timeout_sec <= 0) return;
-  int64_t deadline = neco_now() + (int64_t)timeout_sec * 1000000000;
-  for (;;) {
-    neco_sleep(500 * 1000000); /* 500ms tick */
-    if (neco_now() >= deadline) break;
-    neco_mutex_lock(&call_mutex);
-    int done = call->answered || call->overflow_done;
-    neco_mutex_unlock(&call_mutex);
-    if (done) return;
-  }
-  neco_mutex_lock(&call_mutex);
-  if (call->answered || call->overflow_done) {
-    neco_mutex_unlock(&call_mutex);
-    return;
-  }
+  time_t deadline = call->created_at + (time_t)timeout_sec;
+  if (time(NULL) < deadline) return;
   call->overflow_done = 1;
   const char *strategy = call->trunk->overflow_strategy ? call->trunk->overflow_strategy : "none";
   int do_busy = 0, do_include = 0, do_redirect = 0;
   if (strcasecmp(strategy, "busy") == 0) do_busy = 1;
   else if (strcasecmp(strategy, "include") == 0 && call->trunk->overflow_target && call->trunk->overflow_target[0]) do_include = 1;
   else if (strcasecmp(strategy, "redirect") == 0 && call->trunk->overflow_target && call->trunk->overflow_target[0]) do_redirect = 1;
-  /* Copy fields we need after unlock to avoid use-after-free if response handler removes call */
   char *orig_invite = call->original_invite ? malloc(call->original_invite_len + 1) : NULL;
   size_t orig_len = call->original_invite_len;
   struct sockaddr_storage caller_peer;
@@ -962,7 +942,6 @@ static void overflow_timer_coro(int argc, void *argv[]) {
   if (call->trunk && call->trunk->overflow_target) strncpy(overflow_target, call->trunk->overflow_target, sizeof(overflow_target) - 1);
   if (orig_invite && call->original_invite) memcpy(orig_invite, call->original_invite, orig_len + 1);
   memcpy(&caller_peer, &call->caller_peer, sizeof(caller_peer));
-  neco_mutex_unlock(&call_mutex);
 
   if (do_busy) {
     if (orig_invite && orig_len > 0) {
@@ -975,7 +954,7 @@ static void overflow_timer_coro(int argc, void *argv[]) {
     free(orig_invite);
     if (call_id_copy) {
       incoming_call_t *c = call_find_locked(call_id_copy);
-      if (c) { call_remove_locked(c); neco_mutex_unlock(&call_mutex); }
+      if (c) call_remove_locked(c);
       free(call_id_copy);
     }
     return;
@@ -1047,6 +1026,28 @@ static void overflow_timer_coro(int argc, void *argv[]) {
   free(call_id_copy);
 }
 
+/* Protothread: every ~500ms walk call_list and apply overflow for timed-out calls. */
+static struct pt pt_overflow;
+static time_t overflow_last_run;
+
+static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
+  PT_BEGIN(pt);
+  overflow_last_run = 0;
+  for (;;) {
+    time_t now = time(NULL);
+    if (now - overflow_last_run >= 1) {  /* run at most once per second */
+      overflow_last_run = now;
+      for (incoming_call_t *c = call_list; c; ) {
+        incoming_call_t *next = c->next;
+        overflow_apply_one(c, cfg, sockfd);
+        c = next;
+      }
+    }
+    PT_YIELD(pt);
+  }
+  PT_END(pt);
+}
+
 /* Fork INVITE to a list of extension registrations; create call, send 100. trunk may be NULL (ext-to-ext). Caller frees exts. */
 static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf, size_t req_len, sip_send_ctx *ctx,
   ext_reg_t **exts, size_t n_ext, config_trunk *trunk, const char *source_str) {
@@ -1085,11 +1086,7 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
   call->source_str = source_str ? strdup(source_str) : NULL;
   call->dest_str = NULL;
   call->answered_at = 0;
-
-  if (!call_mutex_initialized) {
-    neco_mutex_init(&call_mutex);
-    call_mutex_initialized = 1;
-  }
+  call->created_at = time(NULL);
 
   int cseq = get_cseq_number(req_buf, req_len);
   for (size_t i = 0; i < n_ext; i++) {
@@ -1139,15 +1136,11 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
     freeaddrinfo(res);
   }
 
-  neco_mutex_lock(&call_mutex);
   call->next = call_list;
   call_list = call;
-  neco_mutex_unlock(&call_mutex);
 
-  if (trunk && trunk->overflow_timeout > 0 && trunk->overflow_strategy && trunk->overflow_strategy[0] &&
-      strcasecmp(trunk->overflow_strategy, "none") != 0) {
-    neco_start(overflow_timer_coro, 3, call, cfg, (void *)(intptr_t)ctx->sockfd);
-  } else {
+  if (!(trunk && trunk->overflow_timeout > 0 && trunk->overflow_strategy && trunk->overflow_strategy[0] &&
+      strcasecmp(trunk->overflow_strategy, "none") != 0)) {
     call->overflow_done = 1;
   }
 
@@ -1402,7 +1395,7 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
   incoming_call_t *call = call_find_locked(call_id_buf);
   if (!call) return;
   char *forward = sip_response_strip_first_via(buf, len);
-  if (!forward) { neco_mutex_unlock(&call_mutex); return; }
+  if (!forward) return;
   size_t forward_len = strlen(forward);
   udp_send_to(ctx->sockfd, (struct sockaddr *)&call->caller_peer, call->caller_peerlen, forward, forward_len);
   free(forward);
@@ -1428,7 +1421,6 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
   }
   if (remove)
     call_remove_locked(call);
-  neco_mutex_unlock(&call_mutex);
 }
 
 /* One UDP datagram: peer address + message (flexible array). Caller frees. */
@@ -1453,12 +1445,9 @@ static bool looks_like_sip(const char *buf, size_t len) {
   return false;
 }
 
-/* Handle one UDP datagram (SIP request or response). */
-static void sip_server_udp_msg(int argc, void *argv[]) {
+/* Handle one UDP datagram (SIP request or response). Called synchronously from main loop. */
+static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
   log_trace("%s", __func__);
-  upbx_config *cfg = (upbx_config *)argv[0];
-  udp_msg_t *msg = (udp_msg_t *)argv[1];
-  int sockfd = (int)(intptr_t)argv[2];
   sip_send_ctx ctx;
   size_t len = msg->len;
   char *buf = msg->buf;
@@ -1522,7 +1511,9 @@ static int parse_listen_addr(const char *addr, char *host, size_t host_size, cha
   return 0;
 }
 
-/* Resolve host (IP or name) to in_addr; return 0 on success. */
+static int resolve_interface_to_in_addr(const char *ifname, struct in_addr *out);
+
+/* Resolve host (IP, hostname, or interface name) to in_addr; return 0 on success. */
 static int resolve_to_in_addr(const char *host, struct in_addr *out) {
   struct in_addr a;
   if (inet_pton(AF_INET, host, &a) == 1) {
@@ -1533,12 +1524,15 @@ static int resolve_to_in_addr(const char *host, struct in_addr *out) {
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
-  if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res)
-    return -1;
-  struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
-  out->s_addr = sin->sin_addr.s_addr;
-  freeaddrinfo(res);
-  return 0;
+  if (getaddrinfo(host, NULL, &hints, &res) == 0 && res) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    out->s_addr = sin->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return 0;
+  }
+  if (resolve_interface_to_in_addr(host, out) == 0)
+    return 0;
+  return -1;
 }
 
 /* Minimal SDP rewrite for RTP relay: parse line-by-line, rewrite c= and m= port. */
@@ -1659,7 +1653,23 @@ static int sdp_rewrite_for_rtp_relay(upbx_config *cfg, const char *body, size_t 
   return 0;
 }
 
-/* Create and bind UDP socket; return fd or -1. */
+/* Resolve interface name (e.g. en0, eth0) to IPv4 address. Return 0 on success. */
+static int resolve_interface_to_in_addr(const char *ifname, struct in_addr *out) {
+  struct ifaddrs *ifa_list = NULL, *ifa;
+  if (getifaddrs(&ifa_list) != 0) return -1;
+  for (ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+    if (strcmp(ifa->ifa_name, ifname) != 0) continue;
+    struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+    out->s_addr = sin->sin_addr.s_addr;
+    freeifaddrs(ifa_list);
+    return 0;
+  }
+  freeifaddrs(ifa_list);
+  return -1;
+}
+
+/* Create and bind UDP socket; return fd or -1. Binds to host:port; host may be an IP, hostname, or interface name (e.g. en0). */
 static int udp_bind(const char *listen_addr) {
   char host[256], port[32];
   struct addrinfo hints, *res = NULL, *ai;
@@ -1673,7 +1683,28 @@ static int udp_bind(const char *listen_addr) {
   hints.ai_socktype = SOCK_DGRAM;
   hints.ai_flags = AI_PASSIVE;
   ret = getaddrinfo(host[0] ? host : NULL, port, &hints, &res);
-  if (ret != 0 || !res) return -1;
+  if (ret != 0 || !res) {
+    /* Host might be an interface name (e.g. en0); resolve via getifaddrs. */
+    struct in_addr if_addr;
+    if (resolve_interface_to_in_addr(host, &if_addr) == 0) {
+      struct sockaddr_in sin;
+      unsigned short port_num = (unsigned short)atoi(port);
+      memset(&sin, 0, sizeof(sin));
+      sin.sin_family = AF_INET;
+      sin.sin_addr = if_addr;
+      sin.sin_port = htons(port_num);
+      fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (fd >= 0 && bind(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
+        if (set_socket_nonblocking(fd, 1) != 0) {
+          close(fd);
+          fd = -1;
+        }
+        return fd;
+      }
+      if (fd >= 0) close(fd);
+    }
+    return -1;
+  }
   for (ai = res; ai; ai = ai->ai_next) {
     fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (fd < 0) continue;
@@ -1684,76 +1715,77 @@ static int udp_bind(const char *listen_addr) {
   }
   freeaddrinfo(res);
   if (fd < 0) return -1;
-  {
-    bool old;
-    if (neco_setnonblock(fd, true, &old) != 0) {
-      close(fd);
-      return -1;
-    }
+  if (set_socket_nonblocking(fd, 1) != 0) {
+    close(fd);
+    return -1;
   }
   return fd;
 }
 
-static void sip_server_main(int argc, void *argv[]) {
-  log_trace("%s", __func__);
+/* Main loop: select on SIP + RTP + trunk fds, dispatch, run protothreads. */
+void daemon_root(int argc, void *argv[]) {
   upbx_config *cfg = (upbx_config *)argv[0];
-  const char *listen_addr;
-  int sockfd;
-  char buf[SIP_READ_BUF_SIZE];
-  struct sockaddr_storage peer;
-  socklen_t peerlen;
-  ssize_t n;
+  if (argc < 1 || !cfg) return;
 
-  if (argc < 1 || !cfg) {
-    log_error("sip_server_main: no config");
-    return;
-  }
   if (rtp_relay_init(cfg) != 0)
     log_error("rtp_relay_init failed");
-  else
-    neco_start(rtp_relay_coro, 1, cfg);
-  listen_addr = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
+
+  const char *listen_addr = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
   log_info("SIP binding to %s", listen_addr);
-  sockfd = udp_bind(listen_addr);
+  int sockfd = udp_bind(listen_addr);
   if (sockfd < 0) {
-    log_error("sip_server_main: UDP bind %s failed", listen_addr);
+    log_error("daemon_root: UDP bind %s failed", listen_addr);
     return;
   }
   log_info("SIP listening on UDP %s", listen_addr);
   if (cfg->trunk_count > 0)
     log_info("trunk registration started (%zu trunk(s))", cfg->trunk_count);
   notify_extension_and_trunk_lists(cfg);
-  if (cfg->trunk_count > 0)
-    neco_start(trunk_reg_loop, 1, cfg);
-  for (;;) {
-    if (neco_wait(sockfd, NECO_WAIT_READ) != 0)
-      continue;
-    peerlen = sizeof(peer);
-    n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
-    if (n <= 0 || (size_t)n > SIP_READ_BUF_SIZE - 1)
-      continue;
-    udp_msg_t *msg = malloc(sizeof(udp_msg_t) + (size_t)n + 1);
-    if (!msg) continue;
-    memcpy(&msg->peer, &peer, sizeof(msg->peer));
-    msg->peerlen = peerlen;
-    msg->len = (size_t)n;
-    memcpy(msg->buf, buf, (size_t)n);
-    msg->buf[n] = '\0';
-    neco_start(sip_server_udp_msg, 3, cfg, msg, (void *)(intptr_t)sockfd);
-    if (reg_list_notify_pending) {
-      reg_list_notify_pending = 0;
-      notify_extension_and_trunk_lists(cfg);
-    }
-  }
-}
 
-/* Root coroutine: start sip_server_main then sleep forever so the scheduler runs it (bluebox pattern). */
-void daemon_root(int argc, void *argv[]) {
-  log_trace("%s", __func__);
-  upbx_config *cfg = (upbx_config *)argv[0];
-  if (argc < 1 || !cfg)
-    return;
-  neco_start(sip_server_main, 1, cfg);
-  for (;;)
-    neco_sleep(3600 * (int64_t)1000000000); /* 1 hour, like bluebox's NECO_HOUR */
+  trunk_reg_start(cfg);
+
+  PT_INIT(&pt_overflow);
+  struct pt pt_trunk_reg;
+  PT_INIT(&pt_trunk_reg);
+
+  char buf[SIP_READ_BUF_SIZE];
+  struct sockaddr_storage peer;
+  socklen_t peerlen;
+
+  for (;;) {
+    fd_set r;
+    FD_ZERO(&r);
+    FD_SET(sockfd, &r);
+    int maxfd = sockfd;
+    rtp_relay_fill_fds(&r, &maxfd);
+    trunk_reg_fill_fds(&r, &maxfd);
+
+    struct timeval tv = { 0, 50000 }; /* 50ms */
+    int n = select(maxfd + 1, &r, NULL, NULL, &tv);
+    if (n > 0) {
+      if (FD_ISSET(sockfd, &r)) {
+        peerlen = sizeof(peer);
+        ssize_t nr = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
+        if (nr > 0 && (size_t)nr <= SIP_READ_BUF_SIZE - 1) {
+          udp_msg_t *msg = malloc(sizeof(udp_msg_t) + (size_t)nr + 1);
+          if (msg) {
+            memcpy(&msg->peer, &peer, sizeof(msg->peer));
+            msg->peerlen = peerlen;
+            msg->len = (size_t)nr;
+            memcpy(msg->buf, buf, (size_t)nr);
+            msg->buf[nr] = '\0';
+            handle_udp_msg(cfg, msg, sockfd);
+          }
+          if (reg_list_notify_pending) {
+            reg_list_notify_pending = 0;
+            notify_extension_and_trunk_lists(cfg);
+          }
+        }
+      }
+      rtp_relay_poll(&r);
+      trunk_reg_poll(&r);
+    }
+    PT_SCHEDULE(overflow_pt(&pt_overflow, cfg, sockfd));
+    PT_SCHEDULE(trunk_reg_pt(&pt_trunk_reg, cfg));
+  }
 }

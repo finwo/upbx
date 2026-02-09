@@ -7,7 +7,6 @@
 
 #include "cofyc/argparse.h"
 #include "rxi/log.h"
-#include "tidwall/neco.h"
 
 #include "CliModule/common.h"
 #include "config.h"
@@ -116,13 +115,10 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
   plugin_start(&cfg);
   log_info("plugins started");
 
-  int err = neco_start(daemon_root, 1, &cfg);
-  if (err != NECO_OK) {
-    log_error("neco_start: %s", neco_strerror(err));
-    plugin_stop();
-    config_free(&cfg);
-    return 1;
-  }
+  void *av[1];
+  av[0] = &cfg;
+  daemon_root(1, av);
+  /* never returns */
 
   plugin_stop();
   config_free(&cfg);

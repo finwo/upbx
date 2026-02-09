@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <signal.h>
 
-#include "tidwall/neco.h"
+#include "socket_util.h"
 #include "rxi/log.h"
 #include "PluginModule/plugin.h"
 
@@ -20,7 +20,7 @@ static void resp_free_internal(plugmod_resp_object *o);
 
 static int resp_read_byte(int fd) {
   unsigned char c;
-  if (neco_read(fd, &c, 1) != 1)
+  if (read(fd, &c, 1) != 1)
     return -1;
   return (int)c;
 }
@@ -75,7 +75,7 @@ static plugmod_resp_object *resp_read(int fd) {
       } else {
         o->u.s = malloc((size_t)len + 1);
         if (!o->u.s) { free(o); return NULL; }
-        if (neco_read(fd, o->u.s, (size_t)len) != (ssize_t)len) { free(o->u.s); free(o); return NULL; }
+        if (read(fd, o->u.s, (size_t)len) != (ssize_t)len) { free(o->u.s); free(o); return NULL; }
         o->u.s[len] = '\0';
         if (resp_read_byte(fd) != '\r' || resp_read_byte(fd) != '\n') { free(o->u.s); free(o); return NULL; }
       }
@@ -214,8 +214,8 @@ static int spawn_plugin(const char *name, const char *exec_path, plugin_state_t 
   out->method_count = 0;
   out->events = NULL;
   out->event_count = 0;
-  bool old;
-  if (neco_setnonblock(out->fd_read, true, &old) != 0 || neco_setnonblock(out->fd_write, true, &old) != 0) {
+  /* Use blocking I/O on plugin pipes so we don't need select(); plugins are local and expected to respond quickly. */
+  if (set_socket_nonblocking(out->fd_read, 0) != 0 || set_socket_nonblocking(out->fd_write, 0) != 0) {
     plugin_state_free(out);
     return -1;
   }
@@ -228,7 +228,7 @@ static int do_discovery(plugin_state_t *p) {
   char *req = NULL;
   size_t req_len;
   if (resp_encode_array(1, argv, &req, &req_len) != 0) return -1;
-  ssize_t n = neco_write(p->fd_write, req, req_len);
+  ssize_t n = write(p->fd_write, req, req_len);
   free(req);
   if (n != (ssize_t)req_len) return -1;
   plugmod_resp_object *r = resp_read(p->fd_read);
@@ -319,7 +319,7 @@ int plugmod_invoke_response(const char *plugin_name, const char *method, int arg
   int ret = resp_encode_array(argc + 1, (const char **)all, &buf, &len);
   free(all);
   if (ret != 0) return -1;
-  if (neco_write(p->fd_write, buf, len) != (ssize_t)len) {
+  if (write(p->fd_write, buf, len) != (ssize_t)len) {
     free(buf);
     return -1;
   }

@@ -3,8 +3,8 @@
 
 #include "config.h"
 
-/* Root coroutine for daemon: starts SIP server then yields forever
- * argv[0] = upbx_config*. Daemon should neco_start(this, 1, &cfg). */
+/* Main entry for daemon: runs select loop, SIP, RTP relay, trunk reg, overflow.
+ * argv[0] = upbx_config*. Daemon calls this and does not return. */
 void daemon_root(int argc, void *argv[]);
 
 #endif

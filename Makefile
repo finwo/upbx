@@ -22,7 +22,7 @@ override CFLAGS?=-Wall -O2
 override CFLAGS+=-I src -D INI_HANDLER_LINENO=1
 override LDFLAGS?=
 
-override LDFLAGS+=-lresolv -pthread
+override LDFLAGS+=-lresolv
 
 override CPPFLAGS?=
 

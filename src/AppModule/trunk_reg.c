@@ -1,11 +1,8 @@
 /*
  * Trunk registration: SIP client sending periodic REGISTER to upstream trunks over UDP.
- * Runs as a neco coroutine; refresh interval from Contact expires (minus 15s) or default 1800s.
+ * Single-threaded: UDP sockets are non-blocking; main loop select() then trunk_reg_poll().
+ * Refresh interval from Contact expires (minus 15s) or default 1800s.
  * Uses minimal SIP parsing (no libosip2) and built-in MD5 for Digest auth.
- * Digest auth follows RFC 3261 (section 22, HTTP auth) and RFC 2617 (Digest scheme):
- * - digest uri = Request-URI from request line (same as REGISTER sip:...).
- * - Match siproxd plugin_upbx.c: use RFC 2069 (no qop) for trunk registration, i.e. response =
- *   MD5(HA1:nonce:HA2), and do not send nc, cnonce, qop. Many trunks work with this.
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -13,12 +10,14 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
 
+#include "pt.h"
 #include "AppModule/md5.h"
-#include "tidwall/neco.h"
+#include "socket_util.h"
 #include "rxi/log.h"
 #include "config.h"
 #include "AppModule/sip_hexdump.h"
@@ -125,21 +124,27 @@ static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
   cvt_hex(resphash, out);
 }
 
-/* Per-trunk runtime state (auth from 401, next refresh time) */
+/* Per-trunk runtime state (auth from 401, next refresh time; in-flight reg socket) */
 typedef struct {
   time_t next_refresh;
   char *auth_nonce;
   char *auth_realm;
-  char *auth_algorithm;  /* From WWW-Authenticate; default MD5 */
-  char *auth_opaque;     /* Echo in Authorization if present */
-  char *auth_qop;        /* From WWW-Authenticate; if "auth" or "auth-int" use qop response, else RFC 2069 */
-  char *call_id;  /* For matching 401 response when retrying */
+  char *auth_algorithm;
+  char *auth_opaque;
+  char *auth_qop;
+  char *call_id;
+  int reg_fd;              /* -1 when idle; socket when waiting for REGISTER response */
+  time_t reg_deadline;     /* when to give up waiting */
+  struct addrinfo *reg_res; /* so we can retry sendto and free later */
 } trunk_state_t;
 
-/* UDP receive timeout for trunk REGISTER response (nanoseconds). */
-#define TRUNK_UDP_RECV_TIMEOUT_NS  (10 * NECO_SECOND)
+#define TRUNK_UDP_RECV_TIMEOUT_SEC  10
 
 #define REGISTER_BUF_SIZE 4096
+
+static upbx_config *trunk_reg_cfg;
+static trunk_state_t *trunk_states;
+static size_t trunk_states_n;
 
 /* Build REGISTER request as raw SIP string. Caller frees returned buffer. Returns length or 0 on error. */
 static size_t build_register(upbx_config *cfg, config_trunk *trunk, trunk_state_t *state,
@@ -217,201 +222,169 @@ static size_t build_register(upbx_config *cfg, config_trunk *trunk, trunk_state_
   return (size_t)(p - req);
 }
 
-/* Register one trunk; returns refresh interval in seconds or -1 on failure. */
-static int register_one_trunk(upbx_config *cfg, size_t trunk_idx, trunk_state_t *state) {
-  log_trace("%s", __func__);
+/* Start registration for one trunk: create socket, send REGISTER, set state to waiting. Returns 0 on success. */
+static int start_registration(upbx_config *cfg, size_t trunk_idx) {
+  trunk_state_t *state = &trunk_states[trunk_idx];
   config_trunk *trunk = &cfg->trunks[trunk_idx];
   const char *port = (trunk->port && trunk->port[0]) ? trunk->port : "5060";
   struct addrinfo hints, *res = NULL, *ai;
   int fd = -1;
-  char *buf = NULL;
   char *req_str = NULL;
   size_t req_len;
-  int refresh = -1;
-  int status_code = 0;
-  int retried = 0;
-  int gai_ret;
-  int got_response = 0;
-  size_t buflen = 0;
+  int with_auth = (state->auth_nonce && state->auth_realm) ? 1 : 0;
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
-  gai_ret = getaddrinfo(trunk->host, port, &hints, &res);
-  if (gai_ret != 0 || !res) {
+  if (getaddrinfo(trunk->host, port, &hints, &res) != 0 || !res) {
     log_warn("trunk %s: resolve %s:%s failed", trunk->name, trunk->host, port);
     return -1;
   }
   for (ai = res; ai; ai = ai->ai_next) {
     fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd >= 0)
-      break;
+    if (fd >= 0) break;
   }
   if (fd < 0) {
     freeaddrinfo(res);
     return -1;
   }
-  {
-    bool old;
-    if (neco_setnonblock(fd, true, &old) != 0) {
-      close(fd);
-      freeaddrinfo(res);
-      return -1;
-    }
-  }
-
-  buf = malloc(SIP_READ_BUF_SIZE);
-  if (!buf) {
+  if (set_socket_nonblocking(fd, 1) != 0) {
     close(fd);
     freeaddrinfo(res);
     return -1;
   }
-
-  for (;;) {
-    req_len = build_register(cfg, trunk, state, (retried && state->auth_nonce && state->auth_realm) ? 1 : 0, &req_str);
-    if (req_len == 0 || !req_str) {
-      refresh = -1;
-      break;
-    }
-    log_trace("trunk_reg: sending %zu bytes to trunk %s (%s:%s)", req_len, trunk->name, trunk->host, port);
-    log_hexdump_trace(req_str, req_len);
-    if (sendto(fd, req_str, req_len, 0, ai->ai_addr, ai->ai_addrlen) != (ssize_t)req_len) {
-      free(req_str);
-      refresh = -1;
-      break;
-    }
-    free(req_str);
-    req_str = NULL;
-
-    /* Wait for response; parse with minimal parser (no libosip2). */
-    {
-      int64_t deadline = neco_now() + TRUNK_UDP_RECV_TIMEOUT_NS;
-      ssize_t n;
-      got_response = 0;
-      for (;;) {
-        if (neco_wait_dl(fd, NECO_WAIT_READ, deadline) != 0)
-          break;
-        n = recvfrom(fd, buf, SIP_READ_BUF_SIZE - 1, 0, NULL, NULL);
-        if (n <= 0)
-          continue;
-        buf[n] = '\0';
-        buflen = (size_t)n;
-        if (!looks_like_sip(buf, buflen))
-          continue;
-        log_trace("trunk_reg: after looks_like_sip ok");
-        if (buflen >= 12 && memcmp(buf, "SIP/2.0 100 ", 12) == 0)
-          continue;
-        log_trace("trunk_reg: after skip 100 check");
-        sip_fixup_for_parse(buf, &buflen, SIP_READ_BUF_SIZE);
-        if (!sip_security_check_raw(buf, buflen))
-          continue;
-        log_trace("trunk_reg: after sip_security_check_raw ok");
-        log_hexdump_trace(buf, buflen);
-        status_code = sip_response_status_code(buf, buflen);
-        if (status_code == 0)
-          continue;
-        if (status_code == 100)
-          continue;
-        got_response = 1;
-        break;
-      }
-      if (!got_response) {
-        refresh = -1;
-        break;
-      }
-    }
-
-    log_trace("trunk_reg: response status_code=%d", status_code);
-    if (status_code == 401 && !retried && trunk->password && trunk->password[0]) {
-      log_trace("trunk_reg: 401 received, parsing WWW-Authenticate");
-      free(state->auth_nonce);
-      free(state->auth_realm);
-      free(state->auth_algorithm);
-      free(state->auth_opaque);
-      free(state->auth_qop);
-      state->auth_nonce = NULL;
-      state->auth_realm = NULL;
-      state->auth_algorithm = NULL;
-      state->auth_opaque = NULL;
-      state->auth_qop = NULL;
-      if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm,
-              &state->auth_algorithm, &state->auth_opaque, &state->auth_qop)) {
-        log_info("trunk %s: 401 parsed, retrying REGISTER with Digest (realm=%s, algorithm=%s, qop=%s)",
-            trunk->name, state->auth_realm ? state->auth_realm : "(none)",
-            state->auth_algorithm && state->auth_algorithm[0] ? state->auth_algorithm : "MD5",
-            state->auth_qop && state->auth_qop[0] ? state->auth_qop : "(none)");
-        retried = 1;
-        continue;
-      }
-      log_warn("trunk %s: 401 but could not parse WWW-Authenticate Digest", trunk->name);
-    }
-    if (status_code >= 200 && status_code < 300) {
-      log_trace("trunk_reg: before get_contact_expires");
-      refresh = sip_response_contact_expires(buf, buflen);
-      if (refresh > TRUNK_REG_REFRESH_LEAD)
-        refresh -= TRUNK_REG_REFRESH_LEAD;
-      else
-        refresh = TRUNK_REG_DEFAULT_REFRESH;
-      if (refresh < TRUNK_REG_MIN_REFRESH)
-        refresh = TRUNK_REG_MIN_REFRESH;
-      log_info("trunk %s: registered (refresh in %ds)", trunk->name, refresh);
-    } else {
-      log_warn("trunk %s: REGISTER failed %d", trunk->name, status_code);
-      refresh = TRUNK_REG_DEFAULT_REFRESH; /* Retry later */
-    }
-    break;
+  req_len = build_register(cfg, trunk, state, with_auth, &req_str);
+  if (req_len == 0 || !req_str) {
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
   }
-
-  free(buf);
-  close(fd);
-  freeaddrinfo(res);
-  return refresh;
+  log_trace("trunk_reg: sending %zu bytes to trunk %s (%s:%s)", req_len, trunk->name, trunk->host, port);
+  log_hexdump_trace(req_str, req_len);
+  if (sendto(fd, req_str, req_len, 0, ai->ai_addr, ai->ai_addrlen) != (ssize_t)req_len) {
+    free(req_str);
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
+  }
+  free(req_str);
+  state->reg_fd = fd;
+  state->reg_deadline = time(NULL) + TRUNK_UDP_RECV_TIMEOUT_SEC;
+  state->reg_res = res;
+  return 0;
 }
 
-void trunk_reg_loop(int argc, void *argv[]) {
-  log_trace("%s", __func__);
-  upbx_config *cfg = (upbx_config *)argv[0];
-  trunk_state_t *states = NULL;
-  time_t now;
-  time_t next_run;
-  int64_t sleep_ns;
-  size_t i;
+/* Handle received response for trunk_idx. Close fd and clear state when done (success or failure). */
+static void handle_reg_response(upbx_config *cfg, size_t trunk_idx, char *buf, size_t buflen) {
+  trunk_state_t *state = &trunk_states[trunk_idx];
+  config_trunk *trunk = &cfg->trunks[trunk_idx];
+  int status_code = sip_response_status_code(buf, buflen);
 
-  if (argc < 1 || !cfg || cfg->trunk_count == 0) {
-    return;
-  }
-
-  states = calloc(cfg->trunk_count, sizeof(trunk_state_t));
-  if (!states) {
-    log_error("trunk_reg_loop: out of memory");
-    return;
-  }
-
-  for (;;) {
-    now = time(NULL);
-    next_run = 0;
-
-    for (i = 0; i < cfg->trunk_count; i++) {
-      config_trunk *t = &cfg->trunks[i];
-      if (!t->host || !t->host[0])
-        continue;
-      if (states[i].next_refresh == 0 || now >= states[i].next_refresh) {
-        int ref = register_one_trunk(cfg, i, &states[i]);
-        if (ref > 0)
-          states[i].next_refresh = now + ref;
-        else
-          states[i].next_refresh = now + TRUNK_REG_DEFAULT_REFRESH;
+  if (status_code == 401 && trunk->password && trunk->password[0]) {
+    free(state->auth_nonce);
+    free(state->auth_realm);
+    free(state->auth_algorithm);
+    free(state->auth_opaque);
+    free(state->auth_qop);
+    state->auth_nonce = state->auth_realm = state->auth_algorithm = state->auth_opaque = state->auth_qop = NULL;
+    if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm,
+            &state->auth_algorithm, &state->auth_opaque, &state->auth_qop)) {
+      log_info("trunk %s: 401 parsed, retrying REGISTER with Digest", trunk->name);
+      char *req_str = NULL;
+      size_t req_len = build_register(cfg, trunk, state, 1, &req_str);
+      if (req_len > 0 && req_str && state->reg_res) {
+        if (sendto(state->reg_fd, req_str, req_len, 0, state->reg_res->ai_addr, state->reg_res->ai_addrlen) == (ssize_t)req_len)
+          state->reg_deadline = time(NULL) + TRUNK_UDP_RECV_TIMEOUT_SEC;
       }
-      if (states[i].next_refresh > 0 && (next_run == 0 || states[i].next_refresh < next_run))
-        next_run = states[i].next_refresh;
+      free(req_str);
+      return;
     }
-
-    if (next_run == 0)
-      next_run = now + 60;
-    if (next_run <= now)
-      next_run = now + 60;
-    sleep_ns = (int64_t)(next_run - now) * 1000000000;
-    if (sleep_ns > 0)
-      neco_sleep(sleep_ns);
   }
+  if (status_code >= 200 && status_code < 300) {
+    int refresh = sip_response_contact_expires(buf, buflen);
+    if (refresh > TRUNK_REG_REFRESH_LEAD) refresh -= TRUNK_REG_REFRESH_LEAD;
+    else refresh = TRUNK_REG_DEFAULT_REFRESH;
+    if (refresh < TRUNK_REG_MIN_REFRESH) refresh = TRUNK_REG_MIN_REFRESH;
+    state->next_refresh = time(NULL) + refresh;
+    log_info("trunk %s: registered (refresh in %ds)", trunk->name, refresh);
+  } else if (status_code > 0) {
+    log_warn("trunk %s: REGISTER failed %d", trunk->name, status_code);
+    state->next_refresh = time(NULL) + TRUNK_REG_DEFAULT_REFRESH;
+  }
+  if (state->reg_fd >= 0) {
+    close(state->reg_fd);
+    state->reg_fd = -1;
+  }
+  if (state->reg_res) {
+    freeaddrinfo(state->reg_res);
+    state->reg_res = NULL;
+  }
+}
+
+void trunk_reg_start(upbx_config *cfg) {
+  if (!cfg || cfg->trunk_count == 0) return;
+  trunk_reg_cfg = cfg;
+  trunk_states_n = cfg->trunk_count;
+  trunk_states = calloc(trunk_states_n, sizeof(trunk_state_t));
+  if (!trunk_states) {
+    log_error("trunk_reg_start: out of memory");
+    trunk_states_n = 0;
+    return;
+  }
+  for (size_t i = 0; i < trunk_states_n; i++)
+    trunk_states[i].reg_fd = -1;
+}
+
+void trunk_reg_fill_fds(fd_set *read_set, int *maxfd) {
+  for (size_t i = 0; i < trunk_states_n; i++) {
+    if (trunk_states[i].reg_fd >= 0) {
+      FD_SET(trunk_states[i].reg_fd, read_set);
+      if (trunk_states[i].reg_fd > *maxfd) *maxfd = trunk_states[i].reg_fd;
+    }
+  }
+}
+
+void trunk_reg_poll(fd_set *read_set) {
+  time_t now = time(NULL);
+  char *buf = malloc(SIP_READ_BUF_SIZE);
+  if (!buf) return;
+  for (size_t i = 0; i < trunk_states_n; i++) {
+    trunk_state_t *state = &trunk_states[i];
+    if (state->reg_fd < 0) continue;
+    if (now > state->reg_deadline) {
+      if (state->reg_fd >= 0) { close(state->reg_fd); state->reg_fd = -1; }
+      if (state->reg_res) { freeaddrinfo(state->reg_res); state->reg_res = NULL; }
+      state->next_refresh = now + TRUNK_REG_DEFAULT_REFRESH;
+      continue;
+    }
+    if (!FD_ISSET(state->reg_fd, read_set)) continue;
+    ssize_t n = recvfrom(state->reg_fd, buf, SIP_READ_BUF_SIZE - 1, 0, NULL, NULL);
+    if (n <= 0) continue;
+    buf[n] = '\0';
+    size_t buflen = (size_t)n;
+    if (!looks_like_sip(buf, buflen)) continue;
+    if (buflen >= 12 && memcmp(buf, "SIP/2.0 100 ", 12) == 0) continue;
+    sip_fixup_for_parse(buf, &buflen, SIP_READ_BUF_SIZE);
+    if (!sip_security_check_raw(buf, buflen)) continue;
+    log_hexdump_trace(buf, buflen);
+    if (sip_response_status_code(buf, buflen) == 100) continue;
+    handle_reg_response(trunk_reg_cfg, i, buf, buflen);
+  }
+  free(buf);
+}
+
+PT_THREAD(trunk_reg_pt(struct pt *pt, upbx_config *cfg)) {
+  PT_BEGIN(pt);
+  for (;;) {
+    time_t now = time(NULL);
+    for (size_t i = 0; i < trunk_states_n; i++) {
+      config_trunk *t = &cfg->trunks[i];
+      if (!t->host || t->host[0] == '\0') continue;
+      if (trunk_states[i].reg_fd >= 0) continue; /* already in flight */
+      if (trunk_states[i].next_refresh != 0 && now < trunk_states[i].next_refresh) continue;
+      start_registration(cfg, i);
+    }
+    PT_YIELD(pt);
+  }
+  PT_END(pt);
 }
