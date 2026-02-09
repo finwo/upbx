@@ -298,7 +298,8 @@ int sip_request_method(const char *buf, size_t len, const char **method_out, siz
   return 1;
 }
 
-/* Get user part from Request-URI in first line (METHOD sip:user@host SIP/2.0). Writes to user_out, max user_size. Returns 1 on success. */
+/* Get userinfo from Request-URI (METHOD sip:userinfo@host SIP/2.0). userinfo may contain '@' (e.g. 100@trunkname).
+ * Returns full userinfo so caller can strip trunk for extension lookup. Writes to user_out, max user_size. Returns 1 on success. */
 int sip_request_uri_user(const char *buf, size_t len, char *user_out, size_t user_size) {
   if (len < 14 || user_size == 0) return 0;
   const char *p = buf;
@@ -308,15 +309,21 @@ int sip_request_uri_user(const char *buf, size_t len, char *user_out, size_t use
   if (p + 4 >= buf + len || strncasecmp(p, "sip:", 4) != 0) return 0;
   p += 4;
   const char *start = p;
-  while (p < buf + len && *p != '@' && *p != ';' && *p != ' ' && *p != '\r' && *p != '\n') p++;
-  size_t n = (size_t)(p - start);
+  const char *last_at = NULL;
+  while (p < buf + len && *p != ';' && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (*p == '@') last_at = p;
+    p++;
+  }
+  /* userinfo is from start to last_at (exclusive). Require at least one @ so we don't treat sip:host as user. */
+  if (!last_at) return 0;
+  size_t n = (size_t)(last_at - start);
   if (n == 0 || n >= user_size) return 0;
   memcpy(user_out, start, n);
   user_out[n] = '\0';
   return 1;
 }
 
-/* Get host and port from Request-URI in first line (METHOD sip:user@host or sip:user@host:port). Returns 1 on success. */
+/* Get host and port from Request-URI (METHOD sip:userinfo@host or sip:userinfo@host:port). userinfo may contain '@'. Returns 1 on success. */
 int sip_request_uri_host_port(const char *buf, size_t len, char *host_out, size_t host_size, char *port_out, size_t port_size) {
   if (len < 14 || host_size == 0 || port_size == 0) return 0;
   const char *p = buf;
@@ -325,9 +332,14 @@ int sip_request_uri_host_port(const char *buf, size_t len, char *host_out, size_
   p++;
   if (p + 4 >= buf + len || strncasecmp(p, "sip:", 4) != 0) return 0;
   p += 4;
-  while (p < buf + len && *p != '@' && *p != ' ' && *p != '\r' && *p != '\n') p++;
-  if (p >= buf + len || *p != '@') return 0;
-  p++;
+  /* Skip userinfo (may contain '@'); host starts after the last '@' in the URI. */
+  const char *last_at = NULL;
+  while (p < buf + len && *p != ';' && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (*p == '@') last_at = p;
+    p++;
+  }
+  if (!last_at || last_at + 1 >= buf + len) return 0;
+  p = last_at + 1;
   const char *host_start = p;
   while (p < buf + len && *p != ':' && *p != ';' && *p != ' ' && *p != '\r' && *p != '\n') p++;
   size_t host_len = (size_t)(p - host_start);
@@ -349,32 +361,72 @@ int sip_request_uri_host_port(const char *buf, size_t len, char *host_out, size_
   return 1;
 }
 
-/* Parse Authorization: Digest; all *out are malloc'd, caller frees. Returns 1 if Digest with username,realm,nonce,uri,response. */
+/* Parse Authorization: Digest; all *out are malloc'd, caller frees. Any out ptr may be NULL (caller doesn't need that value). Returns 1 if Digest with username,realm,nonce,uri,response. */
 int sip_parse_authorization_digest(const char *buf, size_t len,
   char **username_out, char **realm_out, char **nonce_out, char **cnonce_out,
   char **nc_out, char **qop_out, char **uri_out, char **response_out) {
   const char *val;
   size_t val_len;
-  *username_out = *realm_out = *nonce_out = *cnonce_out = *nc_out = *qop_out = *uri_out = *response_out = NULL;
+  char *u = NULL, *r = NULL, *n = NULL, *uri = NULL, *resp = NULL;
+  if (username_out) *username_out = NULL;
+  if (realm_out) *realm_out = NULL;
+  if (nonce_out) *nonce_out = NULL;
+  if (cnonce_out) *cnonce_out = NULL;
+  if (nc_out) *nc_out = NULL;
+  if (qop_out) *qop_out = NULL;
+  if (uri_out) *uri_out = NULL;
+  if (response_out) *response_out = NULL;
   if (!sip_header_get(buf, len, "Authorization", &val, &val_len)) return 0;
   if (val_len < 7 || strncasecmp(val, "Digest ", 7) != 0) return 0;
   val += 7; val_len -= 7;
-  if (!parse_digest_param(val, val_len, "username", username_out)) return 0;
-  if (!parse_digest_param(val, val_len, "realm", realm_out)) { free(*username_out); *username_out = NULL; return 0; }
-  if (!parse_digest_param(val, val_len, "nonce", nonce_out)) { free(*username_out); free(*realm_out); *username_out = *realm_out = NULL; return 0; }
-  if (!parse_digest_param(val, val_len, "uri", uri_out)) { free(*username_out); free(*realm_out); free(*nonce_out); *username_out = *realm_out = *nonce_out = NULL; return 0; }
-  if (!parse_digest_param(val, val_len, "response", response_out)) {
-    free(*username_out); free(*realm_out); free(*nonce_out); free(*uri_out);
-    *username_out = *realm_out = *nonce_out = *uri_out = NULL;
+  if (!parse_digest_param(val, val_len, "username", username_out ? username_out : &u)) return 0;
+  if (!parse_digest_param(val, val_len, "realm", realm_out ? realm_out : &r)) {
+    if (username_out) free(*username_out); else free(u);
+    if (username_out) *username_out = NULL;
+    if (realm_out) free(*realm_out); else free(r);
+    if (realm_out) *realm_out = NULL;
     return 0;
   }
-  parse_digest_param(val, val_len, "cnonce", cnonce_out);
-  parse_digest_param(val, val_len, "nc", nc_out);
-  parse_digest_param(val, val_len, "qop", qop_out);
+  if (!parse_digest_param(val, val_len, "nonce", nonce_out ? nonce_out : &n)) {
+    if (username_out) free(*username_out); else free(u);
+    if (realm_out) free(*realm_out); else free(r);
+    if (username_out) *username_out = NULL;
+    if (realm_out) *realm_out = NULL;
+    return 0;
+  }
+  if (!parse_digest_param(val, val_len, "uri", uri_out ? uri_out : &uri)) {
+    if (username_out) free(*username_out); else free(u);
+    if (realm_out) free(*realm_out); else free(r);
+    if (nonce_out) free(*nonce_out); else free(n);
+    if (username_out) *username_out = NULL;
+    if (realm_out) *realm_out = NULL;
+    if (nonce_out) *nonce_out = NULL;
+    return 0;
+  }
+  if (!parse_digest_param(val, val_len, "response", response_out ? response_out : &resp)) {
+    if (username_out) free(*username_out); else free(u);
+    if (realm_out) free(*realm_out); else free(r);
+    if (nonce_out) free(*nonce_out); else free(n);
+    if (uri_out) free(*uri_out); else free(uri);
+    if (username_out) *username_out = NULL;
+    if (realm_out) *realm_out = NULL;
+    if (nonce_out) *nonce_out = NULL;
+    if (uri_out) *uri_out = NULL;
+    return 0;
+  }
+  if (!username_out) free(u);
+  if (!realm_out) free(r);
+  if (!nonce_out) free(n);
+  if (!uri_out) free(uri);
+  if (!response_out) free(resp);
+  if (cnonce_out) parse_digest_param(val, val_len, "cnonce", cnonce_out);
+  if (nc_out) parse_digest_param(val, val_len, "nc", nc_out);
+  if (qop_out) parse_digest_param(val, val_len, "qop", qop_out);
   return 1;
 }
 
-/* Get URI user from header value (e.g. From/To): "Name" <sip:user@host> or sip:user@host. user_out size is user_size. Returns 1 on success. */
+/* Get URI userinfo from header value (e.g. From/To): "Name" <sip:userinfo@host> or sip:userinfo@host.
+ * userinfo may contain '@' (e.g. 100@trunkname). Returns full userinfo. user_out size is user_size. Returns 1 on success. */
 static int header_value_uri_user(const char *val, size_t val_len, char *user_out, size_t user_size) {
   const char *end = val + val_len;
   const char *p = val;
@@ -390,8 +442,14 @@ static int header_value_uri_user(const char *val, size_t val_len, char *user_out
   if (p + 4 > end) return 0;
   p += 4;
   const char *start = p;
-  while (p < end && *p != '@' && *p != ';' && *p != '>' && *p != ' ' && *p != '\r' && *p != '\n') p++;
-  size_t n = (size_t)(p - start);
+  const char *last_at = NULL;
+  while (p < end && *p != ';' && *p != '>' && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (*p == '@') last_at = p;
+    p++;
+  }
+  /* Require at least one @ so we don't treat sip:host as user. */
+  if (!last_at) return 0;
+  size_t n = (size_t)(last_at - start);
   if (n == 0 || n >= user_size) return 0;
   memcpy(user_out, start, n);
   user_out[n] = '\0';

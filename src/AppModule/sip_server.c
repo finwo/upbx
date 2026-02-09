@@ -71,6 +71,7 @@ static void digest_calc_ha1(const char *alg, const char *user, const char *realm
   cvt_hex(ha1, out);
 }
 
+/* Match siproxd auth.c: without qop use RFC 2069 response = MD5(HA1:nonce:HA2); with qop use RFC 2617. */
 static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
     const char *cnonce, const char *qop, const char *method, const char *uri,
     HASHHEX hentity, HASHHEX out) {
@@ -93,12 +94,16 @@ static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
   MD5_Update(&ctx, (const unsigned char *)":", 1);
   if (nonce) MD5_Update(&ctx, (const unsigned char *)nonce, strlen(nonce));
   MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (nc) MD5_Update(&ctx, (const unsigned char *)nc, strlen(nc));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (cnonce) MD5_Update(&ctx, (const unsigned char *)cnonce, strlen(cnonce));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (qop && *qop) MD5_Update(&ctx, (const unsigned char *)qop, strlen(qop));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
+  if (qop && *qop) {
+    /* RFC 2617 with qop: request-digest = MD5(HA1:nonce:nc:cnonce:qop:HA2) */
+    if (nc) MD5_Update(&ctx, (const unsigned char *)nc, strlen(nc));
+    MD5_Update(&ctx, (const unsigned char *)":", 1);
+    if (cnonce) MD5_Update(&ctx, (const unsigned char *)cnonce, strlen(cnonce));
+    MD5_Update(&ctx, (const unsigned char *)":", 1);
+    MD5_Update(&ctx, (const unsigned char *)qop, strlen(qop));
+    MD5_Update(&ctx, (const unsigned char *)":", 1);
+  }
+  /* else RFC 2069: request-digest = MD5(HA1:nonce:HA2) — no nc/cnonce/qop */
   MD5_Update(&ctx, (const unsigned char *)ha2hex, HASHHEXLEN);
   MD5_Final(resphash, &ctx);
   cvt_hex(resphash, out);
@@ -126,14 +131,14 @@ typedef struct {
 static ext_reg_t *reg_list;
 static size_t reg_count;
 static size_t reg_cap;
-static neco_mutex reg_mutex;
-static int reg_mutex_initialized;
+static int reg_list_ready;
+static int reg_list_notify_pending;  /* set by handle_register; drained in main loop to avoid neco_write from child coroutine */
 
-/* Build WWW-Authenticate header line for 401. Caller frees. */
+/* Build WWW-Authenticate for 401. Legacy only (no qop) for maximum compatibility. Caller frees. */
 static char *build_www_authenticate(void) {
   const char *nonce = auth_generate_nonce();
   char *out = NULL;
-  if (asprintf(&out, "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\"", AUTH_REALM, nonce) < 0)
+  if (asprintf(&out, "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\", algorithm=MD5", AUTH_REALM, nonce) < 0)
     return NULL;
   return out;
 }
@@ -150,6 +155,35 @@ static config_trunk *get_trunk_config(upbx_config *cfg, const char *name) {
     if (strcmp(cfg->trunks[i].name, name) == 0)
       return &cfg->trunks[i];
   return NULL;
+}
+
+/* Decode %40 to @ in place (URI userinfo may be percent-encoded). Shrinks string. */
+static void decode_percent_at_inplace(char *s) {
+  char *w = s;
+  for (const char *r = s; *r; r++) {
+    if (r[0] == '%' && r[1] == '4' && r[2] == '0') {
+      *w++ = '@';
+      r += 2;
+    } else
+      *w++ = *r;
+  }
+  *w = '\0';
+}
+
+/* Return allocated prefix of username before first @ or %40 (caller frees). Used for Authorization username. */
+static char *extension_part_from_username(const char *username) {
+  if (!username) return NULL;
+  const char *end = username;
+  while (*end && *end != '@') {
+    if (end[0] == '%' && end[1] == '4' && end[2] == '0') break;
+    end++;
+  }
+  size_t n = (size_t)(end - username);
+  char *out = malloc(n + 1);
+  if (!out) return NULL;
+  memcpy(out, username, n);
+  out[n] = '\0';
+  return out;
 }
 
 /* Resolve trunk for extension: from @trunk in username, or by locality/group. */
@@ -266,17 +300,12 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
 /* Get trunk name for extension from reg_list ("" if not registered). Caller does not free. */
 static const char *get_trunk_for_extension(const char *ext_number) {
   time_t now = time(NULL);
-  if (!reg_mutex_initialized || !ext_number) return "";
-  neco_mutex_lock(&reg_mutex);
+  if (!reg_list_ready || !ext_number || !reg_list) return "";
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].number, ext_number) == 0) {
-      const char *t = reg_list[i].trunk_name ? reg_list[i].trunk_name : "";
-      neco_mutex_unlock(&reg_mutex);
-      return t;
-    }
+    if (strcmp(reg_list[i].number, ext_number) == 0)
+      return reg_list[i].trunk_name ? reg_list[i].trunk_name : "";
   }
-  neco_mutex_unlock(&reg_mutex);
   return "";
 }
 
@@ -348,14 +377,14 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
           if (exts_strs[i]) {
             time_t now = time(NULL);
             exts_strs[i][0] = '\0';
-            neco_mutex_lock(&reg_mutex);
-            for (j = 0; j < reg_count; j++) {
-              if (reg_list[j].expires <= now) continue;
-              if (strcmp(reg_list[j].trunk_name, t->name) != 0) continue;
-              if (exts_strs[i][0]) strcat(exts_strs[i], ",");
-              if (reg_list[j].number) strcat(exts_strs[i], reg_list[j].number);
+            if (reg_list) {
+              for (j = 0; j < reg_count; j++) {
+                if (reg_list[j].expires <= now) continue;
+                if (strcmp(reg_list[j].trunk_name, t->name) != 0) continue;
+                if (exts_strs[i][0]) strcat(exts_strs[i], ",");
+                if (reg_list[j].number) strcat(exts_strs[i], reg_list[j].number);
+              }
             }
-            neco_mutex_unlock(&reg_mutex);
             argv[i * 5 + 4] = exts_strs[i];
           } else
             argv[i * 5 + 4] = "";
@@ -494,8 +523,7 @@ static void call_remove(incoming_call_t *call) {
 static ext_reg_t *get_ext_reg_by_number(const char *trunk_name, const char *number) {
   ext_reg_t *reg = NULL;
   time_t now = time(NULL);
-  if (!reg_mutex_initialized || !trunk_name || !number) return NULL;
-  neco_mutex_lock(&reg_mutex);
+  if (!reg_list_ready || !reg_list || !trunk_name || !number) return NULL;
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= now) continue;
     if (strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
@@ -504,7 +532,6 @@ static ext_reg_t *get_ext_reg_by_number(const char *trunk_name, const char *numb
       break;
     }
   }
-  neco_mutex_unlock(&reg_mutex);
   return reg;
 }
 
@@ -513,9 +540,8 @@ static size_t get_ext_regs_for_trunk(const char *trunk_name, ext_reg_t ***out) {
   ext_reg_t **list = NULL;
   size_t n = 0;
   time_t now = time(NULL);
-  if (!reg_mutex_initialized || !trunk_name || !out) return 0;
+  if (!reg_list_ready || !reg_list || !trunk_name || !out) return 0;
   *out = NULL;
-  neco_mutex_lock(&reg_mutex);
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= now) continue;
     if (strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
@@ -524,7 +550,6 @@ static size_t get_ext_regs_for_trunk(const char *trunk_name, ext_reg_t ***out) {
     list = new_list;
     list[n++] = &reg_list[i];
   }
-  neco_mutex_unlock(&reg_mutex);
   *out = list;
   return n;
 }
@@ -534,9 +559,8 @@ static size_t get_ext_regs_for_extension(const char *ext_number, ext_reg_t ***ou
   ext_reg_t **list = NULL;
   size_t n = 0;
   time_t now = time(NULL);
-  if (!reg_mutex_initialized || !ext_number || !out) return 0;
+  if (!reg_list_ready || !reg_list || !ext_number || !out) return 0;
   *out = NULL;
-  neco_mutex_lock(&reg_mutex);
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= now) continue;
     if (strcmp(reg_list[i].number, ext_number) != 0) continue;
@@ -545,7 +569,6 @@ static size_t get_ext_regs_for_extension(const char *ext_number, ext_reg_t ***ou
     list = new_list;
     list[n++] = &reg_list[i];
   }
-  neco_mutex_unlock(&reg_mutex);
   *out = list;
   return n;
 }
@@ -584,12 +607,17 @@ static int contact_to_host_port(const char *contact, char *host, size_t host_siz
   return 0;
 }
 
+/* When username_for_ha1 is non-NULL, use it for digest (original as received); else use username parsed from header. */
 static int verify_digest(const char *req_buf, size_t req_len, const char *method, const char *password,
-    const char *expected_realm) {
+    const char *expected_realm, const char *username_for_ha1) {
   char *user = NULL, *realm = NULL, *nonce = NULL, *cnonce = NULL, *nc = NULL, *qop = NULL, *uri = NULL, *client_response = NULL;
   if (!sip_parse_authorization_digest(req_buf, req_len, &user, &realm, &nonce, &cnonce, &nc, &qop, &uri, &client_response))
     return 0;
-  if (!user || !realm || !nonce || !uri || !client_response) {
+  if (!realm || !nonce || !uri || !client_response) {
+    free(user); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(client_response);
+    return 0;
+  }
+  if (!user && !username_for_ha1) {
     free(user); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(client_response);
     return 0;
   }
@@ -597,11 +625,16 @@ static int verify_digest(const char *req_buf, size_t req_len, const char *method
     free(user); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(client_response);
     return 0;
   }
+  const char *digest_user = (username_for_ha1 && username_for_ha1[0]) ? username_for_ha1 : (user ? user : "");
+  log_info("REGISTER digest: username=\"%s\"", digest_user);
   HASHHEX ha1, response_hex;
-  digest_calc_ha1("MD5", user, realm, password, nonce, cnonce, ha1);
+  digest_calc_ha1("MD5", digest_user, realm, password, nonce, cnonce, ha1);
   HASHHEX hent = "";
-  digest_calc_response(ha1, nonce, nc ? nc : "", cnonce ? cnonce : "", qop ? qop : "", method, uri, hent, response_hex);
+  /* Server uses legacy only (RFC 2069): response = MD5(HA1:nonce:HA2). Ignore qop/nc/cnonce for verification. */
+  digest_calc_response(ha1, nonce, NULL, NULL, NULL, method, uri, hent, response_hex);
   int ok = (strcasecmp((char *)response_hex, client_response) == 0);
+  if (!ok)
+    log_info("REGISTER digest: mismatch calculated=\"%s\" client=\"%s\"", (char *)response_hex, client_response ? client_response : "(null)");
   free(user); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(client_response);
   return ok;
 }
@@ -652,13 +685,23 @@ static char *get_contact_value(const char *buf, size_t len) {
 
 /* Handle REGISTER: parse user, auth, store reg, send 200/401/403. */
 static void handle_register(const char *req_buf, size_t req_len, upbx_config *cfg, sip_send_ctx *ctx) {
+  log_trace("REGISTER: step entry");
   char user_buf[256];
-  if (!sip_request_uri_user(req_buf, req_len, user_buf, sizeof(user_buf))) {
-    if (!sip_header_uri_user(req_buf, req_len, "To", user_buf, sizeof(user_buf)))
-      user_buf[0] = '\0';
+  user_buf[0] = '\0';
+  const char *user_source = "none";
+  if (sip_request_uri_user(req_buf, req_len, user_buf, sizeof(user_buf))) {
+    user_source = "Request-URI";
+  } else if (sip_header_uri_user(req_buf, req_len, "From", user_buf, sizeof(user_buf))) {
+    user_source = "From";
+  } else if (sip_header_uri_user(req_buf, req_len, "To", user_buf, sizeof(user_buf))) {
+    user_source = "To";
   }
+  log_trace("REGISTER: user source=%s, user_buf=\"%s\"", user_source, user_buf[0] ? user_buf : "(empty)");
+  char *username_for_digest = user_buf[0] ? strdup(user_buf) : NULL;  /* keep original e.g. extnum%40trunkname for digest */
+  decode_percent_at_inplace(user_buf);  /* support 100%40trunkname same as 100@trunkname */
   const char *user = user_buf;
   if (!user[0]) {
+    free(username_for_digest);
     char *r = build_reply(req_buf, req_len, 400, 0, 0, NULL);
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
     return;
@@ -674,12 +717,16 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   } else
     extension_num = strdup(user);
   if (!extension_num) {
+    free(username_for_digest);
     char *r = build_reply(req_buf, req_len, 503, 0, 0, NULL);
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
     return;
   }
+  /* Look up extension by number only (no trunk marker); config uses [ext:number]. */
   config_extension *ext = get_extension_config(cfg, extension_num);
   if (!ext) {
+    log_info("REGISTER: 403 Forbidden — extension \"%s\" not in config (username \"%s\")", extension_num, user);
+    free(username_for_digest);
     free(extension_num);
     char *r = build_reply(req_buf, req_len, 403, 0, 0, NULL);
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
@@ -687,11 +734,16 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   }
   config_trunk *trunk = resolve_trunk_for_extension(cfg, extension_num, user);
   if (!trunk) {
+    free(username_for_digest);
     free(extension_num);
     char *r = build_reply(req_buf, req_len, 404, 0, 0, NULL);
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
     return;
   }
+  const char *auth_val;
+  size_t auth_len;
+  int has_auth = sip_header_get(req_buf, req_len, "Authorization", &auth_val, &auth_len);
+  log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk->name, has_auth ? 1 : 0);
 
   /* Plugin EXTENSION.REGISTER: can DENY, ALLOW (with optional custom data), or CONTINUE (built-in auth). */
   int plugin_allow = -1;
@@ -699,6 +751,8 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   if (plugin_count() > 0)
     plugin_query_register(extension_num, trunk->name, user, &plugin_allow, &plugin_custom);
   if (plugin_allow == 0) {
+    log_info("REGISTER: 403 Forbidden — plugin denied extension %s", extension_num);
+    free(username_for_digest);
     free(extension_num);
     free(plugin_custom);
     char *r = build_reply(req_buf, req_len, 403, 0, 0, NULL);
@@ -706,45 +760,72 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     return;
   }
   if (plugin_allow != 1) {
+    /* Built-in auth: require Authorization Digest. No header → 401 immediately (avoid parser/mutex path). */
+    log_trace("REGISTER: step 401 path plugin-dont-deny");
+    if (!has_auth || !ext->secret) {
+      log_trace("REGISTER: step 401 path no-auth-or-no-secret");
+      log_trace("REGISTER: sending 401 (no Authorization or no secret), returning");
+      log_info("REGISTER: 401 Unauthorized — sending Digest challenge for extension %s (no credentials or no secret)", extension_num);
+      char *r = build_reply(req_buf, req_len, 401, 0, 1, NULL);
+      if (r) {
+        log_hexdump_trace(r, strlen(r));
+        send_response_buf(ctx, r, strlen(r));
+        free(r);
+      }
+      free(username_for_digest);
+      free(extension_num);
+      return;
+    }
     char *auth_user = NULL, *auth_stripped = NULL;
-    if (!sip_parse_authorization_digest(req_buf, req_len, &auth_user, NULL, NULL, NULL, NULL, NULL, NULL, NULL) || !ext->secret) {
+    log_trace("REGISTER: step about to parse Authorization digest");
+    if (!sip_parse_authorization_digest(req_buf, req_len, &auth_user, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
+      log_trace("REGISTER: step parse failed, sending 401 invalid auth");
+      log_trace("REGISTER: sending 401 (invalid Authorization), returning");
+      log_info("REGISTER: 401 Unauthorized — sending Digest challenge for extension %s (no credentials or no secret)", extension_num);
       char *r = build_reply(req_buf, req_len, 401, 0, 1, NULL);
       if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
+      free(username_for_digest);
       free(extension_num);
       free(auth_user);
       return;
     }
-    if (auth_user) {
-      const char *at2 = strchr(auth_user, '@');
-      if (at2) {
-        auth_stripped = malloc((size_t)(at2 - auth_user) + 1);
-        if (auth_stripped) { memcpy(auth_stripped, auth_user, (size_t)(at2 - auth_user)); auth_stripped[at2 - auth_user] = '\0'; }
-      } else
-        auth_stripped = strdup(auth_user);
-    }
+    if (auth_user)
+      auth_stripped = extension_part_from_username(auth_user);  /* before first @ or %40; digest uses raw auth_user */
     if (!auth_stripped || strcmp(auth_stripped, extension_num) != 0) {
+      log_info("REGISTER: 403 Forbidden — Authorization username (stripped \"%s\") does not match extension \"%s\"", auth_stripped ? auth_stripped : "(null)", extension_num);
+      free(username_for_digest);
       free(auth_user); free(auth_stripped); free(extension_num);
       char *r = build_reply(req_buf, req_len, 403, 0, 0, NULL);
       if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
       return;
     }
-    free(auth_user); free(auth_stripped);
-    if (!verify_digest(req_buf, req_len, "REGISTER", ext->secret, AUTH_REALM)) {
+    /* Use Authorization header username for digest (match siproxd plugin_upbx: client sends e.g. "205@finwo"). */
+    if (!verify_digest(req_buf, req_len, "REGISTER", ext->secret, AUTH_REALM, auth_user)) {
+      log_info("REGISTER: 403 Forbidden — digest verification failed for extension %s", extension_num);
+      free(username_for_digest);
       free(extension_num);
+      free(auth_user);
+      free(auth_stripped);
       char *r = build_reply(req_buf, req_len, 403, 0, 0, NULL);
       if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
       return;
     }
+    free(auth_user);
+    free(auth_stripped);
+    free(username_for_digest);
+    username_for_digest = NULL;
   }
 
-  if (!reg_mutex_initialized) {
-    neco_mutex_init(&reg_mutex);
-    reg_mutex_initialized = 1;
-  }
+  free(username_for_digest);  /* no-op if already freed in digest path */
+  log_trace("REGISTER: step auth OK, extension=%s", extension_num);
+  log_trace("REGISTER: step set reg_list_ready");
+  reg_list_ready = 1;
+  log_trace("REGISTER: step get_contact_value");
   char *contact_val = get_contact_value(req_buf, req_len);
-  neco_mutex_lock(&reg_mutex);
+  log_trace("REGISTER: step contact_val done, loop reg_count=%zu", reg_count);
   for (size_t i = 0; i < reg_count; i++) {
     if (strcmp(reg_list[i].number, extension_num) == 0) {
+      log_trace("REGISTER: step found existing reg at i=%zu", i);
       free(reg_list[i].trunk_name);
       free(reg_list[i].contact);
       free(reg_list[i].plugin_data);
@@ -752,32 +833,38 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
       reg_list[i].contact = contact_val ? contact_val : strdup("");
       reg_list[i].plugin_data = plugin_custom;
       reg_list[i].expires = time(NULL) + DEFAULT_EXPIRES;
-      neco_mutex_unlock(&reg_mutex);
       if (!contact_val) contact_val = strdup("");
       free(extension_num);
+      log_trace("REGISTER: step update path before build_reply");
       { char *r = build_reply(req_buf, req_len, 200, 1, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); } }
-      notify_extension_and_trunk_lists(cfg);
+      log_trace("REGISTER: step update path after send");
+      reg_list_notify_pending = 1;
+      log_trace("REGISTER: step update path return");
       return;
     }
   }
+  log_trace("REGISTER: step after loop no match");
   if (reg_count >= reg_cap) {
     size_t newcap = reg_cap ? reg_cap * 2 : 8;
     ext_reg_t *p = realloc(reg_list, newcap * sizeof(ext_reg_t));
-    if (!p) { neco_mutex_unlock(&reg_mutex); free(extension_num); free(plugin_custom); free(contact_val);
+    if (!p) { free(extension_num); free(plugin_custom); free(contact_val);
       char *r = build_reply(req_buf, req_len, 503, 0, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
       return; }
     reg_list = p;
     reg_cap = newcap;
   }
+  log_trace("REGISTER: step new path assign slot");
   reg_list[reg_count].number = extension_num;
   reg_list[reg_count].trunk_name = strdup(trunk->name);
   reg_list[reg_count].contact = contact_val ? contact_val : strdup("");
   reg_list[reg_count].plugin_data = plugin_custom;
   reg_list[reg_count].expires = time(NULL) + DEFAULT_EXPIRES;
   reg_count++;
-  neco_mutex_unlock(&reg_mutex);
+  log_trace("REGISTER: step new path before build_reply");
   { char *r = build_reply(req_buf, req_len, 200, 1, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); } }
-  notify_extension_and_trunk_lists(cfg);
+  log_trace("REGISTER: step new path after send");
+  reg_list_notify_pending = 1;
+  log_trace("REGISTER: step new path done");
 }
 
 static const char *reason_phrase(int code) {
@@ -1112,13 +1199,12 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   memcpy(ext_num, from_user, ext_len);
   ext_num[ext_len] = '\0';
   ext_reg_t *reg = NULL;
-  if (!reg_mutex_initialized) {
+  if (!reg_list_ready || !reg_list) {
     free(ext_num);
     char *r = build_reply(buf, len, 404, 0, 0, NULL);
     if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
     return;
   }
-  neco_mutex_lock(&reg_mutex);
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= time(NULL)) continue;
     if (strcmp(reg_list[i].number, ext_num) == 0) {
@@ -1126,7 +1212,6 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
       break;
     }
   }
-  neco_mutex_unlock(&reg_mutex);
   free(ext_num);
   if (!reg) {
     char *r = build_reply(buf, len, 404, 0, 0, NULL);
@@ -1249,13 +1334,11 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       free(exts);
     }
     ext_reg_t *reg = NULL;
-    if (reg_mutex_initialized) {
-      neco_mutex_lock(&reg_mutex);
+    if (reg_list_ready && reg_list) {
       for (size_t i = 0; i < reg_count; i++) {
         if (reg_list[i].expires <= time(NULL)) continue;
         if (strcmp(reg_list[i].number, ext_num) == 0) { reg = &reg_list[i]; break; }
       }
-      neco_mutex_unlock(&reg_mutex);
     }
     const char *trunk_name = reg && reg->trunk_name ? reg->trunk_name : "";
     const char *destination = to_user[0] ? to_user : "";
@@ -1413,7 +1496,9 @@ static void sip_server_udp_msg(int argc, void *argv[]) {
     return;
   }
   if (method_len == 8 && strncasecmp(method, "REGISTER", 8) == 0) {
+    log_trace("REGISTER: step udp_msg calling handle_register");
     handle_register(buf, len, cfg, &ctx);
+    log_trace("REGISTER: step udp_msg handle_register returned");
   } else if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
     handle_invite(cfg, buf, len, &ctx);
   } else {
@@ -1655,6 +1740,10 @@ static void sip_server_main(int argc, void *argv[]) {
     memcpy(msg->buf, buf, (size_t)n);
     msg->buf[n] = '\0';
     neco_start(sip_server_udp_msg, 3, cfg, msg, (void *)(intptr_t)sockfd);
+    if (reg_list_notify_pending) {
+      reg_list_notify_pending = 0;
+      notify_extension_and_trunk_lists(cfg);
+    }
   }
 }
 
