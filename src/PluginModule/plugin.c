@@ -124,6 +124,31 @@ void plugmod_resp_free(plugmod_resp_object *o) {
   resp_free_internal(o);
 }
 
+/* Given a RESP array interpreted as a map (even-length: key, value, key, value, ...), return a pointer
+ * to the value element for the given key, or NULL. Key comparison uses string value of BULK/SIMPLE elements.
+ * Returned pointer is into the array; valid until the response object is freed. */
+plugmod_resp_object *plugmod_resp_map_get(const plugmod_resp_object *o, const char *key) {
+  if (!o || !key || o->type != PLUGMOD_RESPT_ARRAY) return NULL;
+  size_t n = o->u.arr.n;
+  if (n & 1) return NULL; /* odd length is not a valid map */
+  for (size_t i = 0; i < n; i += 2) {
+    const plugmod_resp_object *k = &o->u.arr.elem[i];
+    const char *s = (k->type == PLUGMOD_RESPT_BULK || k->type == PLUGMOD_RESPT_SIMPLE) ? k->u.s : NULL;
+    if (s && strcmp(s, key) == 0 && i + 1 < n)
+      return (plugmod_resp_object *)&o->u.arr.elem[i + 1];
+  }
+  return NULL;
+}
+
+/* Given a map and key, return the value's string (BULK/SIMPLE) or NULL. Does not allocate; valid until map freed. */
+const char *plugmod_resp_map_get_string(const plugmod_resp_object *o, const char *key) {
+  plugmod_resp_object *val = plugmod_resp_map_get(o, key);
+  if (!val) return NULL;
+  if (val->type == PLUGMOD_RESPT_BULK || val->type == PLUGMOD_RESPT_SIMPLE)
+    return val->u.s;
+  return NULL;
+}
+
 /* Append one RESP-encoded object to buf; realloc as needed. *buf may change. Returns 0 on success. */
 static int resp_append_object(char **buf, size_t *cap, size_t *len, const plugmod_resp_object *o) {
   if (!o) return -1;

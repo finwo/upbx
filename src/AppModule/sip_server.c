@@ -1259,8 +1259,10 @@ static void handle_invite_incoming(upbx_config *cfg, const char *buf, size_t len
   free(exts);
 }
 
-/* Outgoing INVITE: from registered extension → forward to extension's trunk group (with fallback and CID). */
-static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len, sip_send_ctx *ctx, const char *from_user) {
+/* Outgoing INVITE: from registered extension → forward to extension's trunk group (with fallback and CID).
+ * n_trunk_override == -1: no override, use group order. n_trunk_override >= 0: use trunk_override list (0 = empty → no trunks). */
+static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len, sip_send_ctx *ctx, const char *from_user,
+  const char **trunk_override, int n_trunk_override) {
   log_trace("handle_invite_outgoing: from=%s", from_user ? from_user : "");
   const char *at = strchr(from_user, '@');
   size_t ext_len = at ? (size_t)(at - from_user) : strlen(from_user);
@@ -1304,9 +1306,21 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
     return;
   }
 
-  /* Select trunk from group: prefer first available, fallback to first in group. */
+  /* Build trunk list: from plugin override (by name) or from group. */
   config_trunk *group_trunks[64];
-  size_t n_group = get_group_trunks(cfg, primary_trunk, group_trunks, 64);
+  size_t n_group = 0;
+  if (n_trunk_override >= 0 && trunk_override) {
+    for (int i = 0; i < n_trunk_override && n_group < 64; i++) {
+      config_trunk *t = get_trunk_config(cfg, trunk_override[i]);
+      if (t) group_trunks[n_group++] = t;
+    }
+  }
+  if (n_trunk_override < 0)
+    n_group = get_group_trunks(cfg, primary_trunk, group_trunks, 64);
+  if (n_group == 0) {
+    send_reply(ctx, buf, len, 503, 0, 0);
+    return;
+  }
   config_trunk *trunk = NULL;
   for (size_t i = 0; i < n_group; i++) {
     if (group_trunks[i]->host && group_trunks[i]->host[0] &&
@@ -1519,7 +1533,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     if (is_emergency_number(cfg, to_ext)) {
       log_info("new call: ext %s -> emergency %s (bypass)", ext_num, to_ext);
       free(ext_num);
-      handle_invite_outgoing(cfg, buf, len, ctx, from_user);
+      handle_invite_outgoing(cfg, buf, len, ctx, from_user, NULL, -1);
       return;
     }
 
@@ -1595,14 +1609,20 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         free(dm);
       }
     }
-    const char *trunk_name = reg && reg->trunk_name ? reg->trunk_name : "";
     const char *destination = to_user[0] ? to_user : "";
     char *target_override = NULL;
+    char **trunk_override = NULL;
+    int trunk_override_n = -1;
     int dialout_action = 0;
     int reject_code = 403;
+    config_trunk *primary_trunk = (reg && reg->trunk_name && reg->trunk_name[0])
+      ? get_trunk_config(cfg, reg->trunk_name) : resolve_trunk_for_extension(cfg, ext_num);
+    config_trunk *dialout_group_trunks[64];
+    size_t n_dialout_group = get_group_trunks(cfg, primary_trunk, dialout_group_trunks, 64);
     if (plugin_count() > 0) {
       log_debug("CALL.DIALOUT: querying plugins for ext %s -> %s call=%.32s", ext_num, destination, call_id);
-      plugin_query_dialout(ext_num, trunk_name, destination, call_id, &dialout_action, &reject_code, &target_override);
+      plugin_query_dialout(cfg, ext_num, destination, call_id, dialout_group_trunks, n_dialout_group,
+        &dialout_action, &reject_code, &target_override, &trunk_override, &trunk_override_n);
     }
 
     /* 1c. DIALOUT plugin rejected → send error to caller. */
@@ -1684,7 +1704,11 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     /* 1e. Not a DID → route externally via extension's trunk. */
     log_info("new call: ext %s -> external %s (outgoing via trunk)", from_ext, to_user);
     free(ext_num);
-    handle_invite_outgoing(cfg, cur_buf, cur_len, ctx, from_user);
+    handle_invite_outgoing(cfg, cur_buf, cur_len, ctx, from_user, (const char **)trunk_override, trunk_override_n);
+    if (trunk_override_n >= 0 && trunk_override) {
+      for (int i = 0; i < trunk_override_n; i++) free(trunk_override[i]);
+      free(trunk_override);
+    }
     free(override_buf);
     return;
   }
@@ -1809,7 +1833,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       ext_num[ext_len] = '\0';
       if (get_extension_config_match(cfg, ext_num)) {
         free(ext_num);
-        handle_invite_outgoing(cfg, buf, len, ctx, from_user);
+        handle_invite_outgoing(cfg, buf, len, ctx, from_user, NULL, -1);
         return;
       }
       free(ext_num);

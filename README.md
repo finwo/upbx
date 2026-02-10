@@ -293,7 +293,7 @@ Define API credentials and permissions. Each section creates a user that can aut
 | `EXTENSION.REGISTER` | Before accepting REGISTER | extension, trunk, from_user → DENY / ALLOW [custom] / continue |
 | `EXTENSION.LIST` | At start and on registration change | 3 per ext: number, name, trunk (no secret) |
 | `TRUNK.LIST` | At start and on registration change | 5 per trunk: name, group_prefix, dids, cid, extensions (no credentials) |
-| `CALL.DIALOUT` | Outgoing call from extension | source_ext, source_trunk, destination, call_id → no-edit / REJECT [code] / ALLOW [target] |
+| `CALL.DIALOUT` | Outgoing call from extension | **Input** (map): `source_ext`, `destination`, `call_id`, `trunks` (array of trunk maps: `name`, `cid`, `did`). **Response** (map): required `action` = `REJECT` or `ALLOW`; if REJECT then `reject_code` (e.g. `"403"`); if ALLOW then optional `destination` override, optional `trunk` (single name or array of trunk names for preference order). Trunk override is used for routing when present. |
 | `CALL.DIALIN` | Incoming call to DID | trunk, did, ext1, ext2, …, call_id → dont-care / REJECT [code] / ALTER ext… |
 | `CALL.ANSWER` | When a call is picked up (dialin) | direction, call_id, source, destination (event; response ignored) |
 | `CALL.HANGUP` | When a call is terminated | call_id, source, destination, duration_sec (event; response ignored) |

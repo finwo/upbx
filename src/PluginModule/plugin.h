@@ -32,6 +32,14 @@ struct plugmod_resp_object {
 
 void plugmod_resp_free(plugmod_resp_object *o);
 
+/* Map helper: given a response array interpreted as a map (even-length: key, value, key, value, ...),
+ * return a pointer to the value element for the given key, or NULL. Returned pointer is into the array;
+ * valid until the response is freed. */
+plugmod_resp_object *plugmod_resp_map_get(const plugmod_resp_object *o, const char *key);
+
+/* Map + key → value as string (BULK/SIMPLE), or NULL. Valid until response freed. */
+const char *plugmod_resp_map_get_string(const plugmod_resp_object *o, const char *key);
+
 /* Start plugins. discovery_cmd: sent to discover methods/events (e.g. "COMMAND").
  * event_prefixes: array of prefixes; discovery strings starting with any of these are events (e.g. "EXTENSION.", "TRUNK.", "CALL.").
  * n_event_prefixes: number of prefixes; 0 = none (no events). Discovery skipped if discovery_cmd is NULL. */
