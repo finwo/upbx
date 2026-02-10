@@ -56,14 +56,12 @@ static int do_daemonize(void) {
 }
 
 int appmodule_cmd_daemon(int argc, const char **argv) {
-  const char *config_path = NULL;
   int daemonize_flag = 0;
   int no_daemonize_flag = 0;
 
   struct argparse argparse;
   struct argparse_option options[] = {
     OPT_HELP(),
-    OPT_STRING('f', "config", &config_path, "config file path", NULL, 0, 0),
     OPT_BOOLEAN('d', "daemonize", &daemonize_flag, "run in background", NULL, 0, 0),
     OPT_BOOLEAN('D', "no-daemonize", &no_daemonize_flag, "force foreground (overrides config daemonize=1)", NULL, 0, 0),
     OPT_END(),
@@ -79,6 +77,7 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
   else
     want_daemonize = -1;
 
+  const char *config_path = cli_config_path();
   upbx_config cfg;
   config_init(&cfg);
   if (config_path && config_path[0]) {

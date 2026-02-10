@@ -1,8 +1,8 @@
 /*
- * MD5 (RFC 1321) – reference implementation in C.
+ * MD5 (RFC 1321) -- reference implementation in C.
  * Public domain. No external dependencies.
  */
-#include "AppModule/md5.h"
+#include "common/md5.h"
 #include <string.h>
 #include <stdint.h>
 

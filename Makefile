@@ -14,7 +14,7 @@ CPP:=g++
 FIND=$(shell which gfind find | head -1)
 SRC+=$(shell $(FIND) src/ -type f -name '*.c')
 # Exclude standalone test programs from main binary
-SRC:=$(filter-out src/AppModule/md5_test.c,$(SRC))
+SRC:=$(filter-out $(wildcard src/test/test_*.c),$(SRC))
 
 INCLUDES:=
 
@@ -88,11 +88,32 @@ default: $(BIN)
 $(BIN): $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
-# MD5 test (single-file test program + md5.c)
-md5_test: src/AppModule/md5_test.o src/AppModule/md5.o
+# ---- Test targets (finwo/assert) ----
+TEST_BINS:=test_md5 test_sdp_parse test_sip_parse test_config test_digest_auth
+
+test_md5: src/test/test_md5.o src/common/md5.o
 	$(CC) $^ $(CFLAGS) -o $@
+
+test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/sdp_parse.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o lib/rxi/log/src/log.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_config: src/test/test_config.o src/config.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_digest_auth: src/test/test_digest_auth.o src/common/digest_auth.o src/common/md5.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+.PHONY: test
+test: $(TEST_BINS)
+	@for t in $(TEST_BINS); do echo "--- $$t ---"; ./$$t || exit 1; done
+	@echo "All tests passed."
 
 .PHONY: clean
 clean:
-	rm -rf $(BIN) md5_test
+	rm -rf $(BIN) $(TEST_BINS)
 	rm -rf $(OBJ)
+	rm -rf $(patsubst %,src/test/%.o,$(TEST_BINS:test_%=test_%))
+	rm -rf src/test/*.o

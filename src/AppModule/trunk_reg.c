@@ -2,7 +2,7 @@
  * Trunk registration: SIP client sending periodic REGISTER to upstream trunks over UDP.
  * Single-threaded: UDP sockets are non-blocking; main loop select() then trunk_reg_poll().
  * Refresh interval from Contact expires (minus 15s) or default 1800s.
- * Uses minimal SIP parsing (no libosip2) and built-in MD5 for Digest auth.
+ * Uses internal SIP parsing (sip_parse.c) and shared digest auth (common/digest_auth.c).
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -15,12 +15,12 @@
 #include <netinet/in.h>
 #include <netdb.h>
 
-#include "pt.h"
-#include "AppModule/md5.h"
-#include "socket_util.h"
+#include "common/pt.h"
+#include "common/socket_util.h"
+#include "common/hexdump.h"
+#include "common/digest_auth.h"
 #include "rxi/log.h"
 #include "config.h"
-#include "AppModule/sip_hexdump.h"
 #include "AppModule/sip_parse.h"
 #include "AppModule/trunk_reg.h"
 
@@ -28,101 +28,6 @@
 #define TRUNK_REG_REFRESH_LEAD     15
 #define TRUNK_REG_MIN_REFRESH      60
 #define SIP_READ_BUF_SIZE          (64 * 1024)
-#define SIP_MAX_HEADERS            (32 * 1024)
-
-/* Return true if buf[0..len-1] looks like a SIP message (has status/request line and \r\n\r\n). */
-static bool looks_like_sip(const char *buf, size_t len) {
-  log_trace("%s", __func__);
-  if (len < 12)
-    return false;
-  size_t max = len < SIP_MAX_HEADERS ? len : SIP_MAX_HEADERS;
-  for (size_t i = 0; i + 3 < max; i++) {
-    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
-      return true;
-  }
-  return false;
-}
-
-/* Digest auth (same as sip_server) */
-#define HASHLEN 16
-#define HASHHEXLEN 32
-typedef unsigned char HASH[HASHLEN];
-typedef unsigned char HASHHEX[HASHHEXLEN + 1];
-
-static void cvt_hex(const unsigned char *bin, HASHHEX hex) {
-  log_trace("%s", __func__);
-  for (int i = 0; i < HASHLEN; i++) {
-    unsigned char j = (bin[i] >> 4) & 0xf;
-    hex[i * 2] = (char)(j <= 9 ? j + '0' : j + 'a' - 10);
-    j = bin[i] & 0xf;
-    hex[i * 2 + 1] = (char)(j <= 9 ? j + '0' : j + 'a' - 10);
-  }
-  hex[HASHHEXLEN] = '\0';
-}
-
-static void digest_calc_ha1(const char *alg, const char *user, const char *realm,
-    const char *password, const char *nonce, const char *cnonce, HASHHEX out) {
-  log_trace("%s", __func__);
-  MD5_CTX ctx;
-  HASH ha1;
-  MD5_Init(&ctx);
-  if (user) MD5_Update(&ctx, (unsigned char *)user, strlen(user));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (realm) MD5_Update(&ctx, (unsigned char *)realm, strlen(realm));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (password) MD5_Update(&ctx, (unsigned char *)password, strlen(password));
-  MD5_Final(ha1, &ctx);
-  if (alg && strcasecmp(alg, "md5-sess") == 0) {
-    MD5_Init(&ctx);
-    MD5_Update(&ctx, ha1, HASHLEN);
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    if (nonce) MD5_Update(&ctx, (unsigned char *)nonce, strlen(nonce));
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    if (cnonce) MD5_Update(&ctx, (unsigned char *)cnonce, strlen(cnonce));
-    MD5_Final(ha1, &ctx);
-  }
-  cvt_hex(ha1, out);
-}
-
-static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
-    const char *cnonce, const char *qop, const char *method, const char *uri,
-    HASHHEX hentity, HASHHEX out) {
-  log_trace("%s", __func__);
-  MD5_CTX ctx;
-  HASH ha2, resphash;
-  HASHHEX ha2hex;
-  MD5_Init(&ctx);
-  if (method) MD5_Update(&ctx, (unsigned char *)method, strlen(method));
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (uri) MD5_Update(&ctx, (unsigned char *)uri, strlen(uri));
-  /* RFC 2617: for qop=auth-int only, HA2 = MD5(method:uri:MD5(entity)); for qop=auth, HA2 = MD5(method:uri) */
-  if (qop && strcasecmp(qop, "auth-int") == 0 && hentity) {
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    MD5_Update(&ctx, (unsigned char *)hentity, HASHHEXLEN);
-  }
-  MD5_Final(ha2, &ctx);
-  cvt_hex(ha2, ha2hex);
-  MD5_Init(&ctx);
-  MD5_Update(&ctx, ha1, HASHHEXLEN);
-  MD5_Update(&ctx, (unsigned char *)":", 1);
-  if (nonce) MD5_Update(&ctx, (unsigned char *)nonce, strlen(nonce));
-  if (qop && *qop) {
-    /* RFC 2617 with qop: request-digest = KD(H(A1), nonce ":" nc ":" cnonce ":" qop ":" H(A2)) */
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    if (nc) MD5_Update(&ctx, (unsigned char *)nc, strlen(nc));
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    if (cnonce) MD5_Update(&ctx, (unsigned char *)cnonce, strlen(cnonce));
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-    MD5_Update(&ctx, (unsigned char *)qop, strlen(qop));
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-  } else {
-    /* RFC 2069: request-digest = KD(H(A1), nonce ":" H(A2)) — need ":" before H(A2) (match siproxd auth.c) */
-    MD5_Update(&ctx, (unsigned char *)":", 1);
-  }
-  MD5_Update(&ctx, ha2hex, HASHHEXLEN);
-  MD5_Final(resphash, &ctx);
-  cvt_hex(resphash, out);
-}
 
 /* Per-trunk runtime state (auth from 401, next refresh time; in-flight reg socket) */
 typedef struct {

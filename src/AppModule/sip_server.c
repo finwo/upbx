@@ -1,7 +1,7 @@
 /*
- * SIP server: listen on UDP, receive datagrams, parse SIP with minimal parser (no libosip2),
- * handle REGISTER (extension auth, registration store) and INVITE (call routing).
- * Single-threaded: select() loop and protothreads (pt.h); UDP sockets are non-blocking.
+ * SIP server: listen on UDP, receive datagrams, parse SIP with internal parser,
+ * handle REGISTER (extension auth, registration via registration.c) and INVITE (call routing).
+ * Single-threaded: select() loop and protothreads (common/pt.h); UDP sockets are non-blocking.
  */
 #include <stdbool.h>
 #include <stdlib.h>
@@ -18,100 +18,22 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 
-#include "pt.h"
-#include "socket_util.h"
+#include "common/pt.h"
+#include "common/socket_util.h"
+#include "common/hexdump.h"
+#include "common/digest_auth.h"
 #include "rxi/log.h"
 #include "config.h"
 #include "AppModule/plugin.h"
 #include "AppModule/sip_server.h"
-#include "AppModule/sip_hexdump.h"
 #include "AppModule/trunk_reg.h"
 #include "AppModule/sip_parse.h"
 #include "AppModule/sdp_parse.h"
 #include "AppModule/call.h"
-#include "AppModule/md5.h"
+#include "AppModule/registration.h"
 
 #define SIP_READ_BUF_SIZE  (64 * 1024)
-#define SIP_MAX_HEADERS    (32 * 1024)
 #define AUTH_REALM         "upbx"
-#define DEFAULT_EXPIRES    3600
-
-/* Digest auth (RFC 2617) */
-#define HASHLEN 16
-#define HASHHEXLEN 32
-typedef unsigned char HASH[HASHLEN];
-typedef unsigned char HASHHEX[HASHHEXLEN + 1];
-
-static void cvt_hex(const unsigned char *bin, HASHHEX hex) {
-  for (int i = 0; i < HASHLEN; i++) {
-    unsigned char j = (bin[i] >> 4) & 0xf;
-    hex[i * 2] = (char)(j <= 9 ? j + '0' : j + 'a' - 10);
-    j = bin[i] & 0xf;
-    hex[i * 2 + 1] = (char)(j <= 9 ? j + '0' : j + 'a' - 10);
-  }
-  hex[HASHHEXLEN] = '\0';
-}
-
-static void digest_calc_ha1(const char *alg, const char *user, const char *realm,
-    const char *password, const char *nonce, const char *cnonce, HASHHEX out) {
-  MD5_CTX ctx;
-  HASH ha1;
-  MD5_Init(&ctx);
-  if (user) MD5_Update(&ctx, (const unsigned char *)user, strlen(user));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (realm) MD5_Update(&ctx, (const unsigned char *)realm, strlen(realm));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (password) MD5_Update(&ctx, (const unsigned char *)password, strlen(password));
-  MD5_Final(ha1, &ctx);
-  if (alg && strcasecmp(alg, "md5-sess") == 0) {
-    MD5_Init(&ctx);
-    MD5_Update(&ctx, ha1, HASHLEN);
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-    if (nonce) MD5_Update(&ctx, (const unsigned char *)nonce, strlen(nonce));
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-    if (cnonce) MD5_Update(&ctx, (const unsigned char *)cnonce, strlen(cnonce));
-    MD5_Final(ha1, &ctx);
-  }
-  cvt_hex(ha1, out);
-}
-
-/* Match siproxd auth.c: without qop use RFC 2069 response = MD5(HA1:nonce:HA2); with qop use RFC 2617. */
-static void digest_calc_response(HASHHEX ha1, const char *nonce, const char *nc,
-    const char *cnonce, const char *qop, const char *method, const char *uri,
-    HASHHEX hentity, HASHHEX out) {
-  MD5_CTX ctx;
-  HASH ha2, resphash;
-  HASHHEX ha2hex;
-  MD5_Init(&ctx);
-  if (method) MD5_Update(&ctx, (const unsigned char *)method, strlen(method));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (uri) MD5_Update(&ctx, (const unsigned char *)uri, strlen(uri));
-  /* RFC 2617: for qop=auth-int only, HA2 = MD5(method:uri:MD5(entity)); for qop=auth, HA2 = MD5(method:uri) */
-  if (qop && strcasecmp(qop, "auth-int") == 0 && hentity) {
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-    MD5_Update(&ctx, (const unsigned char *)hentity, HASHHEXLEN);
-  }
-  MD5_Final(ha2, &ctx);
-  cvt_hex(ha2, ha2hex);
-  MD5_Init(&ctx);
-  MD5_Update(&ctx, (const unsigned char *)ha1, HASHHEXLEN);
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (nonce) MD5_Update(&ctx, (const unsigned char *)nonce, strlen(nonce));
-  MD5_Update(&ctx, (const unsigned char *)":", 1);
-  if (qop && *qop) {
-    /* RFC 2617 with qop: request-digest = MD5(HA1:nonce:nc:cnonce:qop:HA2) */
-    if (nc) MD5_Update(&ctx, (const unsigned char *)nc, strlen(nc));
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-    if (cnonce) MD5_Update(&ctx, (const unsigned char *)cnonce, strlen(cnonce));
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-    MD5_Update(&ctx, (const unsigned char *)qop, strlen(qop));
-    MD5_Update(&ctx, (const unsigned char *)":", 1);
-  }
-  /* else RFC 2069: request-digest = MD5(HA1:nonce:HA2) — no nc/cnonce/qop */
-  MD5_Update(&ctx, (const unsigned char *)ha2hex, HASHHEXLEN);
-  MD5_Final(resphash, &ctx);
-  cvt_hex(resphash, out);
-}
 
 static char *auth_generate_nonce(void) {
   static char nonce[48];
@@ -123,27 +45,8 @@ static char *auth_generate_nonce(void) {
   return nonce;
 }
 
-/* Extension registration (runtime state) */
-typedef struct {
-  char *number;       /* Extension number (e.g. "206") for config lookup */
-  char *uri_user;     /* Original username from REGISTER (e.g. "206%40finwo") for Request-URI in INVITE */
-  char *trunk_name;
-  char *contact;
-  char learned_host[256];  /* Address we appeared as in this extension's REGISTER (Request-URI host) for Via/Contact when forking to this extension */
-  char learned_port[32];
-  char *plugin_data;  /* Optional custom data from plugin ALLOW (e.g. external auth token) */
-  time_t expires;
-} ext_reg_t;
-
-static ext_reg_t *reg_list;
-static size_t reg_count;
-static size_t reg_cap;
-static int reg_list_ready;
-static int reg_list_notify_pending;  /* set by handle_register; drained in main loop */
-
-/* Address clients used to reach us (from Request-URI of REGISTER). Used for Via/SDP. */
-static char learned_advertise_host[256];
-static char learned_advertise_port[32];
+/* Registration state is managed by AppModule/registration.c.
+ * See registration.h for the ext_reg_t struct and query/update API. */
 
 static config_extension *get_extension_config(upbx_config *cfg, const char *number) {
   for (size_t i = 0; i < cfg->extension_count; i++)
@@ -299,17 +202,7 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
   output[len] = '\0';
 }
 
-/* Get trunk name for extension from reg_list ("" if not registered). Caller does not free. */
-static const char *get_trunk_for_extension(const char *ext_number) {
-  time_t now = time(NULL);
-  if (!reg_list_ready || !ext_number || !reg_list) return "";
-  for (size_t i = 0; i < reg_count; i++) {
-    if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].number, ext_number) == 0)
-      return reg_list[i].trunk_name ? reg_list[i].trunk_name : "";
-  }
-  return "";
-}
+/* Trunk lookup for extension is now registration_get_trunk_for_ext() in registration.c. */
 
 /* Notify plugins of extension list (number, name, trunk per ext) and trunk list (name, group, dids, cid, exts per trunk). */
 static void notify_extension_and_trunk_lists(upbx_config *cfg) {
@@ -332,7 +225,7 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
           config_extension *e = &cfg->extensions[i];
           argv[i * 3 + 0] = e->number ? e->number : "";
           argv[i * 3 + 1] = e->name ? e->name : "";
-          trunk_copies[i] = strdup(get_trunk_for_extension(e->number));
+          trunk_copies[i] = strdup(registration_get_trunk_for_ext(e->number));
           argv[i * 3 + 2] = trunk_copies[i] ? trunk_copies[i] : "";
         }
         plugin_notify_event("EXTENSION.LIST", (int)argc, argv);
@@ -377,16 +270,14 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
           argv[i * 5 + 3] = t->cid ? t->cid : "";
           exts_strs[i] = malloc(512);
           if (exts_strs[i]) {
-            time_t now = time(NULL);
+            ext_reg_t **tregs = NULL;
+            size_t treg_count = registration_get_regs(t->name, NULL, &tregs);
             exts_strs[i][0] = '\0';
-            if (reg_list) {
-              for (j = 0; j < reg_count; j++) {
-                if (reg_list[j].expires <= now) continue;
-                if (strcmp(reg_list[j].trunk_name, t->name) != 0) continue;
-                if (exts_strs[i][0]) strcat(exts_strs[i], ",");
-                if (reg_list[j].number) strcat(exts_strs[i], reg_list[j].number);
-              }
+            for (j = 0; j < treg_count; j++) {
+              if (exts_strs[i][0]) strcat(exts_strs[i], ",");
+              if (tregs[j]->number) strcat(exts_strs[i], tregs[j]->number);
             }
+            free(tregs);
             argv[i * 5 + 4] = exts_strs[i];
           } else
             argv[i * 5 + 4] = "";
@@ -436,69 +327,17 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
   plugin_notify_event("CALL.HANGUP", 4, argv);
 }
 
-/* Remove a call with plugin notification. */
-static void hangup_and_remove(call_t *call) {
+/* Pre-remove callback: fires CALL.HANGUP plugin event for every call removal,
+ * including timeout aging (which previously bypassed notifications). */
+static void call_pre_remove_handler(call_t *call) {
   if (!call) return;
   int duration = 0;
   if (call->answered && call->answered_at > 0)
     duration = (int)(time(NULL) - call->answered_at);
   notify_call_hangup(call->call_id, call->source_str, call->dest_str, duration);
-  call_remove(call);
 }
 
-/* Get one extension registration by trunk and number. Caller does not free. */
-static ext_reg_t *get_ext_reg_by_number(const char *trunk_name, const char *number) {
-  ext_reg_t *reg = NULL;
-  time_t now = time(NULL);
-  if (!reg_list_ready || !reg_list || !trunk_name || !number) return NULL;
-  for (size_t i = 0; i < reg_count; i++) {
-    if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
-    if (strcmp(reg_list[i].number, number) == 0) {
-      reg = &reg_list[i];
-      break;
-    }
-  }
-  return reg;
-}
-
-/* Fill ext_reg_t* array for extensions registered on trunk. *out (array of pointers) freed by caller. Returns count. */
-static size_t get_ext_regs_for_trunk(const char *trunk_name, ext_reg_t ***out) {
-  ext_reg_t **list = NULL;
-  size_t n = 0;
-  time_t now = time(NULL);
-  if (!reg_list_ready || !reg_list || !trunk_name || !out) return 0;
-  *out = NULL;
-  for (size_t i = 0; i < reg_count; i++) {
-    if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
-    ext_reg_t **new_list = (ext_reg_t **)realloc(list, (n + 1) * sizeof(ext_reg_t *));
-    if (!new_list) break;
-    list = new_list;
-    list[n++] = &reg_list[i];
-  }
-  *out = list;
-  return n;
-}
-
-/* Fill ext_reg_t* array for an extension number (any trunk). *out freed by caller. Returns count. */
-static size_t get_ext_regs_for_extension(const char *ext_number, ext_reg_t ***out) {
-  ext_reg_t **list = NULL;
-  size_t n = 0;
-  time_t now = time(NULL);
-  if (!reg_list_ready || !reg_list || !ext_number || !out) return 0;
-  *out = NULL;
-  for (size_t i = 0; i < reg_count; i++) {
-    if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].number, ext_number) != 0) continue;
-    ext_reg_t **new_list = (ext_reg_t **)realloc(list, (n + 1) * sizeof(ext_reg_t *));
-    if (!new_list) break;
-    list = new_list;
-    list[n++] = &reg_list[i];
-  }
-  *out = list;
-  return n;
-}
+/* Registration queries: see registration.h. */
 
 /* Parse Contact URI string to host and port. Contact may be "sip:user@host:port",
  * "<sip:...>", or "display-name" <sip:...>. Return 0 on success. */
@@ -661,16 +500,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
       }
     }
     if (h[0] && strcmp(h, "0.0.0.0") != 0) {
-      size_t hl = strlen(h);
-      if (hl < sizeof(learned_advertise_host)) {
-        memcpy(learned_advertise_host, h, hl + 1);
-        if (p[0]) {
-          size_t pl = strlen(p);
-          if (pl < sizeof(learned_advertise_port)) memcpy(learned_advertise_port, p, pl + 1);
-          else memcpy(learned_advertise_port, "5060", 5);
-        } else
-          memcpy(learned_advertise_port, "5060", 5);
-      }
+      registration_set_advertise_addr(h, p[0] ? p : "5060");
       /* Per-extension learned_host/port are set when we update or create the reg entry below (so forked INVITEs use the address this extension sees us as). */
     }
   }
@@ -804,74 +634,12 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     /* keep raw_uri_user for storing in reg below */
   }
 
-  /* Store raw_uri_user in reg (transfer ownership); free if we never stored (e.g. early return above already freed it) */
-  log_trace("REGISTER: step auth OK, extension=%s", extension_num);
-  log_trace("REGISTER: step set reg_list_ready");
-  reg_list_ready = 1;
-  log_trace("REGISTER: step get_contact_value");
+  /* Store registration (transfers ownership of extension_num, raw_uri_user, contact_val, plugin_custom). */
+  log_trace("REGISTER: auth OK, extension=%s", extension_num);
   char *contact_val = get_contact_value(req_buf, req_len);
-  log_trace("REGISTER: step contact_val done, loop reg_count=%zu", reg_count);
-  for (size_t i = 0; i < reg_count; i++) {
-    if (strcmp(reg_list[i].number, extension_num) == 0) {
-      log_trace("REGISTER: step found existing reg at i=%zu", i);
-      free(reg_list[i].trunk_name);
-      free(reg_list[i].contact);
-      free(reg_list[i].uri_user);
-      free(reg_list[i].plugin_data);
-      reg_list[i].trunk_name = strdup(trunk->name);
-      reg_list[i].contact = contact_val ? contact_val : strdup("");
-      reg_list[i].uri_user = raw_uri_user;  /* transfer ownership */
-      raw_uri_user = NULL;
-      reg_list[i].plugin_data = plugin_custom;
-      reg_list[i].expires = time(NULL) + DEFAULT_EXPIRES;
-      if (h[0]) {
-        strncpy(reg_list[i].learned_host, h, sizeof(reg_list[i].learned_host) - 1);
-        reg_list[i].learned_host[sizeof(reg_list[i].learned_host) - 1] = '\0';
-        strncpy(reg_list[i].learned_port, p[0] ? p : "5060", sizeof(reg_list[i].learned_port) - 1);
-        reg_list[i].learned_port[sizeof(reg_list[i].learned_port) - 1] = '\0';
-      } else
-        reg_list[i].learned_host[0] = '\0';
-      if (!contact_val) contact_val = strdup("");
-      free(extension_num);
-      log_trace("REGISTER: step update path before build_reply");
-      { char *r = build_reply(req_buf, req_len, 200, 1, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); } }
-      log_trace("REGISTER: step update path after send");
-      reg_list_notify_pending = 1;
-      log_trace("REGISTER: step update path return");
-      return;
-    }
-  }
-  log_trace("REGISTER: step after loop no match");
-  if (reg_count >= reg_cap) {
-    size_t newcap = reg_cap ? reg_cap * 2 : 8;
-    ext_reg_t *new_list = realloc(reg_list, newcap * sizeof(ext_reg_t));
-    if (!new_list) { free(extension_num); free(plugin_custom); free(contact_val);
-      char *r = build_reply(req_buf, req_len, 503, 0, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
-      return; }
-    reg_list = new_list;
-    reg_cap = newcap;
-  }
-  log_trace("REGISTER: step new path assign slot");
-  reg_list[reg_count].number = extension_num;
-  reg_list[reg_count].uri_user = raw_uri_user;  /* transfer ownership */
-  raw_uri_user = NULL;
-  reg_list[reg_count].trunk_name = strdup(trunk->name);
-  reg_list[reg_count].contact = contact_val ? contact_val : strdup("");
-  if (h[0]) {
-    strncpy(reg_list[reg_count].learned_host, h, sizeof(reg_list[reg_count].learned_host) - 1);
-    reg_list[reg_count].learned_host[sizeof(reg_list[reg_count].learned_host) - 1] = '\0';
-    strncpy(reg_list[reg_count].learned_port, p[0] ? p : "5060", sizeof(reg_list[reg_count].learned_port) - 1);
-    reg_list[reg_count].learned_port[sizeof(reg_list[reg_count].learned_port) - 1] = '\0';
-  } else
-    reg_list[reg_count].learned_host[0] = '\0';
-  reg_list[reg_count].plugin_data = plugin_custom;
-  reg_list[reg_count].expires = time(NULL) + DEFAULT_EXPIRES;
-  reg_count++;
-  log_trace("REGISTER: step new path before build_reply");
+  registration_update(extension_num, raw_uri_user, trunk->name, contact_val, h, p[0] ? p : "5060", plugin_custom);
+  raw_uri_user = NULL;  /* ownership transferred */
   { char *r = build_reply(req_buf, req_len, 200, 1, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); } }
-  log_trace("REGISTER: step new path after send");
-  reg_list_notify_pending = 1;
-  log_trace("REGISTER: step new path done");
   free(raw_uri_user);  /* no-op if transferred to reg */
 }
 
@@ -929,44 +697,6 @@ static int get_cseq_number(const char *buf, size_t len) {
   return atoi(val);
 }
 
-/* Route INVITE to plugin-provided targets (SIP URIs). Sends INVITE to each, then 100 Trying to caller. */
-__attribute__((unused))
-static void handle_invite_route_to_targets(upbx_config *cfg, const char *req_buf, size_t req_len, sip_send_ctx *ctx, char **targets, size_t n_targets) {
-  char via_buf[512], from_buf[384], to_buf[384], call_id_buf[256], cseq_buf[64], contact_buf[256];
-  via_buf[0] = from_buf[0] = to_buf[0] = call_id_buf[0] = cseq_buf[0] = contact_buf[0] = '\0';
-  sip_header_copy(req_buf, req_len, "Via", via_buf, sizeof(via_buf));
-  sip_header_copy(req_buf, req_len, "From", from_buf, sizeof(from_buf));
-  sip_header_copy(req_buf, req_len, "To", to_buf, sizeof(to_buf));
-  sip_header_copy(req_buf, req_len, "Call-ID", call_id_buf, sizeof(call_id_buf));
-  sip_header_copy(req_buf, req_len, "CSeq", cseq_buf, sizeof(cseq_buf));
-  sip_header_copy(req_buf, req_len, "Contact", contact_buf, sizeof(contact_buf));
-  const char *body_ptr = NULL;
-  size_t body_len = 0;
-  sip_request_get_body(req_buf, req_len, &body_ptr, &body_len);
-  for (size_t i = 0; i < n_targets; i++) {
-    if (!targets[i] || !targets[i][0]) continue;
-    char host[256], port[32];
-    if (contact_to_host_port(targets[i], host, sizeof(host), port, sizeof(port)) != 0) continue;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) continue;
-    char req_uri[256];
-    sip_format_request_uri("", host, port, req_uri, sizeof(req_uri));
-    char *inv = sip_build_request_parts("INVITE", req_uri,
-      via_buf[0] ? via_buf : NULL, from_buf[0] ? from_buf : NULL, to_buf[0] ? to_buf : NULL,
-      call_id_buf[0] ? call_id_buf : NULL, cseq_buf[0] ? cseq_buf : NULL, contact_buf[0] ? contact_buf : NULL,
-      0, body_ptr, body_len, NULL);
-    if (inv) {
-      udp_send_to(ctx->sockfd, res->ai_addr, res->ai_addrlen, inv, strlen(inv));
-      free(inv);
-    }
-    freeaddrinfo(res);
-  }
-  { char *r = build_reply(req_buf, req_len, 100, 0, 0, NULL); if (r) { send_response_buf(ctx, r, strlen(r)); free(r); } }
-}
-
 static int parse_listen_addr(const char *addr, char *host, size_t host_size, char *port, size_t port_size);
 static int get_advertise_addr(upbx_config *cfg, char *host_out, size_t host_size, char *port_out, size_t port_size);
 static int get_advertise_addr_for_ext(upbx_config *cfg, const ext_reg_t *reg, char *host_out, size_t host_size, char *port_out, size_t port_size);
@@ -994,7 +724,7 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
         free(resp);
       }
     }
-    hangup_and_remove(call);
+    call_remove(call);
     return;
   }
 
@@ -1003,7 +733,7 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
     trunk_name[0] = overflow_target_str[0] = '\0';
     if (call->trunk->name) strncpy(trunk_name, call->trunk->name, sizeof(trunk_name) - 1);
     if (call->trunk->overflow_target) strncpy(overflow_target_str, call->trunk->overflow_target, sizeof(overflow_target_str) - 1);
-    ext_reg_t *overflow_reg = get_ext_reg_by_number(trunk_name, overflow_target_str);
+    ext_reg_t *overflow_reg = registration_get_by_number(trunk_name, overflow_target_str);
     if (overflow_reg && call->original_invite && call->original_invite_len > 0) {
       char host[256], port[32];
       if (contact_to_host_port(overflow_reg->contact, host, sizeof(host), port, sizeof(port)) == 0) {
@@ -1099,6 +829,7 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
   }
   call->sockfd = ctx->sockfd;
   call->trunk  = trunk;
+  call->direction = strdup("dialin");
   call->source_str = source_str ? strdup(source_str) : NULL;
   memcpy(&call->a.sip_addr, &ctx->peer, sizeof(ctx->peer));
   call->a.sip_len = ctx->peerlen;
@@ -1298,13 +1029,13 @@ static void handle_invite_incoming(upbx_config *cfg, const char *buf, size_t len
     exts = (ext_reg_t **)malloc(n_override * sizeof(ext_reg_t *));
     if (exts) {
       for (size_t k = 0; k < n_override; k++) {
-        ext_reg_t *r = get_ext_reg_by_number(trunk->name, override_ext_numbers[k]);
+        ext_reg_t *r = registration_get_by_number(trunk->name, override_ext_numbers[k]);
         if (r) exts[n_ext++] = r;
       }
       if (n_ext == 0) { free(exts); exts = NULL; }
     }
   } else
-    n_ext = get_ext_regs_for_trunk(trunk->name, &exts);
+    n_ext = registration_get_regs(trunk->name, NULL, &exts);
   if (n_ext == 0 || !exts) {
     free(exts);
     char *r = build_reply(buf, len, 480, 0, 0, NULL);
@@ -1327,20 +1058,10 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   }
   memcpy(ext_num, from_user, ext_len);
   ext_num[ext_len] = '\0';
-  ext_reg_t *reg = NULL;
-  if (!reg_list_ready || !reg_list) {
-    free(ext_num);
-    char *r = build_reply(buf, len, 404, 0, 0, NULL);
-    if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
-    return;
-  }
-  for (size_t i = 0; i < reg_count; i++) {
-    if (reg_list[i].expires <= time(NULL)) continue;
-    if (strcmp(reg_list[i].number, ext_num) == 0) {
-      reg = &reg_list[i];
-      break;
-    }
-  }
+  ext_reg_t **ext_matches = NULL;
+  size_t ext_match_count = registration_get_regs(NULL, ext_num, &ext_matches);
+  ext_reg_t *reg = ext_match_count > 0 ? ext_matches[0] : NULL;
+  free(ext_matches);
   free(ext_num);
   if (!reg) {
     char *r = build_reply(buf, len, 404, 0, 0, NULL);
@@ -1390,6 +1111,7 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   if (call) {
     call->sockfd = ctx->sockfd;
     call->trunk  = trunk;
+    call->direction = strdup("dialout");
     call->source_str = from_user ? strdup(from_user) : NULL;
     memcpy(&call->a.sip_addr, &ctx->peer, sizeof(ctx->peer));
     call->a.sip_len = ctx->peerlen;
@@ -1520,7 +1242,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   if (to_user[0] && find_trunk_by_did(cfg, to_user)) {
     config_trunk *trunk = find_trunk_by_did(cfg, to_user);
     ext_reg_t **exts = NULL;
-    size_t n_ext = get_ext_regs_for_trunk(trunk->name, &exts);
+    size_t n_ext = registration_get_regs(trunk->name, NULL, &exts);
     if (plugin_count() > 0 && n_ext > 0 && exts) {
       const char **ext_numbers = (const char **)malloc(n_ext * sizeof(const char *));
       if (ext_numbers) {
@@ -1564,7 +1286,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     }
     if (to_ext[0] && get_extension_config(cfg, to_ext) && strcmp(ext_num, to_ext) != 0) {
       ext_reg_t **exts = NULL;
-      size_t n_ext = get_ext_regs_for_extension(to_ext, &exts);
+      size_t n_ext = registration_get_regs(NULL, to_ext, &exts);
       if (n_ext > 0 && exts) {
         log_info("INVITE %s->%s: extension-to-extension, forking to %zu reg(s)", ext_num, to_ext, n_ext);
         fork_invite_to_extension_regs(cfg, buf, len, ctx, exts, n_ext, NULL, ext_num);
@@ -1583,13 +1305,10 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       }
       free(exts);
     }
-    ext_reg_t *reg = NULL;
-    if (reg_list_ready && reg_list) {
-      for (size_t i = 0; i < reg_count; i++) {
-        if (reg_list[i].expires <= time(NULL)) continue;
-        if (strcmp(reg_list[i].number, ext_num) == 0) { reg = &reg_list[i]; break; }
-      }
-    }
+    ext_reg_t **dm = NULL;
+    size_t dmc = registration_get_regs(NULL, ext_num, &dm);
+    ext_reg_t *reg = dmc > 0 ? dm[0] : NULL;
+    free(dm);
     const char *trunk_name = reg && reg->trunk_name ? reg->trunk_name : "";
     const char *destination = to_user[0] ? to_user : "";
     char *target_override = NULL;
@@ -1801,12 +1520,12 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
       free(call->dest_str);
       call->dest_str = strdup(callee_num);
     }
-    notify_call_answer("dialin", call->call_id, call->source_str, call->dest_str);
+    notify_call_answer(call->direction ? call->direction : "dialin", call->call_id, call->source_str, call->dest_str);
     /* Call stays alive for RTP; BYE or timeout will clean up. */
   } else if (code >= 300) {
     /* Non-2xx final response: call failed or was cancelled (e.g. 487).
      * The ACK was already sent above. Clean up the call. */
-    hangup_and_remove(call);
+    call_remove(call);
   }
 }
 
@@ -1817,20 +1536,6 @@ typedef struct {
   size_t len;
   char buf[];
 } udp_msg_t;
-
-/* Return true if buf[0..len-1] looks like a SIP message so libosip2 parse is safe. */
-static bool looks_like_sip(const char *buf, size_t len) {
-  log_trace("%s", __func__);
-  if (len < 12)
-    return false;
-  /* Must end headers with \r\n\r\n so parser doesn't run off. */
-  size_t max = len < SIP_MAX_HEADERS ? len : SIP_MAX_HEADERS;
-  for (size_t i = 0; i + 3 < max; i++) {
-    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
-      return true;
-  }
-  return false;
-}
 
 /* Handle one UDP datagram (SIP request or response). Called synchronously from main loop. */
 static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
@@ -1952,7 +1657,7 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
       }
       /* Reply 200 OK to the BYE sender. */
       { char *r = build_reply(buf, len, 200, 0, 0, NULL); if (r) { send_response_buf(&ctx, r, strlen(r)); free(r); } }
-      hangup_and_remove(c);
+      call_remove(c);
     } else {
       /* No matching call; reply 481 Call/Transaction Does Not Exist. */
       char *r = build_reply(buf, len, 481, 0, 0, NULL);
@@ -2041,13 +1746,7 @@ static int get_advertise_addr_for_ext(upbx_config *cfg, const ext_reg_t *reg, ch
 
 static int get_advertise_addr(upbx_config *cfg, char *host_out, size_t host_size, char *port_out, size_t port_size) {
   const char *listen = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
-  if (learned_advertise_host[0]) {
-    size_t n = strlen(learned_advertise_host);
-    if (n >= host_size) return -1;
-    memcpy(host_out, learned_advertise_host, n + 1);
-    n = strlen(learned_advertise_port);
-    if (n > 0 && n < port_size) memcpy(port_out, learned_advertise_port, n + 1);
-    else if (port_size > 0) { strncpy(port_out, "5060", port_size - 1); port_out[port_size - 1] = '\0'; }
+  if (registration_get_advertise_addr(host_out, host_size, port_out, port_size)) {
     return 0;
   }
   return parse_listen_addr(listen, host_out, host_size, port_out, port_size);
@@ -2137,6 +1836,13 @@ void daemon_root(int argc, void *argv[]) {
     return;
   }
   log_info("SIP listening on UDP %s", listen_addr);
+
+  /* Register callback so all call removals (including timeout aging) fire CALL.HANGUP. */
+  call_set_pre_remove_callback(call_pre_remove_handler);
+
+  /* Initialize registration subsystem. */
+  registration_init();
+
   if (cfg->trunk_count > 0)
     log_info("trunk registration started (%zu trunk(s))", cfg->trunk_count);
   notify_extension_and_trunk_lists(cfg);
@@ -2185,8 +1891,8 @@ void daemon_root(int argc, void *argv[]) {
             msg->buf[nr] = '\0';
             handle_udp_msg(cfg, msg, sockfd);
           }
-          if (reg_list_notify_pending) {
-            reg_list_notify_pending = 0;
+          if (registration_is_notify_pending()) {
+            registration_clear_notify_pending();
             notify_extension_and_trunk_lists(cfg);
           }
         }

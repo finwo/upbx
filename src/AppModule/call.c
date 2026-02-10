@@ -15,7 +15,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "socket_util.h"
+#include "common/socket_util.h"
 #include "AppModule/call.h"
 #include "rxi/log.h"
 
@@ -27,6 +27,13 @@ static call_t *call_list = NULL;
 
 /* Track last-used port so we rotate through the range. */
 static int prev_port = 0;
+
+/* Pre-remove callback (e.g. for plugin CALL.HANGUP notifications). */
+static call_pre_remove_cb pre_remove_cb = NULL;
+
+void call_set_pre_remove_callback(call_pre_remove_cb cb) {
+  pre_remove_cb = cb;
+}
 
 /* ---- Helpers ---- */
 
@@ -64,6 +71,10 @@ call_t *call_find(const char *call_id) {
 void call_remove(call_t *call) {
   if (!call) return;
 
+  /* Invoke pre-remove callback (e.g. CALL.HANGUP plugin notification). */
+  if (pre_remove_cb)
+    pre_remove_cb(call);
+
   /* Unlink from list. */
   if (call_list == call) {
     call_list = call->next;
@@ -88,6 +99,7 @@ void call_remove(call_t *call) {
   free(call->caller_via);
   free(call->source_str);
   free(call->dest_str);
+  free(call->direction);
   free(call);
 }
 

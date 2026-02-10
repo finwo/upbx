@@ -66,8 +66,15 @@ typedef struct call {
   config_trunk *trunk;                /* NULL for ext-to-ext              */
   char         *source_str;           /* caller id (for plugins)          */
   char         *dest_str;             /* callee id (for plugins)          */
+  char         *direction;            /* "dialin" or "dialout" (for CALL.ANSWER/HANGUP events) */
   int           overflow_done;
 } call_t;
+
+/* ---- Pre-remove callback (for plugin notifications) ---- */
+
+/* Called before a call is removed from the list. Set once at startup. */
+typedef void (*call_pre_remove_cb)(call_t *call);
+void call_set_pre_remove_callback(call_pre_remove_cb cb);
 
 /* ---- Lifecycle ---- */
 

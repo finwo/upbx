@@ -7,10 +7,24 @@
 #include <ctype.h>
 #include <time.h>
 
+#include "rxi/log.h"
 #include "AppModule/sip_parse.h"
 
 #define SEC_MINLEN      16
 #define SEC_MAXLINELEN  2048
+#define SIP_MAX_HEADERS (32 * 1024)
+
+bool looks_like_sip(const char *buf, size_t len) {
+  log_trace("%s", __func__);
+  if (len < 12)
+    return false;
+  size_t max = len < SIP_MAX_HEADERS ? len : SIP_MAX_HEADERS;
+  for (size_t i = 0; i + 3 < max; i++) {
+    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+      return true;
+  }
+  return false;
+}
 
 /* Siproxd security_check_raw: same checks before osip_message_parse. */
 int sip_security_check_raw(char *sip_buffer, size_t size) {

@@ -1,5 +1,56 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "CliModule/common.h"
+
 #ifndef NULL
 #define NULL (void*)0
 #endif
 
 struct climodule_command *climodule_commands = NULL;
+
+static const char *global_config_path = NULL;
+
+const char *cli_find_arg(int argc, const char **argv, const char *name) {
+  for (int i = 0; i < argc - 1; i++)
+    if (strcmp(argv[i], name) == 0)
+      return argv[i + 1];
+  return NULL;
+}
+
+size_t cli_collect_positional(int argc, const char **argv, int start,
+    const char **out, size_t max_out) {
+  size_t n = 0;
+  for (int i = start; i < argc && n < max_out; i++) {
+    if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] != '\0') {
+      i++; /* skip value of --flag */
+      continue;
+    }
+    out[n++] = argv[i];
+  }
+  return n;
+}
+
+void cli_set_config_path(const char *path) {
+  global_config_path = path;
+}
+
+const char *cli_config_path(void) {
+  return global_config_path;
+}
+
+const char *cli_resolve_default_config(void) {
+  static char buf[1024];
+  const char *home = getenv("HOME");
+  if (home) {
+    snprintf(buf, sizeof(buf), "%s/.config/upbx.conf", home);
+    if (access(buf, R_OK) == 0) return buf;
+    snprintf(buf, sizeof(buf), "%s/.upbx.conf", home);
+    if (access(buf, R_OK) == 0) return buf;
+  }
+  if (access("/etc/upbx/upbx.conf", R_OK) == 0) return "/etc/upbx/upbx.conf";
+  if (access("/etc/upbx.conf", R_OK) == 0) return "/etc/upbx.conf";
+  return NULL;
+}

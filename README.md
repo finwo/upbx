@@ -18,24 +18,38 @@ The binary is `upbx`.
 
 ---
 
+## Global options
+
+These options apply to all commands and must appear **before** the command name.
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--config <path>` | `-f` | Config file path. If omitted, the following are tried in order: `$HOME/.config/upbx.conf`, `$HOME/.upbx.conf`, `/etc/upbx/upbx.conf`, `/etc/upbx.conf`. |
+| `--verbosity <level>` | `-v` | Log verbosity: fatal, error, warn, info, debug, trace (default: info). |
+| `--log <path>` | | Also write log to file (SIGHUP reopens for logrotate). |
+
+---
+
 ## Running the daemon
 
-The main entry point is the **daemon** command. You must pass a config file.
+The main entry point is the **daemon** command.
 
 ```bash
-# Foreground (default)
-./upbx daemon -f /etc/upbx.conf
+# Foreground (default, config auto-detected)
+./upbx daemon
+
+# Explicit config file
+./upbx -f /etc/upbx.conf daemon
 
 # Background (daemonize)
-./upbx daemon -f /etc/upbx.conf -d
+./upbx -f /etc/upbx.conf daemon -d
 
 # Force foreground even if config has daemonize=1
-./upbx daemon -f /etc/upbx.conf -D
+./upbx -f /etc/upbx.conf daemon -D
 ```
 
 | Option | Short | Description |
 |--------|--------|--------------|
-| `--config <path>` | `-f` | Config file path (required for daemon). |
 | `--daemonize` | `-d` | Run in background (double fork, detach from terminal). |
 | `--no-daemonize` | `-D` | Force foreground; overrides `daemonize=1` in config. |
 
@@ -46,6 +60,60 @@ Daemonize behaviour:
 - `-D`/`--no-daemonize` always forces foreground.
 
 After starting, the daemon loads config, starts the built-in RTP relay, spawns any configured plugins, binds the SIP UDP socket, and handles REGISTER (extensions and trunk registration) and INVITE (routing). Logging goes to stderr (and optionally to a file if you use global `--log`).
+
+---
+
+## Managing extensions and trunks
+
+Extensions and trunks can be managed from the CLI without manually editing the config file. The `-f` flag is a global option (see above); if omitted, the default config locations are searched.
+
+```bash
+# List extensions
+./upbx extension list
+
+# Add an extension (number and secret are positional)
+./upbx extension add --name "Reception" 200 mypass
+
+# Remove an extension
+./upbx extension remove 200
+# or: ./upbx extension rm 200
+
+# List trunks
+./upbx trunk list
+
+# Add a trunk (name is positional, flags for connection details)
+./upbx trunk add --host sip.example.com \
+  --username user --password pass --did 15551234567 --cid 15551234567 mycarrier
+
+# Remove a trunk
+./upbx trunk remove mycarrier
+# or: ./upbx trunk rm mycarrier
+
+# Explicit config file
+./upbx -f /etc/upbx.conf extension list
+```
+
+---
+
+## Shell completion
+
+Enable tab completion for bash or zsh. The completion scripts are context-aware and will offer extension numbers and trunk names from the config when completing `remove`/`rm` arguments.
+
+```bash
+# Bash
+eval "$(./upbx completion bash)"
+
+# Zsh
+eval "$(./upbx completion zsh)"
+```
+
+---
+
+## Running tests
+
+```bash
+make test
+```
 
 ---
 

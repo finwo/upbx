@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <signal.h>
 
-#include "socket_util.h"
+#include "common/socket_util.h"
 #include "rxi/log.h"
 #include "PluginModule/plugin.h"
 

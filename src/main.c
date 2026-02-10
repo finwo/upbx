@@ -13,6 +13,7 @@ extern "C" {
 
 #include "CliModule/setup.h"
 #include "CliModule/execute_command.h"
+#include "CliModule/common.h"
 
 #ifdef __cplusplus
 }
@@ -56,6 +57,7 @@ static void sighup_handler(int sig) {
 int main(int argc, const char **argv) {
   const char *loglevel = "info";
   const char *logfile_path = NULL;
+  const char *config_path = NULL;
 
   climodule_setup();
   appmodule_setup();
@@ -63,6 +65,7 @@ int main(int argc, const char **argv) {
   struct argparse argparse;
   struct argparse_option options[] = {
     OPT_HELP(),
+    OPT_STRING('f', "config", &config_path, "config file path (default: auto-detect)", NULL, 0, 0),
     OPT_STRING('v', "verbosity", &loglevel, "log verbosity: fatal,error,warn,info,debug,trace (default: info)", NULL, 0, 0),
     OPT_STRING(0, "log", &logfile_path, "also write log to file (SIGHUP reopens for logrotate)", NULL, 0, 0),
     OPT_END(),
@@ -73,6 +76,11 @@ int main(int argc, const char **argv) {
     argparse_usage(&argparse);
     return 1;
   }
+
+  /* Resolve config path: explicit -f, then default locations */
+  if (!config_path || !config_path[0])
+    config_path = cli_resolve_default_config();
+  cli_set_config_path(config_path);
 
   int level = LOG_INFO;
   if (0) {
