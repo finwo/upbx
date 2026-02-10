@@ -33,8 +33,8 @@ void plugin_notify_event(const char *event_name, int argc, const char **argv);
 void plugin_query_register(const char *extension_num, const char *trunk_name, const char *from_user,
   int *out_allow, char **out_custom);
 
-/* CALL.DIALOUT: outgoing call from extension, before emergency handling. Args: source_ext, source_trunk, destination, call_id.
- * Ignore plugin override if destination is emergency. Returns: 0 = no-edit, 1 = reject (*out_reject_code), 2 = allow (*out_target_override = new target or NULL to use destination). Caller frees *out_target_override. */
+/* CALL.DIALOUT: outgoing call from extension. Args: source_ext, source_trunk, destination, call_id.
+ * Returns: 0 = no-edit, 1 = reject (*out_reject_code), 2 = allow (*out_target_override = new target or NULL to use destination). Caller frees *out_target_override. */
 void plugin_query_dialout(const char *source_ext, const char *source_trunk, const char *destination, const char *call_id,
   int *out_action, int *out_reject_code, char **out_target_override);
 

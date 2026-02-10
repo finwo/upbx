@@ -95,6 +95,8 @@ void call_remove(call_t *call) {
     free(call->fork_ids[i]);
     free(call->fork_vias[i]);
   }
+  for (size_t i = 0; i < call->n_pending_exts; i++)
+    free(call->pending_exts[i]);
   free(call->original_invite);
   free(call->caller_via);
   free(call->source_str);

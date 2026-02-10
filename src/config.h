@@ -47,9 +47,6 @@ struct upbx_config {
   char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
   int rtp_port_low;   /* RTP relay port range (from rtp_ports low-high; default 10000-20000) */
   int rtp_port_high;
-  char **emergency;
-  size_t emergency_count;
-
   config_plugin *plugins;
   size_t plugin_count;
 

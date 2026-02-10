@@ -30,11 +30,21 @@ typedef struct call {
 
   /* Forking: SIP addresses we sent INVITE to (for ACK/CANCEL). */
   #define CALL_MAX_FORKS 8
+  #define FORK_ACTIVE  0    /* INVITE sent, waiting for response          */
+  #define FORK_DONE    1    /* Final non-2xx received (not retryable)     */
+  #define FORK_BUSY    2    /* 486 Busy received, waiting for retry       */
   struct sockaddr_storage fork_addrs[CALL_MAX_FORKS];
   socklen_t              fork_lens[CALL_MAX_FORKS];
   char                  *fork_ids[CALL_MAX_FORKS];
   char                  *fork_vias[CALL_MAX_FORKS]; /* Via value we used (for CANCEL) */
+  int                    fork_state[CALL_MAX_FORKS]; /* FORK_ACTIVE/DONE/BUSY */
   size_t                 n_forks;
+
+  /* Extensions pending (re-)INVITE: initially populated by fork setup,
+   * repopulated when a fork responds 486 Busy. The pending handler in
+   * overflow_pt drains this list by sending INVITEs when extensions are free. */
+  char                  *pending_exts[CALL_MAX_FORKS];
+  size_t                 n_pending_exts;
 
   /* RTP relay: one socket facing each party.
    * Receive on rtp_sock_a → sendto(rtp_remote_b)

@@ -127,9 +127,6 @@ listen = 0.0.0.0:5060
 rtp_ports = 10000-20000
 daemonize = 0
 # locality = 4
-# emergency = 911
-# emergency = 112
-
 [plugin:myplugin]
 exec = /usr/bin/my-plugin-binary
 
@@ -167,7 +164,6 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `rtp_ports` | Port range for the built-in RTP relay, as `low-high` (e.g. `10000-20000`). Default 10000–20000. |
 | `daemonize` | `1` = run in background when started without `-d`/`-D`; `0` = foreground. |
 | `locality` | Number of digits for short-dial / group routing. When set, an extension’s trunk can be chosen by **group**: if the extension number has more than `locality` digits and its prefix matches a trunk’s `group`, that trunk is used for outgoing calls (see `[trunk]` `group`). `0` = disabled. |
-| `emergency` | Emergency number(s); can repeat. Used when routing emergency calls from extensions. |
 
 ### `[plugin:name]`
 
@@ -210,7 +206,7 @@ With this, extensions register as `<number>@<trunk>` (or via your dial plan). In
 | `EXTENSION.REGISTER` | Before accepting REGISTER | extension, trunk, from_user → DENY / ALLOW [custom] / continue |
 | `EXTENSION.LIST` | At start and on registration change | 3 per ext: number, name, trunk (no secret) |
 | `TRUNK.LIST` | At start and on registration change | 5 per trunk: name, group_prefix, dids, cid, extensions (no credentials) |
-| `CALL.DIALOUT` | Outgoing call from extension (before emergency) | source_ext, source_trunk, destination, call_id → no-edit / REJECT [code] / ALLOW [target]; ignored if destination is emergency |
+| `CALL.DIALOUT` | Outgoing call from extension | source_ext, source_trunk, destination, call_id → no-edit / REJECT [code] / ALLOW [target] |
 | `CALL.DIALIN` | Incoming call to DID | trunk, did, ext1, ext2, …, call_id → dont-care / REJECT [code] / ALTER ext… |
 | `CALL.ANSWER` | When a call is picked up (dialin) | direction, call_id, source, destination (event; response ignored) |
 | `CALL.HANGUP` | When a call is terminated | call_id, source, destination, duration_sec (event; response ignored) |

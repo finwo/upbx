@@ -150,15 +150,6 @@ static int handler(void *user, const char *section, const char *name, const char
       }
       return 1;
     }
-    if (strcmp(key, "emergency") == 0) {
-      char **p = (char **)realloc(cfg->emergency, (cfg->emergency_count + 1) * sizeof(char *));
-      if (!p) { set_last_parse_error(sec, key); return 0; }
-      cfg->emergency = p;
-      cfg->emergency[cfg->emergency_count] = STRDUP(val);
-      if (!cfg->emergency[cfg->emergency_count]) { set_last_parse_error(sec, key); return 0; }
-      cfg->emergency_count++;
-      return 1;
-    }
     log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec[0] ? sec : "(none)");
     return 1;
   }
@@ -285,9 +276,6 @@ void config_init(upbx_config *cfg) {
 
 void config_free(upbx_config *cfg) {
   free(cfg->listen);
-  for (size_t i = 0; i < cfg->emergency_count; i++)
-    free(cfg->emergency[i]);
-  free(cfg->emergency);
 
   for (size_t i = 0; i < cfg->plugin_count; i++) {
     free(cfg->plugins[i].name);
