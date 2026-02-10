@@ -41,6 +41,7 @@ typedef struct {
   int reg_fd;              /* -1 when idle; socket when waiting for REGISTER response */
   time_t reg_deadline;     /* when to give up waiting */
   struct addrinfo *reg_res; /* so we can retry sendto and free later */
+  int registered;          /* 1 when upstream accepted our REGISTER (2xx), 0 otherwise */
 } trunk_state_t;
 
 #define TRUNK_UDP_RECV_TIMEOUT_SEC  10
@@ -194,9 +195,11 @@ static void handle_reg_response(upbx_config *cfg, size_t trunk_idx, char *buf, s
     else refresh = TRUNK_REG_DEFAULT_REFRESH;
     if (refresh < TRUNK_REG_MIN_REFRESH) refresh = TRUNK_REG_MIN_REFRESH;
     state->next_refresh = time(NULL) + refresh;
+    state->registered = 1;
     log_info("trunk %s: registered (refresh in %ds)", trunk->name, refresh);
   } else if (status_code > 0) {
     log_warn("trunk %s: REGISTER failed %d", trunk->name, status_code);
+    state->registered = 0;
     state->next_refresh = time(NULL) + TRUNK_REG_DEFAULT_REFRESH;
   }
   if (state->reg_fd >= 0) {
@@ -243,6 +246,7 @@ void trunk_reg_poll(fd_set *read_set) {
     if (now > state->reg_deadline) {
       if (state->reg_fd >= 0) { close(state->reg_fd); state->reg_fd = -1; }
       if (state->reg_res) { freeaddrinfo(state->reg_res); state->reg_res = NULL; }
+      state->registered = 0;
       state->next_refresh = now + TRUNK_REG_DEFAULT_REFRESH;
       continue;
     }
@@ -275,4 +279,16 @@ PT_THREAD(trunk_reg_pt(struct pt *pt, upbx_config *cfg)) {
     PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+/* Check whether a trunk's upstream registration is currently active. */
+int trunk_reg_is_available(const char *trunk_name) {
+  if (!trunk_name || !trunk_name[0] || !trunk_reg_cfg || !trunk_states) return 0;
+  for (size_t i = 0; i < trunk_states_n; i++) {
+    if (i < trunk_reg_cfg->trunk_count &&
+        trunk_reg_cfg->trunks[i].name &&
+        strcmp(trunk_reg_cfg->trunks[i].name, trunk_name) == 0)
+      return trunk_states[i].registered;
+  }
+  return 0;
 }

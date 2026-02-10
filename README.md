@@ -127,6 +127,10 @@ listen = 0.0.0.0:5060
 rtp_ports = 10000-20000
 daemonize = 0
 # locality = 4
+# cross_group_calls = 1
+# emergency = 911
+# emergency = 112
+
 [plugin:myplugin]
 exec = /usr/bin/my-plugin-binary
 
@@ -152,6 +156,11 @@ cid = 15559876543
 [ext:100]
 # name = Front desk
 secret = my-secret
+
+# Pattern extension: matches any 08540 + 3 digits (e.g. 08540001 through 08540999)
+# Register as literal "08540xxx" to receive calls matching this pattern.
+[ext:08540xxx]
+secret = trunk-secret
 ```
 
 ### `[upbx]`
@@ -163,7 +172,9 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `listen` | SIP UDP bind address (e.g. `0.0.0.0:5060` or `192.168.1.1:5060`). Fallback for Via/SDP when not yet learned from REGISTER. |
 | `rtp_ports` | Port range for the built-in RTP relay, as `low-high` (e.g. `10000-20000`). Default 10000–20000. |
 | `daemonize` | `1` = run in background when started without `-d`/`-D`; `0` = foreground. |
-| `locality` | Number of digits for short-dial / group routing. When set, an extension’s trunk can be chosen by **group**: if the extension number has more than `locality` digits and its prefix matches a trunk’s `group`, that trunk is used for outgoing calls (see `[trunk]` `group`). `0` = disabled. |
+| `locality` | Number of short-dial digits and locality group selector. `0` (default) = disabled, all trunks form one big group. When `> 0`, trunks with the same `group` prefix form a locality group, and extensions whose number starts with that prefix belong to the group. Dialing exactly `locality` digits triggers **short-dialing**: the caller’s group prefix is prepended automatically (e.g. `locality = 4`, prefix `1234`, dial `1001` expands to `12341001`). |
+| `cross_group_calls` | `1` (default) = allow direct ext-to-ext calls across locality groups. `0` = block cross-group ext-to-ext calls with 403. Only meaningful when `locality > 0`. |
+| `emergency` | Repeatable. Numbers listed here always route externally via the caller’s trunk, bypassing short-dialing and ext-to-ext routing (e.g. `emergency = 911`). |
 
 ### `[plugin:name]`
 
@@ -179,16 +190,16 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `port` | Upstream SIP port (default 5060 if omitted). |
 | `username` | Username for trunk registration. |
 | `password` | Password for trunk registration. |
-| `did` | Incoming DID(s); can repeat. Incoming calls to this DID are forked to extensions registered on this trunk. |
-| `cid` | Outgoing caller ID number. |
-| `cid_name` | Optional caller ID display name. |
+| `did` | Incoming DID(s); can repeat. Incoming calls to this DID are forked to all extensions in the trunk's locality group. |
+| `cid` | Outgoing caller ID number. Applied to the From header of outgoing INVITEs when this trunk is selected. |
+| `cid_name` | Optional caller ID display name. Used with `cid` in the From header. |
 | `pattern` | Regex pattern for number rewriting (use with `replace`). |
 | `replace` | Replacement string for the last `pattern` (applied in order). |
 | `overflow_timeout` | Seconds before overflow behaviour; `0` = disabled. |
 | `overflow_strategy` | `none`, `busy`, `include`, or `redirect`. |
 | `overflow_target` | Target number for `overflow_strategy = include` or `redirect`. |
 | `user_agent` | Custom User-Agent for trunk registration. |
-| `group` | **Group prefix for locality.** When `[upbx]` `locality` is set, extensions whose number starts with this prefix and has at least `len(group) + locality` digits use this trunk for outgoing. E.g. `group = 1234`, `locality = 4`: extension `12341000` (8 digits, prefix 1234) uses this trunk. |
+| `group` | **Group prefix for locality.** Trunks with the same `group` value form a locality group. Extensions whose number starts with this prefix and has at least `len(group) + locality` digits belong to this group. Incoming DID calls ring all extensions in the group. Outgoing calls use the first available trunk in the group (config order), with fallback. E.g. `group = 1234`, `locality = 4`: extension `12341000` belongs to this group. |
 
 ### `[ext:number]`
 
@@ -197,7 +208,14 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `name` | Optional display name. |
 | `secret` | Password for extension digest auth. |
 
-With this, extensions register as `<number>@<trunk>` (or via your dial plan). Incoming calls to a DID go to all registered extensions on that trunk. Outgoing calls use the extension’s trunk (from `@trunk`, or from **locality/group** when `locality` and a trunk `group` match the extension number).
+Extensions register using their extension number (e.g. `100`). Trunk assignment is automatic based on `locality` and `group` settings — no `@trunk` syntax needed.
+
+**Routing summary:**
+- **No trunks configured:** ext-to-ext calls only.
+- **`locality = 0` (default):** All trunks form one group. All extensions belong to it. Incoming DID calls ring all extensions. Outgoing calls use the first available trunk.
+- **`locality > 0`:** Trunks with the same `group` prefix form locality groups. Extensions matching a group prefix belong to that group. Short-dialing within the group works automatically.
+- **CID:** Outgoing calls use the selected trunk’s `cid` and `cid_name` in the From header (if configured).
+- **Pattern extensions:** `[ext:08540xxx]` matches any number where `08540` is literal and each `x` matches any single digit (0–9). Exact extension matches always take priority. Register using the full pattern string (e.g. `08540xxx` as the SIP username). Useful for upbx-as-trunk-server setups where downstream PBX instances register as pattern extensions.
 
 ## Plugin events
 

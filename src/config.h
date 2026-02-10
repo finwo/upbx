@@ -44,9 +44,12 @@ typedef struct {
 struct upbx_config {
   int locality;       /* 0 = disabled */
   int daemonize;      /* 0 or 1 */
+  int cross_group_calls; /* 1 = allow ext-to-ext across groups (default), 0 = block */
   char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
   int rtp_port_low;   /* RTP relay port range (from rtp_ports low-high; default 10000-20000) */
   int rtp_port_high;
+  char **emergency;   /* Numbers that always route externally (e.g. "911") */
+  size_t emergency_count;
   config_plugin *plugins;
   size_t plugin_count;
 

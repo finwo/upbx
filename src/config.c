@@ -150,6 +150,15 @@ static int handler(void *user, const char *section, const char *name, const char
       }
       return 1;
     }
+    if (strcmp(key, "cross_group_calls") == 0) {
+      cfg->cross_group_calls = (atoi(val) != 0) ? 1 : 0;
+      return 1;
+    }
+    if (strcmp(key, "emergency") == 0) {
+      char **n = realloc(cfg->emergency, (cfg->emergency_count + 1) * sizeof(char *));
+      if (n) { cfg->emergency = n; cfg->emergency[cfg->emergency_count++] = STRDUP(val); }
+      return 1;
+    }
     log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec[0] ? sec : "(none)");
     return 1;
   }
@@ -272,10 +281,14 @@ void config_init(upbx_config *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   cfg->rtp_port_low = 10000;
   cfg->rtp_port_high = 20000;
+  cfg->cross_group_calls = 1;
 }
 
 void config_free(upbx_config *cfg) {
   free(cfg->listen);
+  for (size_t i = 0; i < cfg->emergency_count; i++)
+    free(cfg->emergency[i]);
+  free(cfg->emergency);
 
   for (size_t i = 0; i < cfg->plugin_count; i++) {
     free(cfg->plugins[i].name);

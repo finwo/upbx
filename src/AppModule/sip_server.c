@@ -91,30 +91,23 @@ static char *extension_part_from_username(const char *username) {
   return out;
 }
 
-/* Resolve trunk for extension: from @trunk in username, or by locality/group. */
-static config_trunk *resolve_trunk_for_extension(upbx_config *cfg,
-    const char *ext_number, const char *username) {
-  const char *at = strchr(username, '@');
-  if (at && at[1]) {
-    char *trunk_name = strdup(at + 1);
-    if (!trunk_name) return NULL;
-    config_trunk *t = get_trunk_config(cfg, trunk_name);
-    free(trunk_name);
-    return t;
+/* Resolve trunk for extension: by locality/group prefix, or first trunk when locality==0.
+ * Returns NULL when no trunks are configured (ext-to-ext only). */
+static config_trunk *resolve_trunk_for_extension(upbx_config *cfg, const char *ext_number) {
+  if (!cfg || cfg->trunk_count == 0)
+    return NULL;  /* no trunks → ext-to-ext only */
+  if (cfg->locality == 0)
+    return &cfg->trunks[0];  /* one big group: first trunk is representative */
+  /* locality > 0: match by group prefix */
+  size_t ext_len = ext_number ? strlen(ext_number) : 0;
+  for (size_t i = 0; i < cfg->trunk_count; i++) {
+    if (!cfg->trunks[i].group_prefix) continue;
+    size_t pre_len = strlen(cfg->trunks[i].group_prefix);
+    if (ext_len >= pre_len + (size_t)cfg->locality &&
+        strncmp(ext_number, cfg->trunks[i].group_prefix, pre_len) == 0)
+      return &cfg->trunks[i];
   }
-  if (cfg->locality > 0) {
-    size_t ext_len = strlen(ext_number);
-    if (ext_len > (size_t)cfg->locality) {
-      for (size_t i = 0; i < cfg->trunk_count; i++) {
-        if (!cfg->trunks[i].group_prefix) continue;
-        size_t pre_len = strlen(cfg->trunks[i].group_prefix);
-        if (ext_len >= pre_len + (size_t)cfg->locality &&
-            strncmp(ext_number, cfg->trunks[i].group_prefix, pre_len) == 0)
-          return &cfg->trunks[i];
-      }
-    }
-  }
-  return NULL;
+  return NULL;  /* no matching group */
 }
 
 /* Find trunk that has this DID. */
@@ -125,6 +118,113 @@ static config_trunk *find_trunk_by_did(upbx_config *cfg, const char *did) {
       if (strcmp(cfg->trunks[i].dids[j], did) == 0)
         return &cfg->trunks[i];
     }
+  }
+  return NULL;
+}
+
+/* Collect all trunks in the same locality group as 'member'. Returns count written to out[]. */
+static size_t get_group_trunks(upbx_config *cfg, config_trunk *member,
+    config_trunk **out, size_t max_out) {
+  if (!cfg || !member || !out || max_out == 0) return 0;
+  size_t n = 0;
+  if (cfg->locality == 0) {
+    /* One big group: return ALL trunks. */
+    for (size_t i = 0; i < cfg->trunk_count && n < max_out; i++)
+      out[n++] = &cfg->trunks[i];
+    return n;
+  }
+  /* locality > 0: match by group_prefix. */
+  if (!member->group_prefix || !member->group_prefix[0]) {
+    /* No prefix: trunk is alone in its group. */
+    out[0] = member;
+    return 1;
+  }
+  for (size_t i = 0; i < cfg->trunk_count && n < max_out; i++) {
+    if (cfg->trunks[i].group_prefix &&
+        strcmp(cfg->trunks[i].group_prefix, member->group_prefix) == 0)
+      out[n++] = &cfg->trunks[i];
+  }
+  return n;
+}
+
+/* Collect all registered extensions across a locality group.
+ * Allocates *out (caller frees). Returns extension count. */
+static size_t get_group_regs(upbx_config *cfg, config_trunk *member,
+    ext_reg_t ***out) {
+  *out = NULL;
+  config_trunk *group_trunks[64];
+  size_t n_trunks = get_group_trunks(cfg, member, group_trunks, 64);
+  if (n_trunks == 0) return 0;
+
+  ext_reg_t **merged = NULL;
+  size_t merged_n = 0;
+
+  for (size_t t = 0; t < n_trunks; t++) {
+    ext_reg_t **tregs = NULL;
+    size_t tn = registration_get_regs(group_trunks[t]->name, NULL, &tregs);
+    for (size_t i = 0; i < tn; i++) {
+      /* De-duplicate by extension number. */
+      int dup = 0;
+      for (size_t j = 0; j < merged_n; j++) {
+        if (merged[j]->number && tregs[i]->number &&
+            strcmp(merged[j]->number, tregs[i]->number) == 0) { dup = 1; break; }
+      }
+      if (!dup) {
+        ext_reg_t **tmp = realloc(merged, (merged_n + 1) * sizeof(ext_reg_t *));
+        if (tmp) { merged = tmp; merged[merged_n++] = tregs[i]; }
+      }
+    }
+    free(tregs);
+  }
+  /* When locality == 0 (one big group), also include trunk-less extensions. */
+  if (cfg->locality == 0) {
+    ext_reg_t **nregs = NULL;
+    size_t nn = registration_get_regs("", NULL, &nregs);
+    for (size_t i = 0; i < nn; i++) {
+      int dup = 0;
+      for (size_t j = 0; j < merged_n; j++) {
+        if (merged[j]->number && nregs[i]->number &&
+            strcmp(merged[j]->number, nregs[i]->number) == 0) { dup = 1; break; }
+      }
+      if (!dup) {
+        ext_reg_t **tmp = realloc(merged, (merged_n + 1) * sizeof(ext_reg_t *));
+        if (tmp) { merged = tmp; merged[merged_n++] = nregs[i]; }
+      }
+    }
+    free(nregs);
+  }
+  *out = merged;
+  return merged_n;
+}
+
+/* Check if a number is in the emergency list. */
+static int is_emergency_number(upbx_config *cfg, const char *number) {
+  if (!number || !number[0]) return 0;
+  for (size_t i = 0; i < cfg->emergency_count; i++)
+    if (strcmp(cfg->emergency[i], number) == 0) return 1;
+  return 0;
+}
+
+/* Pattern match: 'x'/'X' matches any digit. Returns 1 on match. */
+static int ext_pattern_match(const char *pattern, const char *number) {
+  for (; *pattern && *number; pattern++, number++) {
+    if (*pattern == 'x' || *pattern == 'X') {
+      if (*number < '0' || *number > '9') return 0;
+    } else if (*pattern != *number) {
+      return 0;
+    }
+  }
+  return (*pattern == '\0' && *number == '\0');
+}
+
+/* Pattern-aware extension config lookup: exact match first, then x-wildcard. */
+static config_extension *get_extension_config_match(upbx_config *cfg, const char *number) {
+  config_extension *exact = get_extension_config(cfg, number);
+  if (exact) return exact;
+  for (size_t i = 0; i < cfg->extension_count; i++) {
+    if (strchr(cfg->extensions[i].number, 'x') || strchr(cfg->extensions[i].number, 'X'))
+      if (ext_pattern_match(cfg->extensions[i].number, number))
+        return &cfg->extensions[i];
   }
   return NULL;
 }
@@ -571,25 +671,21 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
     return;
   }
-  config_trunk *trunk = resolve_trunk_for_extension(cfg, extension_num, user);
-  if (!trunk) {
-    free(raw_uri_user);
-    free(extension_num);
-    send_reply(ctx, req_buf, req_len, 404, 0, 0);
-    return;
-  }
+  config_trunk *trunk = resolve_trunk_for_extension(cfg, extension_num);
+  /* trunk may be NULL when no trunks are configured or no group matches — that's OK (ext-to-ext only). */
   /* Get Authorization from parser (single place; no string scraping). */
   const char *auth_val;
   size_t auth_len;
   int has_auth = sip_header_get(req_buf, req_len, "Authorization", &auth_val, &auth_len);
-  log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk->name, has_auth ? 1 : 0);
+  log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk ? trunk->name : "(none)", has_auth ? 1 : 0);
 
   /* Plugin EXTENSION.REGISTER: can DENY, ALLOW (with optional custom data), or CONTINUE (built-in auth). */
   int plugin_allow = -1;
   char *plugin_custom = NULL;
+  const char *trunk_name_str = trunk ? trunk->name : "";
   if (plugin_count() > 0) {
-    log_debug("REGISTER: querying plugins for ext %s on trunk %s", extension_num, trunk->name);
-    plugin_query_register(extension_num, trunk->name, user, &plugin_allow, &plugin_custom);
+    log_debug("REGISTER: querying plugins for ext %s on trunk %s", extension_num, trunk_name_str);
+    plugin_query_register(extension_num, trunk_name_str, user, &plugin_allow, &plugin_custom);
   }
   if (plugin_allow == 0) {
     log_info("REGISTER: plugin denied registration for extension %s", extension_num);
@@ -652,9 +748,12 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
 
   /* Store registration (transfers ownership of extension_num, raw_uri_user, contact_val, plugin_custom). */
   log_trace("REGISTER: auth OK, extension=%s", extension_num);
-  log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk->name);
+  if (trunk)
+    log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk->name);
+  else
+    log_info("REGISTER: extension %s registered (no trunk)", extension_num);
   char *contact_val = get_contact_value(req_buf, req_len);
-  registration_update(extension_num, raw_uri_user, trunk->name, contact_val, h, p[0] ? p : "5060", plugin_custom);
+  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", plugin_custom);
   raw_uri_user = NULL;  /* ownership transferred */
   send_reply(ctx, req_buf, req_len, 200, 1, 0);
   free(raw_uri_user);  /* no-op if transferred to reg */
@@ -1111,7 +1210,7 @@ static void handle_invite_incoming(upbx_config *cfg, const char *buf, size_t len
       if (n_ext == 0) { free(exts); exts = NULL; }
     }
   } else
-    n_ext = registration_get_regs(trunk->name, NULL, &exts);
+    n_ext = get_group_regs(cfg, trunk, &exts);
   if (n_ext == 0 || !exts) {
     free(exts);
     send_reply(ctx, buf, len, 480, 0, 0);
@@ -1121,7 +1220,7 @@ static void handle_invite_incoming(upbx_config *cfg, const char *buf, size_t len
   free(exts);
 }
 
-/* Outgoing INVITE: from registered extension → forward to that extension's trunk. Trunk rewrite rules are always applied when configured. */
+/* Outgoing INVITE: from registered extension → forward to extension's trunk group (with fallback and CID). */
 static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len, sip_send_ctx *ctx, const char *from_user) {
   log_trace("handle_invite_outgoing: from=%s", from_user ? from_user : "");
   const char *at = strchr(from_user, '@');
@@ -1142,11 +1241,38 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
     send_reply(ctx, buf, len, 404, 0, 0);
     return;
   }
-  config_trunk *trunk = get_trunk_config(cfg, reg->trunk_name);
+  /* Find primary trunk from registration. */
+  config_trunk *primary_trunk = (reg->trunk_name && reg->trunk_name[0]) ?
+    get_trunk_config(cfg, reg->trunk_name) : NULL;
+  if (!primary_trunk) {
+    /* Trunk-less extension trying to call externally → no trunk available. */
+    log_info("INVITE outgoing: ext %s has no trunk, rejecting external call", from_user);
+    send_reply(ctx, buf, len, 503, 0, 0);
+    return;
+  }
+
+  /* Select trunk from group: prefer first available, fallback to first in group. */
+  config_trunk *group_trunks[64];
+  size_t n_group = get_group_trunks(cfg, primary_trunk, group_trunks, 64);
+  config_trunk *trunk = NULL;
+  for (size_t i = 0; i < n_group; i++) {
+    if (group_trunks[i]->host && group_trunks[i]->host[0] &&
+        trunk_reg_is_available(group_trunks[i]->name)) {
+      trunk = group_trunks[i];
+      break;
+    }
+  }
+  if (!trunk) {
+    /* No available trunk: graceful degradation to first in group with a host. */
+    for (size_t i = 0; i < n_group; i++) {
+      if (group_trunks[i]->host && group_trunks[i]->host[0]) { trunk = group_trunks[i]; break; }
+    }
+  }
   if (!trunk || !trunk->host) {
     send_reply(ctx, buf, len, 503, 0, 0);
     return;
   }
+  log_debug("outgoing: selected trunk %s for ext %s (group %zu trunk(s))", trunk->name, from_user, n_group);
 
   /* Start with possibly rewritten INVITE (trunk number patterns). */
   const char *send_buf = buf;
@@ -1222,7 +1348,7 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
       call->rtp_remote_a.sin_port   = htons((uint16_t)sdp_media[0].port);
     }
 
-    /* Rewrite INVITE: prepend Via + rewrite SDP. */
+    /* Rewrite INVITE: prepend Via + rewrite SDP + apply trunk CID. */
     char via_host[256], via_port_s[32];
     if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port_s, sizeof(via_port_s)) == 0) {
       char via_val[256];
@@ -1238,6 +1364,22 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
       }
       char t1[SIP_READ_BUF_SIZE], t2[SIP_READ_BUF_SIZE];
       int cur_len = sip_prepend_via(send_buf, send_len, via_val, t1, sizeof(t1));
+
+      /* Apply trunk CID to From header if configured. */
+      if (cur_len > 0 && ((trunk->cid && trunk->cid[0]) || (trunk->cid_name && trunk->cid_name[0]))) {
+        const char *cid_num = (trunk->cid && trunk->cid[0]) ? trunk->cid : from_user;
+        const char *cid_display = (trunk->cid_name && trunk->cid_name[0]) ? trunk->cid_name : NULL;
+        char from_val[384];
+        sip_format_from_to_value(cid_display, cid_num, via_host, via_port_s, from_val, sizeof(from_val));
+        /* Preserve original From tag. */
+        char tag_buf[64];
+        tag_buf[0] = '\0';
+        if (sip_header_get_param(t1, (size_t)cur_len, "From", "tag", tag_buf, sizeof(tag_buf)) && tag_buf[0])
+          sip_append_tag_param(from_val, sizeof(from_val), tag_buf);
+        int rw_len = sip_rewrite_header(t1, (size_t)cur_len, "From", from_val, t2, sizeof(t2));
+        if (rw_len > 0) { memcpy(t1, t2, (size_t)rw_len); cur_len = rw_len; }
+      }
+
       if (cur_len > 0 && call->rtp_port_b > 0 && sdp_n > 0) {
         const char *sb;
         size_t sbl;
@@ -1320,10 +1462,55 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       return;
     }
 
-    /* 1a. Extension-to-extension (same or any trunk): callee is a known extension. */
-    if (to_ext[0] && get_extension_config(cfg, to_ext) && strcmp(ext_num, to_ext) != 0) {
+    /* 1-pre. Emergency number bypass: skip short-dialing and ext-to-ext, route externally. */
+    if (is_emergency_number(cfg, to_ext)) {
+      log_info("new call: ext %s -> emergency %s (bypass)", ext_num, to_ext);
+      free(ext_num);
+      handle_invite_outgoing(cfg, buf, len, ctx, from_user);
+      return;
+    }
+
+    /* 1-pre2. Short-dialing expansion: when locality > 0 and dialed number has exactly 'locality' digits,
+     * prepend caller's group prefix to form a full number. */
+    char expanded_to_ext[128];
+    expanded_to_ext[0] = '\0';
+    if (cfg->locality > 0 && to_ext[0] && (int)strlen(to_ext) == cfg->locality) {
+      config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
+      if (caller_trunk && caller_trunk->group_prefix && caller_trunk->group_prefix[0]) {
+        snprintf(expanded_to_ext, sizeof(expanded_to_ext), "%s%s", caller_trunk->group_prefix, to_ext);
+        if (get_extension_config_match(cfg, expanded_to_ext)) {
+          log_debug("short-dial: %s expanded to %s (prefix %s)", to_ext, expanded_to_ext, caller_trunk->group_prefix);
+          to_ext = expanded_to_ext;
+        } else {
+          expanded_to_ext[0] = '\0'; /* expansion didn't match, revert */
+        }
+      }
+    }
+
+    /* 1a. Extension-to-extension: callee is a known extension (exact or pattern). */
+    config_extension *callee_ext = (to_ext[0] && strcmp(ext_num, to_ext) != 0) ? get_extension_config_match(cfg, to_ext) : NULL;
+    if (callee_ext) {
+      /* Cross-group call blocking: when locality > 0 and cross_group_calls == 0, block if different groups. */
+      if (cfg->locality > 0 && !cfg->cross_group_calls) {
+        config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
+        config_trunk *callee_trunk = resolve_trunk_for_extension(cfg, callee_ext->number);
+        const char *caller_prefix = caller_trunk ? caller_trunk->group_prefix : NULL;
+        const char *callee_prefix = callee_trunk ? callee_trunk->group_prefix : NULL;
+        int same_group = 0;
+        if (!caller_prefix && !callee_prefix) same_group = 1; /* both trunk-less */
+        else if (caller_prefix && callee_prefix && strcmp(caller_prefix, callee_prefix) == 0) same_group = 1;
+        if (!same_group) {
+          log_info("INVITE: cross-group ext-to-ext blocked %s -> %s", ext_num, to_ext);
+          free(ext_num);
+          send_reply(ctx, buf, len, 403, 0, 0);
+          return;
+        }
+      }
+
+      /* Look up registrations: for pattern matches, use the pattern string as the registered number. */
+      const char *reg_lookup = callee_ext->number;
       ext_reg_t **exts = NULL;
-      size_t n_ext = registration_get_regs(NULL, to_ext, &exts);
+      size_t n_ext = registration_get_regs(NULL, reg_lookup, &exts);
       if (n_ext > 0 && exts) {
         log_info("new call: ext %s -> ext %s (ext-to-ext, %zu reg(s))", ext_num, to_ext, n_ext);
         fork_invite_to_extension_regs(cfg, buf, len, ctx, exts, n_ext, NULL, ext_num, "dialin");
@@ -1332,14 +1519,11 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         return;
       }
       /* RFC 3261: callee not registered → 480 Temporarily Unavailable so caller gets clear failure */
-      if (n_ext == 0) {
-        log_debug("INVITE %s->%s: no registration for callee, sending 480", ext_num, to_ext);
-        send_reply(ctx, buf, len, 480, 0, 0);
-        free(exts);
-        free(ext_num);
-        return;
-      }
+      log_debug("INVITE %s->%s: no registration for callee, sending 480", ext_num, to_ext);
+      send_reply(ctx, buf, len, 480, 0, 0);
       free(exts);
+      free(ext_num);
+      return;
     }
 
     /* 1b. CALL.DIALOUT plugin event — always fires for outgoing calls from extensions. */
@@ -1388,7 +1572,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     config_trunk *did_trunk = to_user[0] ? find_trunk_by_did(cfg, to_user) : NULL;
     if (did_trunk) {
       ext_reg_t **exts = NULL;
-      size_t n_ext = registration_get_regs(did_trunk->name, NULL, &exts);
+      size_t n_ext = get_group_regs(cfg, did_trunk, &exts);
 
       /* Fire CALL.DIALIN for the recipient trunk. */
       log_info("new call: ext %s -> DID %s (trunk %s, %zu target(s))", ext_num, to_user, did_trunk->name, n_ext);
@@ -1447,7 +1631,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   if (to_user[0] && find_trunk_by_did(cfg, to_user)) {
     config_trunk *trunk = find_trunk_by_did(cfg, to_user);
     ext_reg_t **exts = NULL;
-    size_t n_ext = registration_get_regs(trunk->name, NULL, &exts);
+    size_t n_ext = get_group_regs(cfg, trunk, &exts);
     log_info("new call: incoming from %s to DID %s (trunk %s, %zu target(s))", from_user[0] ? from_user : "(external)", to_user, trunk->name, n_ext);
     if (plugin_count() > 0 && n_ext > 0 && exts) {
       const char **ext_numbers = (const char **)malloc(n_ext * sizeof(const char *));

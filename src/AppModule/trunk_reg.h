@@ -22,4 +22,7 @@ void trunk_reg_poll(fd_set *read_set);
 /* Protothread: decides when to start registration for each trunk. Schedule from main loop. */
 char trunk_reg_pt(struct pt *pt, struct upbx_config *cfg);
 
+/* Check whether a trunk's upstream registration is currently active (2xx received). */
+int trunk_reg_is_available(const char *trunk_name);
+
 #endif
