@@ -124,7 +124,61 @@ void plugmod_resp_free(plugmod_resp_object *o) {
   resp_free_internal(o);
 }
 
-static int resp_encode_array(int argc, const char **argv, char **out_buf, size_t *out_len) {
+/* Append one RESP-encoded object to buf; realloc as needed. *buf may change. Returns 0 on success. */
+static int resp_append_object(char **buf, size_t *cap, size_t *len, const plugmod_resp_object *o) {
+  if (!o) return -1;
+  size_t need = *len + 256;
+  if (o->type == PLUGMOD_RESPT_BULK || o->type == PLUGMOD_RESPT_SIMPLE || o->type == PLUGMOD_RESPT_ERROR) {
+    size_t slen = o->u.s ? strlen(o->u.s) : 0;
+    need = *len + 32 + slen + 2;
+  } else if (o->type == PLUGMOD_RESPT_ARRAY) {
+    need = *len + 32;
+    for (size_t i = 0; i < o->u.arr.n; i++)
+      need += 64; /* rough; will grow in recurse */
+  }
+  if (need > *cap) {
+    size_t newcap = need + 4096;
+    char *n = realloc(*buf, newcap);
+    if (!n) return -1;
+    *buf = n;
+    *cap = newcap;
+  }
+  switch (o->type) {
+    case PLUGMOD_RESPT_SIMPLE: {
+      const char *s = o->u.s ? o->u.s : "";
+      *len += (size_t)snprintf(*buf + *len, *cap - *len, "+%s\r\n", s);
+      break;
+    }
+    case PLUGMOD_RESPT_ERROR: {
+      const char *s = o->u.s ? o->u.s : "";
+      *len += (size_t)snprintf(*buf + *len, *cap - *len, "-%s\r\n", s);
+      break;
+    }
+    case PLUGMOD_RESPT_INT:
+      *len += (size_t)snprintf(*buf + *len, *cap - *len, ":%lld\r\n", (long long)o->u.i);
+      break;
+    case PLUGMOD_RESPT_BULK: {
+      const char *s = o->u.s ? o->u.s : "";
+      size_t slen = strlen(s);
+      *len += (size_t)snprintf(*buf + *len, *cap - *len, "$%zu\r\n%s\r\n", slen, s);
+      break;
+    }
+    case PLUGMOD_RESPT_ARRAY: {
+      size_t n = o->u.arr.n;
+      *len += (size_t)snprintf(*buf + *len, *cap - *len, "*%zu\r\n", n);
+      for (size_t i = 0; i < n; i++) {
+        if (resp_append_object(buf, cap, len, &o->u.arr.elem[i]) != 0)
+          return -1;
+      }
+      break;
+    }
+    default:
+      return -1;
+  }
+  return 0;
+}
+
+static int resp_encode_array_objects(int argc, const plugmod_resp_object *const *argv, char **out_buf, size_t *out_len) {
   size_t cap = 64;
   size_t len = 0;
   char *buf = malloc(cap);
@@ -132,15 +186,34 @@ static int resp_encode_array(int argc, const char **argv, char **out_buf, size_t
   len += (size_t)snprintf(buf + len, cap - len, "*%d\r\n", argc);
   if (len >= cap) { free(buf); return -1; }
   for (int i = 0; i < argc; i++) {
-    size_t slen = strlen(argv[i]);
-    size_t need = len + 32 + slen + 2;
-    if (need > cap) {
-      cap = need + 4096;
-      char *n = realloc(buf, cap);
-      if (!n) { free(buf); return -1; }
-      buf = n;
+    if (resp_append_object(&buf, &cap, &len, argv[i]) != 0) {
+      free(buf);
+      return -1;
     }
-    len += (size_t)snprintf(buf + len, cap - len, "$%zu\r\n%s\r\n", slen, argv[i]);
+  }
+  *out_buf = buf;
+  *out_len = len;
+  return 0;
+}
+
+static int resp_encode_request(const char *method, int argc, const plugmod_resp_object *const *argv,
+  char **out_buf, size_t *out_len) {
+  plugmod_resp_object method_obj = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)method } };
+  size_t cap = 128;
+  size_t len = 0;
+  char *buf = malloc(cap);
+  if (!buf) return -1;
+  len += (size_t)snprintf(buf + len, cap - len, "*%d\r\n", argc + 1);
+  if (len >= cap) { free(buf); return -1; }
+  if (resp_append_object(&buf, &cap, &len, &method_obj) != 0) {
+    free(buf);
+    return -1;
+  }
+  for (int i = 0; i < argc; i++) {
+    if (resp_append_object(&buf, &cap, &len, argv[i]) != 0) {
+      free(buf);
+      return -1;
+    }
   }
   *out_buf = buf;
   *out_len = len;
@@ -224,10 +297,11 @@ static int spawn_plugin(const char *name, const char *exec_path, plugin_state_t 
 
 static int do_discovery(plugin_state_t *p) {
   if (!discovery_cmd_used) return 0;
-  const char *argv[1] = { discovery_cmd_used };
+  plugmod_resp_object disc_obj = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)discovery_cmd_used } };
+  const plugmod_resp_object *av[] = { &disc_obj };
   char *req = NULL;
   size_t req_len;
-  if (resp_encode_array(1, argv, &req, &req_len) != 0) return -1;
+  if (resp_encode_array_objects(1, av, &req, &req_len) != 0) return -1;
   ssize_t n = write(p->fd_write, req, req_len);
   free(req);
   if (n != (ssize_t)req_len) return -1;
@@ -305,21 +379,14 @@ void plugmod_stop(void) {
   plugin_cap = 0;
 }
 
-int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const char **argv,
+int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv,
   plugmod_resp_object **out) {
   plugin_state_t *p = find_plugin(plugin_name);
   if (!p || !out) return -1;
   *out = NULL;
-  char **all = malloc((size_t)(argc + 1) * sizeof(char *));
-  if (!all) return -1;
-  all[0] = (char *)method;
-  for (int i = 0; i < argc; i++)
-    all[i + 1] = (char *)argv[i];
   char *buf = NULL;
   size_t len = 0;
-  int ret = resp_encode_array(argc + 1, (const char **)all, &buf, &len);
-  free(all);
-  if (ret != 0) return -1;
+  if (resp_encode_request(method, argc, argv, &buf, &len) != 0) return -1;
   if (write(p->fd_write, buf, len) != (ssize_t)len) {
     free(buf);
     return -1;
@@ -329,7 +396,7 @@ int plugmod_invoke_response(const char *plugin_name, const char *method, int arg
   return (*out) ? 0 : -1;
 }
 
-int plugmod_invoke(const char *plugin_name, const char *method, int argc, const char **argv) {
+int plugmod_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv) {
   log_debug("plugin call: %s -> %s (%d args)", plugin_name, method, argc);
   plugmod_resp_object *r = NULL;
   int ret = plugmod_invoke_response(plugin_name, method, argc, argv, &r);
@@ -346,7 +413,7 @@ int plugmod_has_event(const char *plugin_name, const char *event_name) {
   return 0;
 }
 
-void plugmod_notify_event(const char *event_name, int argc, const char **argv) {
+void plugmod_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv) {
   log_debug("plugin event %s (%d args)", event_name, argc);
   for (size_t i = 0; i < plugin_n; i++) {
     if (!plugmod_has_event(plugins[i].name, event_name)) continue;

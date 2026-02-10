@@ -38,7 +38,7 @@ void plugin_stop(void) {
   plugmod_stop();
 }
 
-int plugin_invoke(const char *plugin_name, const char *method, int argc, const char **argv) {
+int plugin_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv) {
   return plugmod_invoke(plugin_name, method, argc, argv);
 }
 
@@ -46,7 +46,7 @@ int plugin_has_event(const char *plugin_name, const char *event_name) {
   return plugmod_has_event(plugin_name, event_name);
 }
 
-void plugin_notify_event(const char *event_name, int argc, const char **argv) {
+void plugin_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv) {
   plugmod_notify_event(event_name, argc, argv);
 }
 
@@ -74,7 +74,10 @@ void plugin_query_register(const char *extension_num, const char *trunk_name, co
   int *out_allow, char **out_custom) {
   *out_allow = -1; /* CONTINUE */
   *out_custom = NULL;
-  const char *argv[] = { extension_num, trunk_name, from_user ? from_user : "" };
+  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(extension_num ? extension_num : "") } };
+  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(trunk_name ? trunk_name : "") } };
+  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(from_user ? from_user : "") } };
+  const plugmod_resp_object *argv[] = { &a0, &a1, &a2 };
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
     if (!plugmod_has_event(name, "EXTENSION.REGISTER")) continue;
@@ -106,7 +109,11 @@ void plugin_query_dialout(const char *source_ext, const char *source_trunk, cons
   *out_action = 0; /* no-edit */
   *out_reject_code = 403;
   *out_target_override = NULL;
-  const char *argv[] = { source_ext ? source_ext : "", source_trunk ? source_trunk : "", destination ? destination : "", call_id ? call_id : "" };
+  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source_ext ? source_ext : "") } };
+  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source_trunk ? source_trunk : "") } };
+  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(destination ? destination : "") } };
+  const plugmod_resp_object a3 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(call_id ? call_id : "") } };
+  const plugmod_resp_object *argv[] = { &a0, &a1, &a2, &a3 };
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
     if (!plugmod_has_event(name, "CALL.DIALOUT")) continue;
@@ -142,18 +149,27 @@ void plugin_query_dialin(const char *trunk_name, const char *did, const char **t
   *out_n = 0;
   /* Build argv: trunk, did, ext1, ext2, ..., call_id */
   size_t argc = 3 + n_targets; /* trunk, did, [exts], call_id */
-  char **argv = (char **)malloc((argc + 1) * sizeof(char *));
-  if (!argv) return;
-  argv[0] = (char *)(trunk_name ? trunk_name : "");
-  argv[1] = (char *)(did ? did : "");
-  for (size_t k = 0; k < n_targets; k++)
-    argv[2 + k] = (char *)(target_extensions[k] ? target_extensions[k] : "");
-  argv[2 + n_targets] = (char *)(call_id ? call_id : "");
+  plugmod_resp_object *objs = (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object));
+  if (!objs) return;
+  plugmod_resp_object **ptrs = (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *));
+  if (!ptrs) { free(objs); return; }
+  objs[0].type = PLUGMOD_RESPT_BULK;
+  objs[0].u.s = (char *)(trunk_name ? trunk_name : "");
+  objs[1].type = PLUGMOD_RESPT_BULK;
+  objs[1].u.s = (char *)(did ? did : "");
+  for (size_t k = 0; k < n_targets; k++) {
+    objs[2 + k].type = PLUGMOD_RESPT_BULK;
+    objs[2 + k].u.s = (char *)(target_extensions[k] ? target_extensions[k] : "");
+  }
+  objs[2 + n_targets].type = PLUGMOD_RESPT_BULK;
+  objs[2 + n_targets].u.s = (char *)(call_id ? call_id : "");
+  for (size_t i = 0; i < argc; i++)
+    ptrs[i] = &objs[i];
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
     if (!plugmod_has_event(name, "CALL.DIALIN")) continue;
     plugmod_resp_object *r = NULL;
-    if (plugmod_invoke_response(name, "CALL.DIALIN", (int)argc, (const char **)argv, &r) != 0 || !r)
+    if (plugmod_invoke_response(name, "CALL.DIALIN", (int)argc, (const plugmod_resp_object *const *)ptrs, &r) != 0 || !r)
       continue;
     const char *first = resp_first_string(r);
     if (!first) { plugmod_resp_free(r); continue; }
@@ -163,7 +179,8 @@ void plugin_query_dialin(const char *trunk_name, const char *did, const char **t
       if (code_str) *out_reject_code = atoi(code_str);
       if (*out_reject_code < 100 || *out_reject_code > 699) *out_reject_code = 403;
       plugmod_resp_free(r);
-      free(argv);
+      free(ptrs);
+      free(objs);
       return;
     }
     if (strcasecmp(first, "ALTER") == 0 && r->type == PLUGMOD_RESPT_ARRAY && r->u.arr.n > 1) {
@@ -180,12 +197,14 @@ void plugin_query_dialin(const char *trunk_name, const char *did, const char **t
         *out_action = 2;
       }
       plugmod_resp_free(r);
-      free(argv);
+      free(ptrs);
+      free(objs);
       return;
     }
     plugmod_resp_free(r);
   }
-  free(argv);
+  free(ptrs);
+  free(objs);
 }
 
 size_t plugin_count(void) {

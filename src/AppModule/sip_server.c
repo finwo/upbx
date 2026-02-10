@@ -302,7 +302,6 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
 static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   if (plugin_count() == 0) return;
   size_t i, j;
-  const char **argv;
   size_t argc;
 
   /* EXTENSION.LIST: 3 args per extension (number, name, trunk); no secret */
@@ -311,23 +310,32 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   }
   if (i < plugin_count()) {
     argc = 3 * cfg->extension_count;
-    argv = argc ? (const char **)malloc(argc * sizeof(const char *)) : NULL;
-    if (argv) {
+    plugmod_resp_object *objs = argc ? (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object)) : NULL;
+    plugmod_resp_object **ptrs = argc ? (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *)) : NULL;
+    if (objs && ptrs) {
       char **trunk_copies = (char **)calloc(cfg->extension_count, sizeof(char *));
       if (trunk_copies) {
         for (i = 0; i < cfg->extension_count; i++) {
           config_extension *e = &cfg->extensions[i];
-          argv[i * 3 + 0] = e->number ? e->number : "";
-          argv[i * 3 + 1] = e->name ? e->name : "";
+          const char *s0 = e->number ? e->number : "";
+          const char *s1 = e->name ? e->name : "";
           trunk_copies[i] = strdup(registration_get_trunk_for_ext(e->number));
-          argv[i * 3 + 2] = trunk_copies[i] ? trunk_copies[i] : "";
+          const char *s2 = trunk_copies[i] ? trunk_copies[i] : "";
+          objs[i * 3 + 0].type = PLUGMOD_RESPT_BULK;
+          objs[i * 3 + 0].u.s = (char *)s0;
+          objs[i * 3 + 1].type = PLUGMOD_RESPT_BULK;
+          objs[i * 3 + 1].u.s = (char *)s1;
+          objs[i * 3 + 2].type = PLUGMOD_RESPT_BULK;
+          objs[i * 3 + 2].u.s = (char *)s2;
         }
-        plugin_notify_event("EXTENSION.LIST", (int)argc, argv);
+        for (i = 0; i < argc; i++) ptrs[i] = &objs[i];
+        plugin_notify_event("EXTENSION.LIST", (int)argc, (const plugmod_resp_object *const *)ptrs);
         for (i = 0; i < cfg->extension_count; i++) free(trunk_copies[i]);
         free(trunk_copies);
       }
-      free(argv);
     }
+    free(ptrs);
+    free(objs);
   }
 
   /* TRUNK.LIST: 5 args per trunk (name, group_prefix, dids, cid, extensions); no credentials */
@@ -336,15 +344,18 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   }
   if (i < plugin_count()) {
     argc = 5 * cfg->trunk_count;
-    argv = argc ? (const char **)malloc(argc * sizeof(const char *)) : NULL;
-    if (argv) {
+    plugmod_resp_object *objs = argc ? (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object)) : NULL;
+    plugmod_resp_object **ptrs = argc ? (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *)) : NULL;
+    if (objs && ptrs) {
       char **dids_strs = (char **)calloc(cfg->trunk_count, sizeof(char *));
       char **exts_strs = (char **)calloc(cfg->trunk_count, sizeof(char *));
       if (dids_strs && exts_strs) {
         for (i = 0; i < cfg->trunk_count; i++) {
           config_trunk *t = &cfg->trunks[i];
-          argv[i * 5 + 0] = t->name ? t->name : "";
-          argv[i * 5 + 1] = t->group_prefix ? t->group_prefix : "";
+          objs[i * 5 + 0].type = PLUGMOD_RESPT_BULK;
+          objs[i * 5 + 0].u.s = (char *)(t->name ? t->name : "");
+          objs[i * 5 + 1].type = PLUGMOD_RESPT_BULK;
+          objs[i * 5 + 1].u.s = (char *)(t->group_prefix ? t->group_prefix : "");
           if (t->did_count > 0) {
             size_t need = 1;
             for (j = 0; j < t->did_count; j++)
@@ -356,12 +367,18 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
                 if (j) strcat(dids_strs[i], ",");
                 if (t->dids[j]) strcat(dids_strs[i], t->dids[j]);
               }
-              argv[i * 5 + 2] = dids_strs[i];
-            } else
-              argv[i * 5 + 2] = "";
-          } else
-            argv[i * 5 + 2] = "";
-          argv[i * 5 + 3] = t->cid ? t->cid : "";
+              objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
+              objs[i * 5 + 2].u.s = dids_strs[i];
+            } else {
+              objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
+              objs[i * 5 + 2].u.s = (char *)"";
+            }
+          } else {
+            objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
+            objs[i * 5 + 2].u.s = (char *)"";
+          }
+          objs[i * 5 + 3].type = PLUGMOD_RESPT_BULK;
+          objs[i * 5 + 3].u.s = (char *)(t->cid ? t->cid : "");
           exts_strs[i] = malloc(512);
           if (exts_strs[i]) {
             ext_reg_t **tregs = NULL;
@@ -372,11 +389,15 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
               if (tregs[j]->number) strcat(exts_strs[i], tregs[j]->number);
             }
             free(tregs);
-            argv[i * 5 + 4] = exts_strs[i];
-          } else
-            argv[i * 5 + 4] = "";
+            objs[i * 5 + 4].type = PLUGMOD_RESPT_BULK;
+            objs[i * 5 + 4].u.s = exts_strs[i];
+          } else {
+            objs[i * 5 + 4].type = PLUGMOD_RESPT_BULK;
+            objs[i * 5 + 4].u.s = (char *)"";
+          }
         }
-        plugin_notify_event("TRUNK.LIST", (int)argc, argv);
+        for (i = 0; i < argc; i++) ptrs[i] = &objs[i];
+        plugin_notify_event("TRUNK.LIST", (int)argc, (const plugmod_resp_object *const *)ptrs);
         for (i = 0; i < cfg->trunk_count; i++) {
           free(dids_strs[i]);
           free(exts_strs[i]);
@@ -384,8 +405,9 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
       }
       free(dids_strs);
       free(exts_strs);
-      free(argv);
     }
+    free(ptrs);
+    free(objs);
   }
 }
 
@@ -417,7 +439,11 @@ static void notify_call_answer(const char *direction, const char *call_id, const
   }
   if (i >= plugin_count()) return;
   log_debug("CALL.ANSWER: notifying plugins, call=%.32s %s -> %s (%s)", call_id ? call_id : "", source ? source : "", destination ? destination : "", direction ? direction : "");
-  const char *argv[] = { direction ? direction : "", call_id ? call_id : "", source ? source : "", destination ? destination : "" };
+  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(direction ? direction : "") } };
+  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(call_id ? call_id : "") } };
+  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source ? source : "") } };
+  const plugmod_resp_object a3 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(destination ? destination : "") } };
+  const plugmod_resp_object *argv[] = { &a0, &a1, &a2, &a3 };
   plugin_notify_event("CALL.ANSWER", 4, argv);
 }
 
@@ -432,7 +458,11 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
   log_debug("CALL.HANGUP: notifying plugins, call=%.32s %s -> %s (%ds)", call_id ? call_id : "", source ? source : "", destination ? destination : "", duration_sec);
   char dur_buf[32];
   snprintf(dur_buf, sizeof(dur_buf), "%d", duration_sec);
-  const char *argv[] = { call_id ? call_id : "", source ? source : "", destination ? destination : "", dur_buf };
+  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(call_id ? call_id : "") } };
+  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source ? source : "") } };
+  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(destination ? destination : "") } };
+  const plugmod_resp_object a3 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = dur_buf } };
+  const plugmod_resp_object *argv[] = { &a0, &a1, &a2, &a3 };
   plugin_notify_event("CALL.HANGUP", 4, argv);
 }
 
@@ -1595,10 +1625,8 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         override_buf = build_invite_with_uri(buf, len, target_override, req_host, req_port);
         if (override_buf) { cur_buf = override_buf; cur_len = strlen(override_buf); }
       }
-      free(target_override);
-    } else {
-      free(target_override);
     }
+    free(target_override);
 
     /* 1d. Destination matches a DID → CALL.DIALIN fires too, then route internally.
      * This covers extensions on different trunks calling each other via DID:

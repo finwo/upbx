@@ -41,15 +41,15 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
 void plugmod_stop(void);
 
 /* Invoke method; response is consumed and discarded. Returns 0 on success. */
-int plugmod_invoke(const char *plugin_name, const char *method, int argc, const char **argv);
+int plugmod_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv);
 
 /* Invoke and return decoded response. Caller must plugmod_resp_free(*out). Returns 0 on success. */
-int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const char **argv,
+int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv,
   plugmod_resp_object **out);
 
 int plugmod_has_event(const char *plugin_name, const char *event_name);
 
-void plugmod_notify_event(const char *event_name, int argc, const char **argv);
+void plugmod_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv);
 
 size_t plugmod_count(void);
 const char *plugmod_name_at(size_t i);
