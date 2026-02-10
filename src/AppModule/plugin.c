@@ -11,10 +11,10 @@
 #include "AppModule/plugin.h"
 #include "PluginModule/plugin.h"
 
-static const char *event_prefixes[] = { "EXTENSION.", "TRUNK.", "CALL." };
+static const char *event_prefixes[] = { "extension.", "trunk.", "call." };
 #define N_EVENT_PREFIXES (sizeof(event_prefixes) / sizeof(event_prefixes[0]))
 
-/* Start all plugins from config; uses COMMAND for discovery and EXTENSION./TRUNK./CALL. events. */
+/* Start all plugins from config; uses COMMAND for discovery and extension./trunk./call. events. */
 void plugin_start(upbx_config *cfg) {
   log_trace("plugin_start: entry");
   if (!cfg) return;
@@ -29,7 +29,7 @@ void plugin_start(upbx_config *cfg) {
     configs[n].exec = cfg->plugins[i].exec;
     n++;
   }
-  plugmod_start(configs, n, "COMMAND", event_prefixes, N_EVENT_PREFIXES);
+  plugmod_start(configs, n, "command", event_prefixes, N_EVENT_PREFIXES);
   log_info("plugins started (%zu loaded)", plugmod_count());
   free(configs);
 }
@@ -50,55 +50,56 @@ void plugin_notify_event(const char *event_name, int argc, const plugmod_resp_ob
   plugmod_notify_event(event_name, argc, argv);
 }
 
-static const char *resp_first_string(plugmod_resp_object *o) {
-  if (!o) return NULL;
-  if (o->type == PLUGMOD_RESPT_SIMPLE || o->type == PLUGMOD_RESPT_ERROR || o->type == PLUGMOD_RESPT_BULK)
-    return o->u.s;
-  if (o->type == PLUGMOD_RESPT_ARRAY && o->u.arr.n > 0) {
-    plugmod_resp_object *e = &o->u.arr.elem[0];
-    if (e->type == PLUGMOD_RESPT_SIMPLE || e->type == PLUGMOD_RESPT_BULK)
-      return e->u.s;
+/* Build request map for extension.register: extension, trunk, from_user. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_register_request_map(const char *extension_num, const char *trunk_name, const char *from_user) {
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 6;
+  map->u.arr.elem = calloc(6, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  plugmod_resp_object *e = map->u.arr.elem;
+  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("extension");
+  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(extension_num ? extension_num : "");
+  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("trunk");
+  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(trunk_name ? trunk_name : "");
+  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("from_user");
+  e[5].type = PLUGMOD_RESPT_BULK; e[5].u.s = strdup(from_user ? from_user : "");
+  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[5].u.s) {
+    plugmod_resp_free(map);
+    return NULL;
   }
-  return NULL;
-}
-
-static const char *resp_second_string(plugmod_resp_object *o) {
-  if (!o || o->type != PLUGMOD_RESPT_ARRAY || o->u.arr.n < 2) return NULL;
-  plugmod_resp_object *e = &o->u.arr.elem[1];
-  if (e->type == PLUGMOD_RESPT_SIMPLE || e->type == PLUGMOD_RESPT_BULK)
-    return e->u.s;
-  return NULL;
+  return map;
 }
 
 void plugin_query_register(const char *extension_num, const char *trunk_name, const char *from_user,
-  int *out_allow, char **out_custom) {
-  *out_allow = -1; /* CONTINUE */
-  *out_custom = NULL;
-  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(extension_num ? extension_num : "") } };
-  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(trunk_name ? trunk_name : "") } };
-  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(from_user ? from_user : "") } };
-  const plugmod_resp_object *argv[] = { &a0, &a1, &a2 };
+  int *out_allow) {
+  *out_allow = -1; /* continue */
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "EXTENSION.REGISTER")) continue;
+    if (!plugmod_has_event(name, "extension.register")) continue;
+    plugmod_resp_object *request_map = build_register_request_map(extension_num, trunk_name, from_user);
+    if (!request_map) continue;
     plugmod_resp_object *r = NULL;
-    if (plugmod_invoke_response(name, "EXTENSION.REGISTER", 3, argv, &r) != 0 || !r)
+    if (plugmod_invoke_response(name, "extension.register", 1, (const plugmod_resp_object *const *)&request_map, &r) != 0 || !r) {
+      plugmod_resp_free(request_map);
       continue;
-    const char *first = resp_first_string(r);
-    if (first) {
-      if (strcasecmp(first, "DENY") == 0) {
-        *out_allow = 0;
-        plugmod_resp_free(r);
-        return;
-      }
-      if (strcasecmp(first, "ALLOW") == 0) {
-        *out_allow = 1;
-        const char *custom = resp_second_string(r);
-        if (custom && custom[0])
-          *out_custom = strdup(custom);
-        plugmod_resp_free(r);
-        return;
-      }
+    }
+    plugmod_resp_free(request_map);
+    if (r->type != PLUGMOD_RESPT_ARRAY || (r->u.arr.n & 1)) {
+      plugmod_resp_free(r);
+      continue;
+    }
+    const char *action_str = plugmod_resp_map_get_string(r, "action");
+    if (action_str && strcasecmp(action_str, "reject") == 0) {
+      *out_allow = 0;
+      plugmod_resp_free(r);
+      return;
+    }
+    if (action_str && strcasecmp(action_str, "accept") == 0) {
+      *out_allow = 1;
+      plugmod_resp_free(r);
+      return;
     }
     plugmod_resp_free(r);
   }
@@ -165,6 +166,40 @@ static plugmod_resp_object *build_dialout_request_map(const char *source_ext, co
   return map;
 }
 
+/* Build request map for call.dialin: trunk, did, destinations (array), call_id. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_dialin_request_map(const char *trunk_name, const char *did, const char **target_extensions, size_t n_targets, const char *call_id) {
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 8;
+  map->u.arr.elem = calloc(8, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  plugmod_resp_object *e = map->u.arr.elem;
+  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("trunk");
+  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(trunk_name ? trunk_name : "");
+  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("did");
+  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(did ? did : "");
+  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("destinations");
+  plugmod_resp_object *dests = calloc(1, sizeof(plugmod_resp_object));
+  if (!dests) { plugmod_resp_free(map); return NULL; }
+  dests->type = PLUGMOD_RESPT_ARRAY;
+  dests->u.arr.n = n_targets;
+  dests->u.arr.elem = n_targets ? calloc(n_targets, sizeof(plugmod_resp_object)) : NULL;
+  if (n_targets && !dests->u.arr.elem) { free(dests); plugmod_resp_free(map); return NULL; }
+  for (size_t k = 0; k < n_targets; k++) {
+    dests->u.arr.elem[k].type = PLUGMOD_RESPT_BULK;
+    dests->u.arr.elem[k].u.s = strdup(target_extensions[k] ? target_extensions[k] : "");
+  }
+  e[5].type = PLUGMOD_RESPT_ARRAY; e[5].u.arr = dests->u.arr; free(dests);
+  e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("call_id");
+  e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(call_id ? call_id : "");
+  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[6].u.s || !e[7].u.s) {
+    plugmod_resp_free(map);
+    return NULL;
+  }
+  return map;
+}
+
 /* Apply trunk override: from current_trunks (n_current), build new list ordered/filtered by names (string or array).
  * Returns new array and count; caller frees the array (not the config_trunk*). */
 static config_trunk **apply_trunk_override(config_trunk **current_trunks, size_t n_current,
@@ -225,37 +260,39 @@ void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *
   }
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "CALL.DIALOUT")) continue;
+    if (!plugmod_has_event(name, "call.dialout")) continue;
     plugmod_resp_object *request_map = build_dialout_request_map(source_ext, current_destination, call_id, current_trunks, n_current);
     if (!request_map) continue;
     plugmod_resp_object *r = NULL;
-    if (plugmod_invoke_response(name, "CALL.DIALOUT", 1, (const plugmod_resp_object *const *)&request_map, &r) != 0 || !r) {
+    if (plugmod_invoke_response(name, "call.dialout", 1, (const plugmod_resp_object *const *)&request_map, &r) != 0 || !r) {
       plugmod_resp_free(request_map);
       continue;
     }
     plugmod_resp_free(request_map);
     if (r->type != PLUGMOD_RESPT_ARRAY || (r->u.arr.n & 1)) {
-      log_error("plugin %s: CALL.DIALOUT returned invalid response (not a map)", name);
+      log_error("plugin %s: call.dialout returned invalid response (not a map)", name);
       plugmod_resp_free(r);
       continue;
     }
     const char *action_str = plugmod_resp_map_get_string(r, "action");
     if (!action_str) {
-      log_error("plugin %s: CALL.DIALOUT response missing action", name);
+      log_error("plugin %s: call.dialout response missing action", name);
       plugmod_resp_free(r);
       continue;
     }
-    if (strcasecmp(action_str, "REJECT") == 0) {
+    if (strcasecmp(action_str, "reject") == 0) {
       *out_action = 1;
-      const char *code_str = plugmod_resp_map_get_string(r, "reject_code");
-      if (code_str) *out_reject_code = atoi(code_str);
-      if (*out_reject_code < 100 || *out_reject_code > 699) *out_reject_code = 403;
+      plugmod_resp_object *code_val = plugmod_resp_map_get(r, "reject_code");
+      if (code_val && code_val->type == PLUGMOD_RESPT_INT) {
+        *out_reject_code = (int)code_val->u.i;
+        if (*out_reject_code < 100 || *out_reject_code > 699) *out_reject_code = 403;
+      }
       plugmod_resp_free(r);
       free(current_destination);
       free(current_trunks);
       return;
     }
-    if (strcasecmp(action_str, "ALLOW") == 0) {
+    if (strcasecmp(action_str, "accept") == 0) {
       *out_action = 2;
       const char *d = plugmod_resp_map_get_string(r, "destination");
       if (d && d[0]) {
@@ -295,68 +332,61 @@ void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *
 
 void plugin_query_dialin(const char *trunk_name, const char *did, const char **target_extensions, size_t n_targets, const char *call_id,
   int *out_action, int *out_reject_code, char ***out_targets, size_t *out_n) {
-  *out_action = 0; /* dont-care */
+  *out_action = 0;
   *out_reject_code = 403;
   *out_targets = NULL;
   *out_n = 0;
-  /* Build argv: trunk, did, ext1, ext2, ..., call_id */
-  size_t argc = 3 + n_targets; /* trunk, did, [exts], call_id */
-  plugmod_resp_object *objs = (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object));
-  if (!objs) return;
-  plugmod_resp_object **ptrs = (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *));
-  if (!ptrs) { free(objs); return; }
-  objs[0].type = PLUGMOD_RESPT_BULK;
-  objs[0].u.s = (char *)(trunk_name ? trunk_name : "");
-  objs[1].type = PLUGMOD_RESPT_BULK;
-  objs[1].u.s = (char *)(did ? did : "");
-  for (size_t k = 0; k < n_targets; k++) {
-    objs[2 + k].type = PLUGMOD_RESPT_BULK;
-    objs[2 + k].u.s = (char *)(target_extensions[k] ? target_extensions[k] : "");
-  }
-  objs[2 + n_targets].type = PLUGMOD_RESPT_BULK;
-  objs[2 + n_targets].u.s = (char *)(call_id ? call_id : "");
-  for (size_t i = 0; i < argc; i++)
-    ptrs[i] = &objs[i];
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "CALL.DIALIN")) continue;
+    if (!plugmod_has_event(name, "call.dialin")) continue;
+    plugmod_resp_object *request_map = build_dialin_request_map(trunk_name, did, target_extensions, n_targets, call_id);
+    if (!request_map) continue;
     plugmod_resp_object *r = NULL;
-    if (plugmod_invoke_response(name, "CALL.DIALIN", (int)argc, (const plugmod_resp_object *const *)ptrs, &r) != 0 || !r)
+    if (plugmod_invoke_response(name, "call.dialin", 1, (const plugmod_resp_object *const *)&request_map, &r) != 0 || !r) {
+      plugmod_resp_free(request_map);
       continue;
-    const char *first = resp_first_string(r);
-    if (!first) { plugmod_resp_free(r); continue; }
-    if (strcasecmp(first, "REJECT") == 0) {
-      *out_action = 1;
-      const char *code_str = resp_second_string(r);
-      if (code_str) *out_reject_code = atoi(code_str);
-      if (*out_reject_code < 100 || *out_reject_code > 699) *out_reject_code = 403;
-      plugmod_resp_free(r);
-      free(ptrs);
-      free(objs);
-      return;
     }
-    if (strcasecmp(first, "ALTER") == 0 && r->type == PLUGMOD_RESPT_ARRAY && r->u.arr.n > 1) {
-      size_t n = r->u.arr.n - 1;
-      char **targets = (char **)malloc(n * sizeof(char *));
-      if (targets) {
-        for (size_t j = 1; j < r->u.arr.n; j++) {
-          plugmod_resp_object *e = &r->u.arr.elem[j];
-          targets[j - 1] = (e->type == PLUGMOD_RESPT_SIMPLE || e->type == PLUGMOD_RESPT_BULK) && e->u.s
-            ? strdup(e->u.s) : NULL;
-        }
-        *out_targets = targets;
-        *out_n = n;
-        *out_action = 2;
+    plugmod_resp_free(request_map);
+    if (r->type != PLUGMOD_RESPT_ARRAY || (r->u.arr.n & 1)) {
+      plugmod_resp_free(r);
+      continue;
+    }
+    const char *action_str = plugmod_resp_map_get_string(r, "action");
+    if (action_str && strcasecmp(action_str, "reject") == 0) {
+      *out_action = 1;
+      plugmod_resp_object *code_val = plugmod_resp_map_get(r, "reject_code");
+      if (code_val && code_val->type == PLUGMOD_RESPT_INT) {
+        *out_reject_code = (int)code_val->u.i;
+        if (*out_reject_code < 100 || *out_reject_code > 699) *out_reject_code = 403;
       }
       plugmod_resp_free(r);
-      free(ptrs);
-      free(objs);
       return;
+    }
+    if (action_str && strcasecmp(action_str, "accept") == 0) {
+      plugmod_resp_object *dests_val = plugmod_resp_map_get(r, "destinations");
+      if (dests_val && dests_val->type == PLUGMOD_RESPT_ARRAY) {
+        size_t n = dests_val->u.arr.n;
+        if (n == 0) {
+          log_error("plugin %s: call.dialin accept with empty destinations array, treating as continue", name);
+        } else {
+          char **targets = (char **)malloc(n * sizeof(char *));
+          if (targets) {
+            for (size_t j = 0; j < n; j++) {
+              plugmod_resp_object *elem = &dests_val->u.arr.elem[j];
+              targets[j] = (elem->type == PLUGMOD_RESPT_BULK || elem->type == PLUGMOD_RESPT_SIMPLE) && elem->u.s
+                ? strdup(elem->u.s) : NULL;
+            }
+            *out_targets = targets;
+            *out_n = n;
+            *out_action = 2;
+          }
+          plugmod_resp_free(r);
+          return;
+        }
+      }
     }
     plugmod_resp_free(r);
   }
-  free(ptrs);
-  free(objs);
 }
 
 size_t plugin_count(void) {

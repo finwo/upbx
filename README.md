@@ -185,7 +185,7 @@ permit = *
 # permit = metrics.*
 
 [api:*]
-# anonymous access (no AUTH needed)
+# anonymous access (no auth needed)
 # these permits are inherited by ALL users (anonymous + logged-in)
 permit = ping
 permit = metrics.get
@@ -208,7 +208,7 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 
 | Option | Description |
 |--------|-------------|
-| `exec` | Command to run (via `sh -c`). Process communicates over stdio using a RESP-style protocol; discovery via `COMMAND`. See [Plugin events](#plugin-events) for available events. |
+| `exec` | Command to run (via `sh -c`). Process communicates over stdio using a RESP-style protocol; discovery via `command`. See [Plugin events](#plugin-events) for available events. |
 
 ### `[trunk:name]`
 
@@ -256,7 +256,7 @@ Optional section. When `listen` is set, a TCP server starts speaking the RESP2 (
 
 ### `[api:username]`
 
-Define API credentials and permissions. Each section creates a user that can authenticate via `AUTH username password`. Use `[api:*]` to define permissions for anonymous (unauthenticated) connections. Permissions granted to `[api:*]` are inherited by all users, so baseline commands only need to be permitted once.
+Define API credentials and permissions. Each section creates a user that can authenticate via `auth username password`. Use `[api:*]` to define permissions for anonymous (unauthenticated) connections. Permissions granted to `[api:*]` are inherited by all users, so baseline commands only need to be permitted once.
 
 | Option | Description |
 |--------|-------------|
@@ -269,16 +269,16 @@ Define API credentials and permissions. Each section creates a user that can aut
 
 | Command | Response |
 |---------|----------|
-| `AUTH username password` | `+OK` or `-ERR invalid credentials` |
-| `PING` | `+PONG` |
-| `QUIT` | `+OK`, closes connection |
-| `COMMAND` | List of commands accessible to the current user |
-| `METRICS.KEYS` | `["calls", "extensions", "trunks", "load"]` |
-| `METRICS.LLEN key` | Integer count of items in the list |
-| `METRICS.LRANGE key start stop` | Array of elements (each element is a flat array of alternating key-value pairs) |
-| `METRICS.GET load:1` | Average active calls over the last 1 minute |
-| `METRICS.GET load:5` | Average active calls over the last 5 minutes |
-| `METRICS.GET load:15` | Average active calls over the last 15 minutes |
+| `auth username password` | `+OK` or `-ERR invalid credentials` |
+| `ping` | `+PONG` |
+| `quit` | `+OK`, closes connection |
+| `command` | List of commands accessible to the current user |
+| `metrics.keys` | `["calls", "extensions", "trunks", "load"]` |
+| `metrics.llen key` | Integer count of items in the list |
+| `metrics.lrange key start stop` | Array of elements (each element is a flat array of alternating key-value pairs) |
+| `metrics.get load:1` | Average active calls over the last 1 minute |
+| `metrics.get load:5` | Average active calls over the last 5 minutes |
+| `metrics.get load:15` | Average active calls over the last 15 minutes |
 
 **List keys and their fields:**
 
@@ -288,12 +288,14 @@ Define API credentials and permissions. Each section creates a user that can aut
 
 ## Plugin events
 
+All event names and response `action` values are lower-case. Input and response payloads are one map per event (or one map in the response for query events).
+
 | Event | When | Args / response |
 |------|------|------------------|
-| `EXTENSION.REGISTER` | Before accepting REGISTER | extension, trunk, from_user → DENY / ALLOW [custom] / continue |
-| `EXTENSION.LIST` | At start and on registration change | 3 per ext: number, name, trunk (no secret) |
-| `TRUNK.LIST` | At start and on registration change | 5 per trunk: name, group_prefix, dids, cid, extensions (no credentials) |
-| `CALL.DIALOUT` | Outgoing call from extension | **Input** (map): `source_ext`, `destination`, `call_id`, `trunks` (array of trunk maps: `name`, `cid`, `did`). **Response** (map): required `action` = `REJECT` or `ALLOW`; if REJECT then `reject_code` (e.g. `"403"`); if ALLOW then optional `destination` override, optional `trunk` (single name or array of trunk names for preference order). Trunk override is used for routing when present. |
-| `CALL.DIALIN` | Incoming call to DID | trunk, did, ext1, ext2, …, call_id → dont-care / REJECT [code] / ALTER ext… |
-| `CALL.ANSWER` | When a call is picked up (dialin) | direction, call_id, source, destination (event; response ignored) |
-| `CALL.HANGUP` | When a call is terminated | call_id, source, destination, duration_sec (event; response ignored) |
+| `extension.register` | Before accepting REGISTER | **Input** (map): `extension`, `trunk`, `from_user`. **Response** (map): `action` = `reject` \| `accept` \| `continue`. Other keys reserved for future use. |
+| `extension.list` | At start and on registration change | **Input** (map): `extensions` = array of maps `{ number, name, trunk }`. Event; response ignored. |
+| `trunk.list` | At start and on registration change | **Input** (map): `trunks` = array of maps `{ name, group_prefix, dids, cid, extensions }` (dids and extensions are arrays of strings). Event; response ignored. |
+| `call.dialout` | Outgoing call from extension | **Input** (map): `source_ext`, `destination`, `call_id`, `trunks` (array of trunk maps: `name`, `cid`, `did`). **Response** (map): `action` = `reject` \| `accept`; if reject then `reject_code` (integer); if accept then optional `destination`, optional `trunk` (name or array of names). |
+| `call.dialin` | Incoming call to DID | **Input** (map): `trunk`, `did`, `destinations`, `call_id`. **Response** (map): `action` = `reject` \| `continue` \| `accept`. reject → `reject_code` (integer). accept → optional `destinations` (array; missing or empty = like continue; empty array logs error; one or more = fork list). |
+| `call.answer` | When a call is picked up (dialin) | **Input** (map): `direction`, `call_id`, `source`, `destination`. Event; response ignored. |
+| `call.hangup` | When a call is terminated | **Input** (map): `call_id`, `source`, `destination`, `duration_sec`. Event; response ignored. |

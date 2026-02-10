@@ -25,6 +25,7 @@
 #include "rxi/log.h"
 #include "config.h"
 #include "AppModule/plugin.h"
+#include "PluginModule/plugin.h"
 #include "AppModule/sip_server.h"
 #include "AppModule/trunk_reg.h"
 #include "AppModule/sip_parse.h"
@@ -298,116 +299,178 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
 
 /* Trunk lookup for extension is now registration_get_trunk_for_ext() in registration.c. */
 
-/* Notify plugins of extension list (number, name, trunk per ext) and trunk list (name, group, dids, cid, exts per trunk). */
+/* Build one map for extension.list: key "extensions" = array of maps { number, name, trunk }. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_extension_list_map(upbx_config *cfg) {
+  size_t n = cfg->extension_count;
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 2;
+  map->u.arr.elem = calloc(2, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  map->u.arr.elem[0].type = PLUGMOD_RESPT_BULK;
+  map->u.arr.elem[0].u.s = strdup("extensions");
+  if (!map->u.arr.elem[0].u.s) { free(map->u.arr.elem); free(map); return NULL; }
+  plugmod_resp_object *arr = calloc(1, sizeof(plugmod_resp_object));
+  if (!arr) { free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
+  arr->type = PLUGMOD_RESPT_ARRAY;
+  arr->u.arr.n = n;
+  arr->u.arr.elem = n ? calloc(n, sizeof(plugmod_resp_object)) : NULL;
+  if (n && !arr->u.arr.elem) { free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
+  for (size_t i = 0; i < n; i++) {
+    config_extension *e = &cfg->extensions[i];
+    plugmod_resp_object *em = &arr->u.arr.elem[i];
+    em->type = PLUGMOD_RESPT_ARRAY;
+    em->u.arr.n = 6;
+    em->u.arr.elem = calloc(6, sizeof(plugmod_resp_object));
+    if (!em->u.arr.elem) {
+      for (size_t k = 0; k < i; k++) {
+        free(arr->u.arr.elem[k].u.arr.elem[0].u.s); free(arr->u.arr.elem[k].u.arr.elem[1].u.s);
+        free(arr->u.arr.elem[k].u.arr.elem[2].u.s); free(arr->u.arr.elem[k].u.arr.elem[3].u.s);
+        free(arr->u.arr.elem[k].u.arr.elem[4].u.s); free(arr->u.arr.elem[k].u.arr.elem[5].u.s);
+        free(arr->u.arr.elem[k].u.arr.elem);
+      }
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      return NULL;
+    }
+    const char *trunk_str = registration_get_trunk_for_ext(e->number);
+    em->u.arr.elem[0].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[0].u.s = strdup("number");
+    em->u.arr.elem[1].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[1].u.s = strdup(e->number ? e->number : "");
+    em->u.arr.elem[2].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[2].u.s = strdup("name");
+    em->u.arr.elem[3].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[3].u.s = strdup(e->name ? e->name : "");
+    em->u.arr.elem[4].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[4].u.s = strdup("trunk");
+    em->u.arr.elem[5].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[5].u.s = strdup(trunk_str ? trunk_str : "");
+    if (!em->u.arr.elem[0].u.s || !em->u.arr.elem[1].u.s || !em->u.arr.elem[2].u.s || !em->u.arr.elem[3].u.s || !em->u.arr.elem[4].u.s || !em->u.arr.elem[5].u.s) {
+      for (int k = 0; k < 6; k++) free(em->u.arr.elem[k].u.s);
+      free(em->u.arr.elem);
+      for (size_t k = 0; k < i; k++) {
+        for (int q = 0; q < 6; q++) free(arr->u.arr.elem[k].u.arr.elem[q].u.s);
+        free(arr->u.arr.elem[k].u.arr.elem);
+      }
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      return NULL;
+    }
+  }
+  map->u.arr.elem[1].type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.elem[1].u.arr = arr->u.arr;
+  free(arr);
+  return map;
+}
+
+/* Build one map for trunk.list: key "trunks" = array of maps { name, group_prefix, dids, cid, extensions }. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_trunk_list_map(upbx_config *cfg) {
+  size_t n = cfg->trunk_count;
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 2;
+  map->u.arr.elem = calloc(2, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  map->u.arr.elem[0].type = PLUGMOD_RESPT_BULK;
+  map->u.arr.elem[0].u.s = strdup("trunks");
+  if (!map->u.arr.elem[0].u.s) { free(map->u.arr.elem); free(map); return NULL; }
+  plugmod_resp_object *arr = calloc(1, sizeof(plugmod_resp_object));
+  if (!arr) { free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
+  arr->type = PLUGMOD_RESPT_ARRAY;
+  arr->u.arr.n = n;
+  arr->u.arr.elem = n ? calloc(n, sizeof(plugmod_resp_object)) : NULL;
+  if (n && !arr->u.arr.elem) { free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
+  for (size_t i = 0; i < n; i++) {
+    config_trunk *t = &cfg->trunks[i];
+    plugmod_resp_object *tm = &arr->u.arr.elem[i];
+    tm->type = PLUGMOD_RESPT_ARRAY;
+    tm->u.arr.n = 10; /* 5 keys + 5 values */
+    tm->u.arr.elem = calloc(10, sizeof(plugmod_resp_object));
+    if (!tm->u.arr.elem) {
+      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      return NULL;
+    }
+    plugmod_resp_object *e = tm->u.arr.elem;
+    e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("name");
+    e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(t->name ? t->name : "");
+    e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("group_prefix");
+    e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(t->group_prefix ? t->group_prefix : "");
+    e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("dids");
+    plugmod_resp_object *dids_arr = calloc(1, sizeof(plugmod_resp_object));
+    if (!dids_arr) {
+      for (int k = 0; k < 10; k++) free(e[k].u.s);
+      free(tm->u.arr.elem);
+      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      return NULL;
+    }
+    dids_arr->type = PLUGMOD_RESPT_ARRAY;
+    dids_arr->u.arr.n = t->did_count;
+    dids_arr->u.arr.elem = t->did_count ? calloc(t->did_count, sizeof(plugmod_resp_object)) : NULL;
+    if (t->did_count && !dids_arr->u.arr.elem) {
+      free(dids_arr);
+      for (int k = 0; k < 10; k++) free(e[k].u.s);
+      free(tm->u.arr.elem);
+      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      return NULL;
+    }
+    for (size_t d = 0; d < t->did_count; d++) {
+      dids_arr->u.arr.elem[d].type = PLUGMOD_RESPT_BULK;
+      dids_arr->u.arr.elem[d].u.s = strdup(t->dids[d] ? t->dids[d] : "");
+    }
+    e[5].type = PLUGMOD_RESPT_ARRAY; e[5].u.arr = dids_arr->u.arr; free(dids_arr);
+    e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("cid");
+    e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(t->cid ? t->cid : "");
+    e[8].type = PLUGMOD_RESPT_BULK; e[8].u.s = strdup("extensions");
+    ext_reg_t **tregs = NULL;
+    size_t treg_count = registration_get_regs(t->name, NULL, &tregs);
+    plugmod_resp_object *exts_arr = calloc(1, sizeof(plugmod_resp_object));
+    if (!exts_arr) {
+      plugmod_resp_free(tm);
+      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
+      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+      if (tregs) free(tregs);
+      return NULL;
+    }
+    exts_arr->type = PLUGMOD_RESPT_ARRAY;
+    exts_arr->u.arr.n = treg_count;
+    exts_arr->u.arr.elem = treg_count ? calloc(treg_count, sizeof(plugmod_resp_object)) : NULL;
+    if (treg_count && !exts_arr->u.arr.elem) { free(exts_arr); plugmod_resp_free(tm); for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]); free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); if (tregs) free(tregs); return NULL; }
+    for (size_t r = 0; r < treg_count; r++) {
+      exts_arr->u.arr.elem[r].type = PLUGMOD_RESPT_BULK;
+      exts_arr->u.arr.elem[r].u.s = strdup(tregs[r]->number ? tregs[r]->number : "");
+    }
+    if (tregs) free(tregs);
+    e[9].type = PLUGMOD_RESPT_ARRAY; e[9].u.arr = exts_arr->u.arr; free(exts_arr);
+  }
+  map->u.arr.elem[1].type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.elem[1].u.arr = arr->u.arr;
+  free(arr);
+  return map;
+}
+
+/* Notify plugins of extension list and trunk list (one map each). */
 static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   if (plugin_count() == 0) return;
-  size_t i, j;
-  size_t argc;
+  size_t i;
 
-  /* EXTENSION.LIST: 3 args per extension (number, name, trunk); no secret */
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "EXTENSION.LIST")) break;
+    if (plugin_has_event(plugin_name_at(i), "extension.list")) break;
   }
   if (i < plugin_count()) {
-    argc = 3 * cfg->extension_count;
-    plugmod_resp_object *objs = argc ? (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object)) : NULL;
-    plugmod_resp_object **ptrs = argc ? (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *)) : NULL;
-    if (objs && ptrs) {
-      char **trunk_copies = (char **)calloc(cfg->extension_count, sizeof(char *));
-      if (trunk_copies) {
-        for (i = 0; i < cfg->extension_count; i++) {
-          config_extension *e = &cfg->extensions[i];
-          const char *s0 = e->number ? e->number : "";
-          const char *s1 = e->name ? e->name : "";
-          trunk_copies[i] = strdup(registration_get_trunk_for_ext(e->number));
-          const char *s2 = trunk_copies[i] ? trunk_copies[i] : "";
-          objs[i * 3 + 0].type = PLUGMOD_RESPT_BULK;
-          objs[i * 3 + 0].u.s = (char *)s0;
-          objs[i * 3 + 1].type = PLUGMOD_RESPT_BULK;
-          objs[i * 3 + 1].u.s = (char *)s1;
-          objs[i * 3 + 2].type = PLUGMOD_RESPT_BULK;
-          objs[i * 3 + 2].u.s = (char *)s2;
-        }
-        for (i = 0; i < argc; i++) ptrs[i] = &objs[i];
-        plugin_notify_event("EXTENSION.LIST", (int)argc, (const plugmod_resp_object *const *)ptrs);
-        for (i = 0; i < cfg->extension_count; i++) free(trunk_copies[i]);
-        free(trunk_copies);
-      }
+    plugmod_resp_object *map = build_extension_list_map(cfg);
+    if (map) {
+      plugin_notify_event("extension.list", 1, (const plugmod_resp_object *const *)&map);
+      plugmod_resp_free(map);
     }
-    free(ptrs);
-    free(objs);
   }
 
-  /* TRUNK.LIST: 5 args per trunk (name, group_prefix, dids, cid, extensions); no credentials */
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "TRUNK.LIST")) break;
+    if (plugin_has_event(plugin_name_at(i), "trunk.list")) break;
   }
   if (i < plugin_count()) {
-    argc = 5 * cfg->trunk_count;
-    plugmod_resp_object *objs = argc ? (plugmod_resp_object *)malloc(argc * sizeof(plugmod_resp_object)) : NULL;
-    plugmod_resp_object **ptrs = argc ? (plugmod_resp_object **)malloc(argc * sizeof(plugmod_resp_object *)) : NULL;
-    if (objs && ptrs) {
-      char **dids_strs = (char **)calloc(cfg->trunk_count, sizeof(char *));
-      char **exts_strs = (char **)calloc(cfg->trunk_count, sizeof(char *));
-      if (dids_strs && exts_strs) {
-        for (i = 0; i < cfg->trunk_count; i++) {
-          config_trunk *t = &cfg->trunks[i];
-          objs[i * 5 + 0].type = PLUGMOD_RESPT_BULK;
-          objs[i * 5 + 0].u.s = (char *)(t->name ? t->name : "");
-          objs[i * 5 + 1].type = PLUGMOD_RESPT_BULK;
-          objs[i * 5 + 1].u.s = (char *)(t->group_prefix ? t->group_prefix : "");
-          if (t->did_count > 0) {
-            size_t need = 1;
-            for (j = 0; j < t->did_count; j++)
-              need += (t->dids[j] ? strlen(t->dids[j]) : 0) + 1;
-            dids_strs[i] = malloc(need);
-            if (dids_strs[i]) {
-              dids_strs[i][0] = '\0';
-              for (j = 0; j < t->did_count; j++) {
-                if (j) strcat(dids_strs[i], ",");
-                if (t->dids[j]) strcat(dids_strs[i], t->dids[j]);
-              }
-              objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
-              objs[i * 5 + 2].u.s = dids_strs[i];
-            } else {
-              objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
-              objs[i * 5 + 2].u.s = (char *)"";
-            }
-          } else {
-            objs[i * 5 + 2].type = PLUGMOD_RESPT_BULK;
-            objs[i * 5 + 2].u.s = (char *)"";
-          }
-          objs[i * 5 + 3].type = PLUGMOD_RESPT_BULK;
-          objs[i * 5 + 3].u.s = (char *)(t->cid ? t->cid : "");
-          exts_strs[i] = malloc(512);
-          if (exts_strs[i]) {
-            ext_reg_t **tregs = NULL;
-            size_t treg_count = registration_get_regs(t->name, NULL, &tregs);
-            exts_strs[i][0] = '\0';
-            for (j = 0; j < treg_count; j++) {
-              if (exts_strs[i][0]) strcat(exts_strs[i], ",");
-              if (tregs[j]->number) strcat(exts_strs[i], tregs[j]->number);
-            }
-            free(tregs);
-            objs[i * 5 + 4].type = PLUGMOD_RESPT_BULK;
-            objs[i * 5 + 4].u.s = exts_strs[i];
-          } else {
-            objs[i * 5 + 4].type = PLUGMOD_RESPT_BULK;
-            objs[i * 5 + 4].u.s = (char *)"";
-          }
-        }
-        for (i = 0; i < argc; i++) ptrs[i] = &objs[i];
-        plugin_notify_event("TRUNK.LIST", (int)argc, (const plugmod_resp_object *const *)ptrs);
-        for (i = 0; i < cfg->trunk_count; i++) {
-          free(dids_strs[i]);
-          free(exts_strs[i]);
-        }
-      }
-      free(dids_strs);
-      free(exts_strs);
+    plugmod_resp_object *map = build_trunk_list_map(cfg);
+    if (map) {
+      plugin_notify_event("trunk.list", 1, (const plugmod_resp_object *const *)&map);
+      plugmod_resp_free(map);
     }
-    free(ptrs);
-    free(objs);
   }
 }
 
@@ -430,43 +493,88 @@ static int fork_uri_from_addr(const struct sockaddr_storage *addr, const char *u
   return 0;
 }
 
-/* Notify plugins of CALL.ANSWER (direction, call_id, source, destination). */
+/* Notify plugins of call.answer (direction, call_id, source, destination). */
+/* Build one map for call.answer: direction, call_id, source, destination. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_call_answer_map(const char *direction, const char *call_id, const char *source, const char *destination) {
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 8;
+  map->u.arr.elem = calloc(8, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  plugmod_resp_object *e = map->u.arr.elem;
+  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("direction");
+  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(direction ? direction : "");
+  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("call_id");
+  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(call_id ? call_id : "");
+  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("source");
+  e[5].type = PLUGMOD_RESPT_BULK; e[5].u.s = strdup(source ? source : "");
+  e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("destination");
+  e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(destination ? destination : "");
+  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[5].u.s || !e[6].u.s || !e[7].u.s) {
+    plugmod_resp_free(map);
+    return NULL;
+  }
+  return map;
+}
+
+/* Build one map for call.hangup: call_id, source, destination, duration_sec. Caller plugmod_resp_frees. */
+static plugmod_resp_object *build_call_hangup_map(const char *call_id, const char *source, const char *destination, int duration_sec) {
+  char dur_buf[32];
+  snprintf(dur_buf, sizeof(dur_buf), "%d", duration_sec);
+  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  if (!map) return NULL;
+  map->type = PLUGMOD_RESPT_ARRAY;
+  map->u.arr.n = 8;
+  map->u.arr.elem = calloc(8, sizeof(plugmod_resp_object));
+  if (!map->u.arr.elem) { free(map); return NULL; }
+  plugmod_resp_object *e = map->u.arr.elem;
+  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("call_id");
+  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(call_id ? call_id : "");
+  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("source");
+  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(source ? source : "");
+  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("destination");
+  e[5].type = PLUGMOD_RESPT_BULK; e[5].u.s = strdup(destination ? destination : "");
+  e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("duration_sec");
+  e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(dur_buf);
+  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[5].u.s || !e[6].u.s || !e[7].u.s) {
+    plugmod_resp_free(map);
+    return NULL;
+  }
+  return map;
+}
+
 static void notify_call_answer(const char *direction, const char *call_id, const char *source, const char *destination) {
   size_t i;
   if (plugin_count() == 0) return;
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "CALL.ANSWER")) break;
+    if (plugin_has_event(plugin_name_at(i), "call.answer")) break;
   }
   if (i >= plugin_count()) return;
-  log_debug("CALL.ANSWER: notifying plugins, call=%.32s %s -> %s (%s)", call_id ? call_id : "", source ? source : "", destination ? destination : "", direction ? direction : "");
-  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(direction ? direction : "") } };
-  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(call_id ? call_id : "") } };
-  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source ? source : "") } };
-  const plugmod_resp_object a3 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(destination ? destination : "") } };
-  const plugmod_resp_object *argv[] = { &a0, &a1, &a2, &a3 };
-  plugin_notify_event("CALL.ANSWER", 4, argv);
+  log_debug("call.answer: notifying plugins, call=%.32s %s -> %s (%s)", call_id ? call_id : "", source ? source : "", destination ? destination : "", direction ? direction : "");
+  plugmod_resp_object *map = build_call_answer_map(direction, call_id, source, destination);
+  if (map) {
+    plugin_notify_event("call.answer", 1, (const plugmod_resp_object *const *)&map);
+    plugmod_resp_free(map);
+  }
 }
 
-/* Notify plugins of CALL.HANGUP (call_id, source, destination, duration_seconds). */
 static void notify_call_hangup(const char *call_id, const char *source, const char *destination, int duration_sec) {
   size_t i;
   if (plugin_count() == 0) return;
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "CALL.HANGUP")) break;
+    if (plugin_has_event(plugin_name_at(i), "call.hangup")) break;
   }
   if (i >= plugin_count()) return;
-  log_debug("CALL.HANGUP: notifying plugins, call=%.32s %s -> %s (%ds)", call_id ? call_id : "", source ? source : "", destination ? destination : "", duration_sec);
-  char dur_buf[32];
-  snprintf(dur_buf, sizeof(dur_buf), "%d", duration_sec);
-  const plugmod_resp_object a0 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(call_id ? call_id : "") } };
-  const plugmod_resp_object a1 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(source ? source : "") } };
-  const plugmod_resp_object a2 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)(destination ? destination : "") } };
-  const plugmod_resp_object a3 = { .type = PLUGMOD_RESPT_BULK, .u = { .s = dur_buf } };
-  const plugmod_resp_object *argv[] = { &a0, &a1, &a2, &a3 };
-  plugin_notify_event("CALL.HANGUP", 4, argv);
+  log_debug("call.hangup: notifying plugins, call=%.32s %s -> %s (%ds)", call_id ? call_id : "", source ? source : "", destination ? destination : "", duration_sec);
+  plugmod_resp_object *map = build_call_hangup_map(call_id, source, destination, duration_sec);
+  if (map) {
+    plugin_notify_event("call.hangup", 1, (const plugmod_resp_object *const *)&map);
+    plugmod_resp_free(map);
+  }
 }
 
-/* Pre-remove callback: fires CALL.HANGUP plugin event for every call removal,
+/* Pre-remove callback: fires call.hangup plugin event for every call removal,
  * including timeout aging (which previously bypassed notifications). */
 static void call_pre_remove_handler(call_t *call) {
   if (!call) return;
@@ -713,19 +821,17 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   int has_auth = sip_header_get(req_buf, req_len, "Authorization", &auth_val, &auth_len);
   log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk ? trunk->name : "(none)", has_auth ? 1 : 0);
 
-  /* Plugin EXTENSION.REGISTER: can DENY, ALLOW (with optional custom data), or CONTINUE (built-in auth). */
+  /* Plugin extension.register: can reject, accept, or continue (built-in auth). */
   int plugin_allow = -1;
-  char *plugin_custom = NULL;
   const char *trunk_name_str = trunk ? trunk->name : "";
   if (plugin_count() > 0) {
     log_debug("REGISTER: querying plugins for ext %s on trunk %s", extension_num, trunk_name_str);
-    plugin_query_register(extension_num, trunk_name_str, user, &plugin_allow, &plugin_custom);
+    plugin_query_register(extension_num, trunk_name_str, user, &plugin_allow);
   }
   if (plugin_allow == 0) {
     log_info("REGISTER: plugin denied registration for extension %s", extension_num);
     free(raw_uri_user);
     free(extension_num);
-    free(plugin_custom);
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
     return;
   }
@@ -780,14 +886,14 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     /* keep raw_uri_user for storing in reg below */
   }
 
-  /* Store registration (transfers ownership of extension_num, raw_uri_user, contact_val, plugin_custom). */
+  /* Store registration (transfers ownership of extension_num, raw_uri_user, contact_val). */
   log_trace("REGISTER: auth OK, extension=%s", extension_num);
   if (trunk)
     log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk->name);
   else
     log_info("REGISTER: extension %s registered (no trunk)", extension_num);
   char *contact_val = get_contact_value(req_buf, req_len);
-  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", plugin_custom);
+  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL);
   raw_uri_user = NULL;  /* ownership transferred */
   send_reply(ctx, req_buf, req_len, 200, 1, 0);
   free(raw_uri_user);  /* no-op if transferred to reg */
@@ -1478,7 +1584,7 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   send_reply(ctx, buf, len, 100, 0, 0);
 }
 
-/* Dispatch INVITE: CALL.DIALIN / CALL.DIALOUT plugin events, then incoming (DID) or outgoing (from extension). */
+/* Dispatch INVITE: call.dialin / call.dialout plugin events, then incoming (DID) or outgoing (from extension). */
 static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_send_ctx *ctx) {
   log_trace("handle_invite: entry");
   char to_user_buf[256], from_user_buf[256], call_id_buf[256];
@@ -1593,7 +1699,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       return;
     }
 
-    /* 1b. CALL.DIALOUT plugin event — always fires for outgoing calls from extensions. */
+    /* 1b. call.dialout plugin event — always fires for outgoing calls from extensions. */
     ext_reg_t **dm = NULL;
     size_t dmc = registration_get_regs(NULL, ext_num, &dm);
     ext_reg_t *reg = dmc > 0 ? dm[0] : NULL;
@@ -1620,14 +1726,14 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     config_trunk *dialout_group_trunks[64];
     size_t n_dialout_group = get_group_trunks(cfg, primary_trunk, dialout_group_trunks, 64);
     if (plugin_count() > 0) {
-      log_debug("CALL.DIALOUT: querying plugins for ext %s -> %s call=%.32s", ext_num, destination, call_id);
+      log_debug("call.dialout: querying plugins for ext %s -> %s call=%.32s", ext_num, destination, call_id);
       plugin_query_dialout(cfg, ext_num, destination, call_id, dialout_group_trunks, n_dialout_group,
         &dialout_action, &reject_code, &target_override, &trunk_override, &trunk_override_n);
     }
 
     /* 1c. DIALOUT plugin rejected → send error to caller. */
     if (dialout_action == 1) {
-      log_info("CALL.DIALOUT: plugin rejected call from %s to %s (code %d)", ext_num, destination, reject_code);
+      log_info("call.dialout: plugin rejected call from %s to %s (code %d)", ext_num, destination, reject_code);
       free(ext_num);
       send_reply(ctx, buf, len, reject_code, 0, 0);
       free(target_override);
@@ -1639,7 +1745,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     size_t cur_len = len;
     char *override_buf = NULL;
     if (dialout_action == 2 && target_override && target_override[0]) {
-      log_info("CALL.DIALOUT: plugin overrode target to %s for call %.32s", target_override, call_id);
+      log_info("call.dialout: plugin overrode target to %s for call %.32s", target_override, call_id);
       char req_host[256], req_port[32];
       if (sip_request_uri_host_port(buf, len, req_host, sizeof(req_host), req_port, sizeof(req_port))) {
         override_buf = build_invite_with_uri(buf, len, target_override, req_host, req_port);
@@ -1648,7 +1754,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     }
     free(target_override);
 
-    /* 1d. Destination matches a DID → CALL.DIALIN fires too, then route internally.
+    /* 1d. Destination matches a DID → call.dialin fires too, then route internally.
      * This covers extensions on different trunks calling each other via DID:
      * the recipient trunk sees it as a normal incoming call. */
     config_trunk *did_trunk = to_user[0] ? find_trunk_by_did(cfg, to_user) : NULL;
@@ -1656,7 +1762,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       ext_reg_t **exts = NULL;
       size_t n_ext = get_group_regs(cfg, did_trunk, &exts);
 
-      /* Fire CALL.DIALIN for the recipient trunk. */
+      /* Fire call.dialin for the recipient trunk. */
       log_info("new call: ext %s -> DID %s (trunk %s, %zu target(s))", ext_num, to_user, did_trunk->name, n_ext);
       if (plugin_count() > 0 && n_ext > 0 && exts) {
         const char **ext_numbers = (const char **)malloc(n_ext * sizeof(const char *));
@@ -1666,12 +1772,12 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
           int dialin_reject_code = 403;
           char **dialin_override_targets = NULL;
           size_t n_dialin_override = 0;
-          log_debug("CALL.DIALIN: querying plugins for DID %s on trunk %s, call=%.32s", to_user, did_trunk->name, call_id);
+          log_debug("call.dialin: querying plugins for DID %s on trunk %s, call=%.32s", to_user, did_trunk->name, call_id);
           plugin_query_dialin(did_trunk->name, to_user, ext_numbers, n_ext, call_id,
             &dialin_action, &dialin_reject_code, &dialin_override_targets, &n_dialin_override);
           free(ext_numbers);
           if (dialin_action == 1) {
-            log_info("CALL.DIALIN: plugin rejected call to DID %s (code %d)", to_user, dialin_reject_code);
+            log_info("call.dialin: plugin rejected call to DID %s (code %d)", to_user, dialin_reject_code);
             free(exts);
             free(ext_num);
             free(override_buf);
@@ -1679,7 +1785,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
             return;
           }
           if (dialin_action == 2 && dialin_override_targets && n_dialin_override > 0) {
-            log_info("CALL.DIALIN: plugin overrode targets for DID %s (%zu target(s))", to_user, n_dialin_override);
+            log_info("call.dialin: plugin overrode targets for DID %s (%zu target(s))", to_user, n_dialin_override);
             free(exts);
             free(ext_num);
             handle_invite_incoming(cfg, cur_buf, cur_len, ctx, to_user, (const char **)dialin_override_targets, n_dialin_override);
@@ -1727,18 +1833,18 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         int reject_code = 403;
         char **override_targets = NULL;
         size_t n_override = 0;
-        log_debug("CALL.DIALIN: querying plugins for DID %s on trunk %s, call=%.32s", to_user, trunk->name, call_id);
+        log_debug("call.dialin: querying plugins for DID %s on trunk %s, call=%.32s", to_user, trunk->name, call_id);
         plugin_query_dialin(trunk->name, to_user, ext_numbers, n_ext, call_id,
           &action, &reject_code, &override_targets, &n_override);
         free(ext_numbers);
         if (action == 1) {
-          log_info("CALL.DIALIN: plugin rejected incoming call to DID %s (code %d)", to_user, reject_code);
+          log_info("call.dialin: plugin rejected incoming call to DID %s (code %d)", to_user, reject_code);
           free(exts);
           send_reply(ctx, buf, len, reject_code, 0, 0);
           return;
         }
         if (action == 2 && override_targets && n_override > 0) {
-          log_info("CALL.DIALIN: plugin overrode targets for DID %s (%zu target(s))", to_user, n_override);
+          log_info("call.dialin: plugin overrode targets for DID %s (%zu target(s))", to_user, n_override);
           free(exts);
           handle_invite_incoming(cfg, buf, len, ctx, to_user, (const char **)override_targets, n_override);
           for (size_t i = 0; i < n_override; i++) free(override_targets[i]);
@@ -1793,18 +1899,18 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
           int reject_code = 403;
           char **override_targets = NULL;
           size_t n_override = 0;
-          log_debug("CALL.DIALIN: querying plugins (filter_incoming=0) for %s on trunk %s, call=%.32s", to_user, fi_trunk->name, call_id);
+          log_debug("call.dialin: querying plugins (filter_incoming=0) for %s on trunk %s, call=%.32s", to_user, fi_trunk->name, call_id);
           plugin_query_dialin(fi_trunk->name, to_user, ext_numbers, n_ext, call_id,
             &action, &reject_code, &override_targets, &n_override);
           free(ext_numbers);
           if (action == 1) {
-            log_info("CALL.DIALIN: plugin rejected incoming call to %s (code %d)", to_user, reject_code);
+            log_info("call.dialin: plugin rejected incoming call to %s (code %d)", to_user, reject_code);
             free(exts);
             send_reply(ctx, buf, len, reject_code, 0, 0);
             return;
           }
           if (action == 2 && override_targets && n_override > 0) {
-            log_info("CALL.DIALIN: plugin overrode targets for %s (%zu target(s))", to_user, n_override);
+            log_info("call.dialin: plugin overrode targets for %s (%zu target(s))", to_user, n_override);
             free(exts);
             handle_invite_incoming(cfg, buf, len, ctx, to_user, (const char **)override_targets, n_override);
             for (size_t i = 0; i < n_override; i++) free(override_targets[i]);
@@ -2325,7 +2431,7 @@ void daemon_root(int argc, void *argv[]) {
   }
   log_info("SIP listening on UDP %s", listen_addr);
 
-  /* Register callback so all call removals (including timeout aging) fire CALL.HANGUP. */
+  /* Register callback so all call removals (including timeout aging) fire call.hangup. */
   call_set_pre_remove_callback(call_pre_remove_handler);
 
   /* Initialize registration subsystem. */

@@ -1,6 +1,6 @@
 /*
  * Plugin system: spawn external processes, communicate via RESP over stdio.
- * Discovery via COMMAND. Event prefixes: EXTENSION., TRUNK., CALL.
+ * Discovery via command. Event prefixes: extension., trunk., call.
  * Started from AppModule after config load.
  */
 #ifndef UPBX_APPMODULE_PLUGIN_H
@@ -19,7 +19,7 @@ void plugin_stop(void);
  * Returns 0 on success, -1 on transport error. Response is consumed/discarded. */
 int plugin_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv);
 
-/* Check if plugin has registered an event (e.g. "EXTENSION.REGISTER", "CALL.DIALOUT"). */
+/* Check if plugin has registered an event (e.g. "extension.register", "call.dialout"). */
 int plugin_has_event(const char *plugin_name, const char *event_name);
 
 /* Notify all plugins that have this event. Sends RESP array (event_name, arg0, arg1, ...).
@@ -28,24 +28,19 @@ void plugin_notify_event(const char *event_name, int argc, const plugmod_resp_ob
 
 /* --- Query events: plugin response alters PBX behavior --- */
 
-/* EXTENSION.REGISTER: after parsing extension/trunk, before or instead of built-in auth.
- * Args: extension_num, trunk_name, from_user.
- * Returns: *out_allow: -1 = CONTINUE, 0 = DENY, 1 = ALLOW. If ALLOW, *out_custom may be set (caller frees). */
+/* extension.register: after parsing extension/trunk, before or instead of built-in auth.
+ * Input: one map (extension, trunk, from_user). Response: map with action = reject | accept | continue.
+ * Returns: *out_allow: -1 = continue, 0 = reject, 1 = accept. */
 void plugin_query_register(const char *extension_num, const char *trunk_name, const char *from_user,
-  int *out_allow, char **out_custom);
+  int *out_allow);
 
-/* CALL.DIALOUT: outgoing call from extension. Pass cfg, source_ext, destination, call_id, and initial trunk list
- * (from get_group_trunks; may be NULL with n_initial_trunks 0). Returns: 0 = no-edit, 1 = reject (*out_reject_code),
- * 2 = allow (*out_target_override, *out_trunk_override, *out_trunk_override_n). Caller frees *out_target_override
- * and *out_trunk_override (and each element). *out_trunk_override_n: -1 = no override (use group order; pointer NULL),
- * 0 = empty list (no trunks), >0 = that many trunk names. */
+/* call.dialout: outgoing call from extension. Input: one map (source_ext, destination, call_id, trunks). Response: map with action = reject | accept; reject_code (int) when reject; optional destination, trunk when accept. Returns: 0 = no-edit, 1 = reject (*out_reject_code), 2 = accept (*out_target_override, *out_trunk_override, *out_trunk_override_n). Caller frees *out_target_override and *out_trunk_override (and each element). */
 void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *destination, const char *call_id,
   config_trunk **initial_trunks, size_t n_initial_trunks,
   int *out_action, int *out_reject_code, char **out_target_override,
   char ***out_trunk_override, int *out_trunk_override_n);
 
-/* CALL.DIALIN: incoming call from trunk. Args: trunk_name, did, then N extension numbers (targets), then call_id.
- * argc = 3 + n_targets (trunk, did, ext1, ext2, ..., call_id). Returns: 0 = dont-care, 1 = reject (*out_reject_code), 2 = alter (*out_targets = new list of extension numbers, *out_n, caller frees). */
+/* call.dialin: incoming call from trunk. Input: one map (trunk, did, destinations, call_id). Response: map with action = reject | continue | accept; reject_code (int) when reject; optional destinations (array) when accept. Returns: 0 = dont-care, 1 = reject (*out_reject_code), 2 = accept with override (*out_targets, *out_n; caller frees). */
 void plugin_query_dialin(const char *trunk_name, const char *did, const char **target_extensions, size_t n_targets, const char *call_id,
   int *out_action, int *out_reject_code, char ***out_targets, size_t *out_n);
 
