@@ -28,6 +28,9 @@
 #define TRUNK_REG_REFRESH_LEAD     15
 #define TRUNK_REG_MIN_REFRESH      60
 #define SIP_READ_BUF_SIZE          (64 * 1024)
+#ifndef UPBX_VERSION_STR
+#define UPBX_VERSION_STR "0.1.0"
+#endif
 
 /* Per-trunk runtime state (auth from 401, next refresh time; in-flight reg socket) */
 typedef struct {
@@ -100,7 +103,7 @@ static size_t build_register(upbx_config *cfg, config_trunk *trunk, trunk_state_
     sip_build_authorization_digest_value(user, state->auth_realm, state->auth_nonce, uri_str, (const char *)Response, alg, state->auth_opaque, auth_val, sizeof(auth_val));
   }
 
-  const char *ua = (trunk->user_agent && trunk->user_agent[0]) ? trunk->user_agent : "upbx/1.0";
+  const char *ua = (trunk->user_agent && trunk->user_agent[0]) ? trunk->user_agent : "upbx/" UPBX_VERSION_STR;
   size_t req_len = 0;
   char *req = sip_build_register_request(uri_str, via_buf, to_val, from_val, call_id, "1 REGISTER",
     contact_val[0] ? contact_val : NULL, TRUNK_REG_DEFAULT_REFRESH + TRUNK_REG_REFRESH_LEAD, 70, ua,

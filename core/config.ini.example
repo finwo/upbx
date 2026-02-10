@@ -25,7 +25,7 @@ cid = 15559876543
 # overflow_timeout = 30
 # overflow_strategy = none
 # overflow_target =
-# user_agent = upbx/1.0
+# user_agent = upbx/0.1.0
 # group = 1234
 
 [ext:100]

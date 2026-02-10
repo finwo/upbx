@@ -7,6 +7,7 @@ SRC:=
 # UNAME_SYSTEM=$(call lc,$(shell uname -s))
 
 BIN?=upbx
+VERSION?=0.1.0
 
 CC:=gcc
 CPP:=g++
@@ -19,7 +20,7 @@ SRC:=$(filter-out $(wildcard src/test/test_*.c),$(SRC))
 INCLUDES:=
 
 override CFLAGS?=-Wall -O2
-override CFLAGS+=-I src -D INI_HANDLER_LINENO=1
+override CFLAGS+=-I src -D INI_HANDLER_LINENO=1 -D'UPBX_VERSION_STR="$(VERSION)"'
 override LDFLAGS?=
 
 override LDFLAGS+=-lresolv
