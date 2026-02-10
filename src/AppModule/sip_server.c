@@ -673,8 +673,8 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     user_source = "To";
   }
   log_trace("REGISTER: user source=%s, user_buf=\"%s\"", user_source, user_buf[0] ? user_buf : "(empty)");
-  char *raw_uri_user = user_buf[0] ? strdup(user_buf) : NULL;  /* original username (e.g. 206%40finwo) for digest + stored as reg.uri_user */
-  decode_percent_at_inplace(user_buf);  /* support 100%40trunkname same as 100@trunkname */
+  char *raw_uri_user = user_buf[0] ? strdup(user_buf) : NULL;  /* original user part (percent-encoded) for digest + stored as reg.uri_user */
+  decode_percent_at_inplace(user_buf);  /* RFC 3261: user part may contain @ encoded as %40 */
   const char *user = user_buf;
   if (!user[0]) {
     free(raw_uri_user);
