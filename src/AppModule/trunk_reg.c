@@ -166,6 +166,7 @@ static void handle_reg_response(upbx_config *cfg, size_t trunk_idx, char *buf, s
   trunk_state_t *state = &trunk_states[trunk_idx];
   config_trunk *trunk = &cfg->trunks[trunk_idx];
   int status_code = sip_response_status_code(buf, buflen);
+  log_trace("handle_reg_response: trunk=%s status=%d", trunk->name, status_code);
 
   if (status_code == 401 && trunk->password && trunk->password[0]) {
     free(state->auth_nonce);
@@ -176,7 +177,7 @@ static void handle_reg_response(upbx_config *cfg, size_t trunk_idx, char *buf, s
     state->auth_nonce = state->auth_realm = state->auth_algorithm = state->auth_opaque = state->auth_qop = NULL;
     if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm,
             &state->auth_algorithm, &state->auth_opaque, &state->auth_qop)) {
-      log_info("trunk %s: 401 parsed, retrying REGISTER with Digest", trunk->name);
+      log_debug("trunk %s: 401 challenge received, retrying REGISTER with Digest", trunk->name);
       char *req_str = NULL;
       size_t req_len = build_register(cfg, trunk, state, 1, &req_str);
       if (req_len > 0 && req_str && state->reg_res) {
@@ -209,6 +210,7 @@ static void handle_reg_response(upbx_config *cfg, size_t trunk_idx, char *buf, s
 }
 
 void trunk_reg_start(upbx_config *cfg) {
+  log_trace("trunk_reg_start: %zu trunk(s)", cfg ? cfg->trunk_count : 0);
   if (!cfg || cfg->trunk_count == 0) return;
   trunk_reg_cfg = cfg;
   trunk_states_n = cfg->trunk_count;

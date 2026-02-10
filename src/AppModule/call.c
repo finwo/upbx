@@ -49,6 +49,7 @@ static void rtp_close(int *sock) {
 /* ---- Lifecycle ---- */
 
 call_t *call_create(const char *call_id) {
+  log_trace("call_create: %.32s", call_id ? call_id : "");
   call_t *c = calloc(1, sizeof(*c));
   if (!c) return NULL;
   if (call_id)
@@ -70,6 +71,7 @@ call_t *call_find(const char *call_id) {
 
 void call_remove(call_t *call) {
   if (!call) return;
+  log_trace("call_remove: %.32s", call->call_id);
 
   /* Invoke pre-remove callback (e.g. CALL.HANGUP plugin notification). */
   if (pre_remove_cb)
@@ -212,7 +214,7 @@ void call_relay_rtp(fd_set *read_set) {
     /* Log RTP stats every 5 seconds while active. */
     time_t now = time(NULL);
     if (c->rtp_pkts_a2b + c->rtp_pkts_b2a > 0 && now - c->rtp_log_at >= 5) {
-      log_info("RTP: call %.32s A->B=%lu B->A=%lu pkts",
+      log_trace("RTP: call %.32s A->B=%lu B->A=%lu pkts",
                c->call_id, c->rtp_pkts_a2b, c->rtp_pkts_b2a);
       c->rtp_log_at = now;
     }
@@ -225,7 +227,7 @@ void call_age_idle(int timeout_sec) {
   while (c) {
     call_t *next = c->next;
     if (c->rtp_active_at < cutoff && c->created_at < cutoff) {
-      log_info("call: aging idle call %.32s (no RTP for %ds)",
+      log_debug("call: aging idle call %.32s (no RTP for %ds)",
                c->call_id, timeout_sec);
       call_remove(c);
     }

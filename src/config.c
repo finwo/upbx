@@ -340,6 +340,7 @@ void config_last_parse_error(char *section_out, size_t section_size, char *key_o
 }
 
 int config_load(upbx_config *cfg, const char *path) {
+  log_trace("config_load: path=%s", path ? path : "(null)");
   last_parse_section[0] = '\0';
   last_parse_key[0] = '\0';
   int r = ini_parse(path, handler, cfg);
@@ -351,6 +352,7 @@ int config_load(upbx_config *cfg, const char *path) {
 }
 
 int config_compile_trunk_rewrites(upbx_config *cfg) {
+  log_trace("config_compile_trunk_rewrites: %zu trunk(s)", cfg ? cfg->trunk_count : 0);
   if (!cfg || !cfg->trunks) return 0;
   for (size_t i = 0; i < cfg->trunk_count; i++) {
     config_trunk *t = &cfg->trunks[i];
@@ -359,6 +361,7 @@ int config_compile_trunk_rewrites(upbx_config *cfg) {
     if (!re) return -1;
     for (size_t j = 0; j < t->rewrite_count; j++) {
       if (regcomp(&re[j], t->rewrites[j].pattern, REG_EXTENDED) != 0) {
+        log_error("trunk %s: regex compile failed for pattern \"%s\"", t->name, t->rewrites[j].pattern);
         for (size_t k = 0; k < j; k++) regfree(&re[k]);
         free(re);
         return -1;

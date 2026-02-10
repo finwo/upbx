@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "rxi/log.h"
 #include "config.h"
 #include "AppModule/plugin.h"
 #include "PluginModule/plugin.h"
@@ -15,6 +16,7 @@ static const char *event_prefixes[] = { "EXTENSION.", "TRUNK.", "CALL." };
 
 /* Start all plugins from config; uses COMMAND for discovery and EXTENSION./TRUNK./CALL. events. */
 void plugin_start(upbx_config *cfg) {
+  log_trace("plugin_start: entry");
   if (!cfg) return;
   plugmod_config_item *configs = NULL;
   size_t n = 0;
@@ -28,6 +30,7 @@ void plugin_start(upbx_config *cfg) {
     n++;
   }
   plugmod_start(configs, n, "COMMAND", event_prefixes, N_EVENT_PREFIXES);
+  log_info("plugins started (%zu loaded)", plugmod_count());
   free(configs);
 }
 

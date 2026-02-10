@@ -22,18 +22,18 @@ static const char *const daemon_usages[] = {
 static int do_daemonize(void) {
   pid_t pid = fork();
   if (pid < 0) {
-    log_error("fork: %m");
+    log_fatal("fork: %m");
     return -1;
   }
   if (pid > 0)
     _exit(0);
   if (setsid() < 0) {
-    log_error("setsid: %m");
+    log_fatal("setsid: %m");
     _exit(1);
   }
   pid = fork();
   if (pid < 0) {
-    log_error("fork: %m");
+    log_fatal("fork: %m");
     _exit(1);
   }
   if (pid > 0)
@@ -83,7 +83,7 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
   if (config_path && config_path[0]) {
     int r = config_load(&cfg, config_path);
     if (r < 0) {
-      log_error("cannot open config: %s", config_path);
+      log_fatal("cannot open config: %s", config_path);
       return 1;
     }
     if (r > 0) {
@@ -112,7 +112,6 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
 
   log_info("daemon starting");
   plugin_start(&cfg);
-  log_info("plugins started");
 
   void *av[1];
   av[0] = &cfg;

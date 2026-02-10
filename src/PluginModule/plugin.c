@@ -264,6 +264,7 @@ static int do_discovery(plugin_state_t *p) {
 
 void plugmod_start(const plugmod_config_item *configs, size_t n,
   const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes) {
+  log_trace("plugmod_start: %zu plugin configs, discovery=%s", n, discovery_cmd ? discovery_cmd : "(none)");
   discovery_cmd_used = discovery_cmd;
   event_prefixes_used = event_prefixes;
   event_prefixes_n = n_event_prefixes;
@@ -283,11 +284,11 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
     if (spawn_plugin(configs[i].name, configs[i].exec, p) != 0)
       continue;
     if (discovery_cmd_used && do_discovery(p) != 0) {
-      log_warn("plugin %s: discovery failed", p->name);
+      log_error("plugin %s: discovery failed", p->name);
       plugin_state_free(p);
       continue;
     }
-    log_info("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
+    log_debug("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
     plugin_n++;
   }
 }
@@ -329,6 +330,7 @@ int plugmod_invoke_response(const char *plugin_name, const char *method, int arg
 }
 
 int plugmod_invoke(const char *plugin_name, const char *method, int argc, const char **argv) {
+  log_debug("plugin call: %s -> %s (%d args)", plugin_name, method, argc);
   plugmod_resp_object *r = NULL;
   int ret = plugmod_invoke_response(plugin_name, method, argc, argv, &r);
   if (r) plugmod_resp_free(r);
@@ -345,6 +347,7 @@ int plugmod_has_event(const char *plugin_name, const char *event_name) {
 }
 
 void plugmod_notify_event(const char *event_name, int argc, const char **argv) {
+  log_debug("plugin event %s (%d args)", event_name, argc);
   for (size_t i = 0; i < plugin_n; i++) {
     if (!plugmod_has_event(plugins[i].name, event_name)) continue;
     plugmod_invoke(plugins[i].name, event_name, argc, argv);
