@@ -871,7 +871,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
       send_reply(ctx, req_buf, req_len, 403, 0, 0);
       return;
     }
-    /* Use Authorization header username for digest (match siproxd plugin_upbx: client sends e.g. "205@finwo"). */
+    /* Use the username from the Authorization header verbatim for digest verification. */
     if (!verify_digest(req_buf, req_len, "REGISTER", ext->secret, AUTH_REALM, auth_user)) {
       log_warn("REGISTER: 403 Forbidden — digest verification failed for extension %s", extension_num);
       free(raw_uri_user);

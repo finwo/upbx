@@ -7,7 +7,7 @@
 /* Return true if buf[0..len-1] looks like a SIP message (has \r\n\r\n header terminator and min length). */
 bool looks_like_sip(const char *buf, size_t len);
 
-/* Siproxd-style raw checks before parsing. Buffer must be \0-terminated. Returns 1 if ok, 0 to reject. */
+/* Raw checks before parsing. Buffer must be \0-terminated. Returns 1 if ok, 0 to reject. */
 int sip_security_check_raw(char *sip_buffer, size_t size);
 
 /* Parse status code from first line (SIP/2.0 <code> ...). Returns 0 on parse error. */

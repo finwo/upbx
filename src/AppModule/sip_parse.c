@@ -26,7 +26,7 @@ bool looks_like_sip(const char *buf, size_t len) {
   return false;
 }
 
-/* Siproxd security_check_raw: same checks before osip_message_parse. */
+/* Raw security checks before osip_message_parse. */
 int sip_security_check_raw(char *sip_buffer, size_t size) {
   char *p1, *p2;
 

@@ -2,8 +2,6 @@
 
 A standalone minimalist SIP PBX daemon: extension and trunk registration, call routing
 
-**Inspired by [siproxd](https://github.com/hb9xar/siproxd)** — UPBX’s design (built-in RTP relay, SIP proxy behavior, and plugin hooks) draws on siproxd (though heavily modified).
-
 ---
 
 ## Building
@@ -299,3 +297,7 @@ All event names and response `action` values are lower-case. Input and response 
 | `call.dialin` | Incoming call to DID | **Input** (map): `trunk`, `did`, `destinations`, `call_id`. **Response** (map): `action` = `reject` \| `continue` \| `accept`. reject → `reject_code` (integer). accept → optional `destinations` (array; missing or empty = like continue; empty array logs error; one or more = fork list). |
 | `call.answer` | When a call is picked up (dialin) | **Input** (map): `direction`, `call_id`, `source`, `destination`. Event; response ignored. |
 | `call.hangup` | When a call is terminated | **Input** (map): `call_id`, `source`, `destination`, `duration_sec`. Event; response ignored. |
+
+---
+
+*UPBX started as an experiment in handling SIP ourselves; [siproxd](https://github.com/hb9xar/siproxd) was an early inspiration for that.*
