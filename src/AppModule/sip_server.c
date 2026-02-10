@@ -1026,18 +1026,23 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
   char via_val[256];
   sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
 
-  /* Build From value: use just the extension number for clean caller ID. */
+  /* Build From value: only rewrite when caller is an exact local extension.
+   * Pattern-matched callers (e.g. downstream PBX via trunk-server) keep their
+   * original From header to preserve caller identity pass-through. */
   char from_val[384];
   from_val[0] = '\0';
   if (source_str) {
     config_extension *ext_caller = get_extension_config(cfg, source_str);
-    const char *caller_display = (ext_caller && ext_caller->name && ext_caller->name[0]) ? ext_caller->name : NULL;
-    sip_format_from_to_value(caller_display, source_str, via_host, via_port, from_val, sizeof(from_val));
-    /* Preserve original From tag. */
-    char tag_buf[64];
-    tag_buf[0] = '\0';
-    if (sip_header_get_param(req_buf, req_len, "From", "tag", tag_buf, sizeof(tag_buf)) && tag_buf[0])
-      sip_append_tag_param(from_val, sizeof(from_val), tag_buf);
+    if (ext_caller) {
+      const char *caller_display = (ext_caller->name && ext_caller->name[0]) ? ext_caller->name : NULL;
+      sip_format_from_to_value(caller_display, source_str, via_host, via_port, from_val, sizeof(from_val));
+      /* Preserve original From tag. */
+      char tag_buf[64];
+      tag_buf[0] = '\0';
+      if (sip_header_get_param(req_buf, req_len, "From", "tag", tag_buf, sizeof(tag_buf)) && tag_buf[0])
+        sip_append_tag_param(from_val, sizeof(from_val), tag_buf);
+    }
+    /* else: from_val stays empty → original From header passes through unchanged */
   }
 
   /* Chain rewrites on the original INVITE: URI → Via → Contact → From → SDP → body. */
@@ -1236,14 +1241,28 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   size_t ext_match_count = registration_get_regs(NULL, ext_num, &ext_matches);
   ext_reg_t *reg = ext_match_count > 0 ? ext_matches[0] : NULL;
   free(ext_matches);
-  free(ext_num);
+  /* Pattern-aware fallback: if direct lookup failed, find the pattern config
+   * and look up the registration under the pattern's literal number. */
   if (!reg) {
+    config_extension *pat_ext = get_extension_config_match(cfg, ext_num);
+    if (pat_ext && strcmp(pat_ext->number, ext_num) != 0) {
+      ext_matches = NULL;
+      ext_match_count = registration_get_regs(NULL, pat_ext->number, &ext_matches);
+      reg = ext_match_count > 0 ? ext_matches[0] : NULL;
+      free(ext_matches);
+    }
+  }
+  /* Find primary trunk: try registration first, then fall back to prefix-based resolution. */
+  config_trunk *primary_trunk = NULL;
+  if (reg && reg->trunk_name && reg->trunk_name[0])
+    primary_trunk = get_trunk_config(cfg, reg->trunk_name);
+  if (!primary_trunk)
+    primary_trunk = resolve_trunk_for_extension(cfg, ext_num);
+  free(ext_num);
+  if (!reg && !primary_trunk) {
     send_reply(ctx, buf, len, 404, 0, 0);
     return;
   }
-  /* Find primary trunk from registration. */
-  config_trunk *primary_trunk = (reg->trunk_name && reg->trunk_name[0]) ?
-    get_trunk_config(cfg, reg->trunk_name) : NULL;
   if (!primary_trunk) {
     /* Trunk-less extension trying to call externally → no trunk available. */
     log_info("INVITE outgoing: ext %s has no trunk, rejecting external call", from_user);
@@ -1455,7 +1474,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   log_trace("handle_invite: To=%s From=%s Call-ID=%.32s", to_user[0] ? to_user : "(null)", from_user[0] ? from_user : "(null)", call_id);
 
   /* --- 1. From a known extension --- */
-  if (from_ext[0] && get_extension_config(cfg, from_ext)) {
+  if (from_ext[0] && get_extension_config_match(cfg, from_ext)) {
     char *ext_num = strdup(from_ext);
     if (!ext_num) {
       send_reply(ctx, buf, len, 503, 0, 0);
@@ -1531,6 +1550,17 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     size_t dmc = registration_get_regs(NULL, ext_num, &dm);
     ext_reg_t *reg = dmc > 0 ? dm[0] : NULL;
     free(dm);
+    /* Pattern-aware fallback: if direct lookup failed, find the pattern config
+     * and look up the registration under the pattern's literal number. */
+    if (!reg) {
+      config_extension *pat_ext = get_extension_config_match(cfg, ext_num);
+      if (pat_ext && strcmp(pat_ext->number, ext_num) != 0) {
+        dm = NULL;
+        dmc = registration_get_regs(NULL, pat_ext->number, &dm);
+        reg = dmc > 0 ? dm[0] : NULL;
+        free(dm);
+      }
+    }
     const char *trunk_name = reg && reg->trunk_name ? reg->trunk_name : "";
     const char *destination = to_user[0] ? to_user : "";
     char *target_override = NULL;
@@ -1670,6 +1700,73 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     return;
   }
 
+  /* --- 2b. Trunk with filter_incoming=0: accept any number matching a registered extension --- */
+  if (to_user[0]) {
+    /* Find a trunk with filter_incoming=0 (the one that allowed this call through). */
+    config_trunk *fi_trunk = NULL;
+    for (size_t i = 0; i < cfg->trunk_count; i++) {
+      if (!cfg->trunks[i].filter_incoming) {
+        fi_trunk = &cfg->trunks[i];
+        break;
+      }
+    }
+    config_extension *match_ext = fi_trunk ? get_extension_config_match(cfg, to_user) : NULL;
+    if (fi_trunk && match_ext) {
+      /* Determine destination extension's group for cross-group check. */
+      config_trunk *ext_trunk = resolve_trunk_for_extension(cfg, match_ext->number);
+      const char *fi_prefix  = fi_trunk->group_prefix  ? fi_trunk->group_prefix  : "";
+      const char *ext_prefix = ext_trunk && ext_trunk->group_prefix ? ext_trunk->group_prefix : "";
+      int same_group = (cfg->locality == 0) || (strcmp(fi_prefix, ext_prefix) == 0);
+      if (!same_group && !cfg->cross_group_calls) {
+        log_info("incoming call to %s blocked: cross-group not allowed (trunk %s group '%s', ext group '%s')",
+                 to_user, fi_trunk->name, fi_prefix, ext_prefix);
+        send_reply(ctx, buf, len, 403, 0, 0);
+        return;
+      }
+      /* Route to the destination extension's group. */
+      config_trunk *route_trunk = ext_trunk ? ext_trunk : fi_trunk;
+      ext_reg_t **exts = NULL;
+      size_t n_ext = get_group_regs(cfg, route_trunk, &exts);
+      log_info("new call: incoming from %s to %s (trunk %s filter_incoming=0, %zu target(s))",
+               from_user[0] ? from_user : "(external)", to_user, fi_trunk->name, n_ext);
+      if (plugin_count() > 0 && n_ext > 0 && exts) {
+        const char **ext_numbers = (const char **)malloc(n_ext * sizeof(const char *));
+        if (ext_numbers) {
+          for (size_t i = 0; i < n_ext; i++) ext_numbers[i] = exts[i]->number;
+          int action = 0;
+          int reject_code = 403;
+          char **override_targets = NULL;
+          size_t n_override = 0;
+          log_debug("CALL.DIALIN: querying plugins (filter_incoming=0) for %s on trunk %s, call=%.32s", to_user, fi_trunk->name, call_id);
+          plugin_query_dialin(fi_trunk->name, to_user, ext_numbers, n_ext, call_id,
+            &action, &reject_code, &override_targets, &n_override);
+          free(ext_numbers);
+          if (action == 1) {
+            log_info("CALL.DIALIN: plugin rejected incoming call to %s (code %d)", to_user, reject_code);
+            free(exts);
+            send_reply(ctx, buf, len, reject_code, 0, 0);
+            return;
+          }
+          if (action == 2 && override_targets && n_override > 0) {
+            log_info("CALL.DIALIN: plugin overrode targets for %s (%zu target(s))", to_user, n_override);
+            free(exts);
+            handle_invite_incoming(cfg, buf, len, ctx, to_user, (const char **)override_targets, n_override);
+            for (size_t i = 0; i < n_override; i++) free(override_targets[i]);
+            free(override_targets);
+            return;
+          }
+          if (override_targets) {
+            for (size_t i = 0; i < n_override; i++) free(override_targets[i]);
+            free(override_targets);
+          }
+        }
+      }
+      if (exts) free(exts);
+      handle_invite_incoming(cfg, buf, len, ctx, to_user, NULL, 0);
+      return;
+    }
+  }
+
   /* --- 3. Fallback: from_user with @, extension prefix match → outgoing --- */
   if (from_user[0]) {
     const char *at = strchr(from_user, '@');
@@ -1678,7 +1775,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     if (ext_num) {
       memcpy(ext_num, from_user, ext_len);
       ext_num[ext_len] = '\0';
-      if (get_extension_config(cfg, ext_num)) {
+      if (get_extension_config_match(cfg, ext_num)) {
         free(ext_num);
         handle_invite_outgoing(cfg, buf, len, ctx, from_user);
         return;

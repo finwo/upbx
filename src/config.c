@@ -51,6 +51,7 @@ static config_trunk *find_or_add_trunk(upbx_config *cfg, const char *name) {
   config_trunk *t = &cfg->trunks[old];
   memset(t, 0, sizeof(*t));
   t->name = STRDUP(name);
+  /* filter_incoming defaults to 0 (accept any matching extension) via memset */
   if (!t->name) { cfg->trunk_count = old; return NULL; }
   return t;
 }
@@ -250,6 +251,10 @@ static int handler(void *user, const char *section, const char *name, const char
     if (strcmp(key, "group") == 0) {
       free(t->group_prefix);
       t->group_prefix = STRDUP(val);
+      return 1;
+    }
+    if (strcmp(key, "filter_incoming") == 0) {
+      t->filter_incoming = (atoi(val) != 0) ? 1 : 0;
       return 1;
     }
     log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);

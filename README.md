@@ -152,6 +152,7 @@ cid = 15559876543
 # overflow_target =
 # user_agent = upbx/1.0
 # group = 1234
+# filter_incoming = 0
 
 [ext:100]
 # name = Front desk
@@ -200,6 +201,7 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `overflow_target` | Target number for `overflow_strategy = include` or `redirect`. |
 | `user_agent` | Custom User-Agent for trunk registration. |
 | `group` | **Group prefix for locality.** Trunks with the same `group` value form a locality group. Extensions whose number starts with this prefix and has at least `len(group) + locality` digits belong to this group. Incoming DID calls ring all extensions in the group. Outgoing calls use the first available trunk in the group (config order), with fallback. E.g. `group = 1234`, `locality = 4`: extension `12341000` belongs to this group. |
+| `filter_incoming` | `0` (default) = accept any incoming number that matches a registered extension (exact or pattern). `1` = only accept incoming calls to registered DIDs on this trunk. Set to `1` if you want to restrict a trunk to only its configured DIDs. Cross-group restrictions (`cross_group_calls`) still apply. |
 
 ### `[ext:number]`
 
