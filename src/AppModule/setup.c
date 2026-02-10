@@ -2,6 +2,7 @@
 #include "AppModule/command/daemon.h"
 #include "AppModule/command/extension.h"
 #include "AppModule/command/trunk.h"
+#include "AppModule/command/api_user.h"
 #include "AppModule/command/completion.h"
 #include "CliModule/register_command.h"
 
@@ -20,6 +21,11 @@ void appmodule_setup(void) {
     "trunk",
     "Manage trunks (list/add/remove)",
     appmodule_cmd_trunk
+  );
+  climodule_register_command(
+    "api-user",
+    "Manage API users (list/add/remove)",
+    appmodule_cmd_api_user
   );
   climodule_register_command(
     "completion",

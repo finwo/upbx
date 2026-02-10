@@ -9,7 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#include "AppModule/sdp_parse.h"
+#include "AppModule/util/sdp_parse.h"
 
 /* ---- Internal helpers ---- */
 

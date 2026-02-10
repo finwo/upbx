@@ -94,7 +94,7 @@ TEST_BINS:=test_md5 test_sdp_parse test_sip_parse test_config test_digest_auth
 test_md5: src/test/test_md5.o src/common/md5.o
 	$(CC) $^ $(CFLAGS) -o $@
 
-test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/sdp_parse.o
+test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/util/sdp_parse.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o lib/rxi/log/src/log.o

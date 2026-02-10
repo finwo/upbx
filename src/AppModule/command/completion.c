@@ -5,6 +5,7 @@
  *   upbx completion zsh           -- output zsh completion script
  *   upbx completion _extensions   -- list extension numbers (for completion)
  *   upbx completion _trunks       -- list trunk names (for completion)
+ *   upbx completion _api_users    -- list API usernames (for completion)
  *
  * Install:
  *   eval "$(upbx completion bash)"
@@ -39,6 +40,20 @@ static int output_trunks(void) {
   for (size_t i = 0; i < c.trunk_count; i++) {
     if (c.trunks[i].name)
       printf("%s\n", c.trunks[i].name);
+  }
+  config_free(&c);
+  return 0;
+}
+
+static int output_api_users(void) {
+  const char *config_path = cli_config_path();
+  if (!config_path) return 0;
+  upbx_config c;
+  config_init(&c);
+  if (config_load(&c, config_path) != 0) { config_free(&c); return 0; }
+  for (size_t i = 0; i < c.api.user_count; i++) {
+    if (c.api.users[i].username)
+      printf("%s\n", c.api.users[i].username);
   }
   config_free(&c);
   return 0;
@@ -80,7 +95,7 @@ static void output_bash(void) {
     "\n"
     "  # Top-level: commands and global flags\n"
     "  if [ -z \"$cmd\" ]; then\n"
-    "    COMPREPLY=( $(compgen -W \"daemon extension trunk completion list-commands -f\" -- \"$cur\") )\n"
+    "    COMPREPLY=( $(compgen -W \"daemon extension trunk api-user completion list-commands -f\" -- \"$cur\") )\n"
     "    return 0\n"
     "  fi\n"
     "\n"
@@ -89,6 +104,7 @@ static void output_bash(void) {
     "    case \"$cmd\" in\n"
     "      extension) COMPREPLY=( $(compgen -W \"list add remove rm\" -- \"$cur\") );;\n"
     "      trunk)     COMPREPLY=( $(compgen -W \"list add remove rm\" -- \"$cur\") );;\n"
+    "      api-user)  COMPREPLY=( $(compgen -W \"list add remove rm\" -- \"$cur\") );;\n"
     "      daemon)    COMPREPLY=( $(compgen -W \"-d -D --daemonize --no-daemonize\" -- \"$cur\") );;\n"
     "      completion) COMPREPLY=( $(compgen -W \"bash zsh\" -- \"$cur\") );;\n"
     "    esac\n"
@@ -114,6 +130,15 @@ static void output_bash(void) {
     "        remove|rm)\n"
     "          local trunks=$(upbx $f_flag completion _trunks 2>/dev/null)\n"
     "          COMPREPLY=( $(compgen -W \"$trunks\" -- \"$cur\") );;\n"
+    "      esac;;\n"
+    "    api-user)\n"
+    "      case \"$subcmd\" in\n"
+    "        add)\n"
+    "          if [ \"$prev\" = \"--permit\" ]; then return 0; fi\n"
+    "          COMPREPLY=( $(compgen -W \"--permit\" -- \"$cur\") );;\n"
+    "        remove|rm)\n"
+    "          local api_users=$(upbx $f_flag completion _api_users 2>/dev/null)\n"
+    "          COMPREPLY=( $(compgen -W \"$api_users\" -- \"$cur\") );;\n"
     "      esac;;\n"
     "  esac\n"
     "  return 0\n"
@@ -143,6 +168,7 @@ static void output_zsh(void) {
     "    'daemon:Run the UPBX daemon'\n"
     "    'extension:Manage extensions'\n"
     "    'trunk:Manage trunks'\n"
+    "    'api-user:Manage API users'\n"
     "    'completion:Output shell completion script'\n"
     "    'list-commands:List available commands'\n"
     "  )\n"
@@ -206,6 +232,27 @@ static void output_zsh(void) {
     "            esac\n"
     "          fi\n"
     "          ;;\n"
+    "        api-user)\n"
+    "          local -a api_user_subcmds\n"
+    "          api_user_subcmds=(list add remove rm)\n"
+    "          if (( CURRENT == 2 )); then\n"
+    "            _describe -t subcmds 'api-user subcommand' api_user_subcmds\n"
+    "          else\n"
+    "            case $line[2] in\n"
+    "              add)\n"
+    "                _arguments \\\n"
+    "                  '*--permit[Permit pattern]:pattern:' \\\n"
+    "                  '1:username:' \\\n"
+    "                  '2:secret:'\n"
+    "                ;;\n"
+    "              remove|rm)\n"
+    "                local -a api_users\n"
+    "                api_users=(${(f)\"$(upbx $f_flag completion _api_users 2>/dev/null)\"})\n"
+    "                _describe -t api_users 'API username' api_users\n"
+    "                ;;\n"
+    "            esac\n"
+    "          fi\n"
+    "          ;;\n"
     "        daemon)\n"
     "          _arguments \\\n"
     "            '-d[Run in background]' \\\n"
@@ -242,6 +289,8 @@ int appmodule_cmd_completion(int argc, const char **argv) {
     return output_extensions();
   if (strcmp(argv[1], "_trunks") == 0)
     return output_trunks();
+  if (strcmp(argv[1], "_api_users") == 0)
+    return output_api_users();
 
   fprintf(stderr, "Unknown shell: %s (supported: bash, zsh)\n", argv[1]);
   return 1;

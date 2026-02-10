@@ -63,9 +63,9 @@ After starting, the daemon loads config, starts the built-in RTP relay, spawns a
 
 ---
 
-## Managing extensions and trunks
+## Managing extensions, trunks, and API users
 
-Extensions and trunks can be managed from the CLI without manually editing the config file. The `-f` flag is a global option (see above); if omitted, the default config locations are searched.
+Extensions, trunks, and API users can be managed from the CLI without manually editing the config file. The `-f` flag is a global option (see above); if omitted, the default config locations are searched.
 
 ```bash
 # List extensions
@@ -89,6 +89,16 @@ Extensions and trunks can be managed from the CLI without manually editing the c
 ./upbx trunk remove mycarrier
 # or: ./upbx trunk rm mycarrier
 
+# List API users
+./upbx api-user list
+
+# Add an API user (username and secret are positional, --permit can repeat)
+./upbx api-user add --permit "metrics.*" --permit "ping" monitoring mon-pass
+
+# Remove an API user
+./upbx api-user remove monitoring
+# or: ./upbx api-user rm monitoring
+
 # Explicit config file
 ./upbx -f /etc/upbx.conf extension list
 ```
@@ -97,7 +107,7 @@ Extensions and trunks can be managed from the CLI without manually editing the c
 
 ## Shell completion
 
-Enable tab completion for bash or zsh. The completion scripts are context-aware and will offer extension numbers and trunk names from the config when completing `remove`/`rm` arguments.
+Enable tab completion for bash or zsh. The completion scripts are context-aware and will offer extension numbers, trunk names, and API usernames from the config when completing `remove`/`rm` arguments.
 
 ```bash
 # Bash
@@ -162,6 +172,23 @@ secret = my-secret
 # Register as literal "08540xxx" to receive calls matching this pattern.
 [ext:08540xxx]
 secret = trunk-secret
+
+[api]
+listen = 127.0.0.1:6380
+
+[api:admin]
+secret = my-password
+permit = *
+
+# [api:monitoring]
+# secret = mon-pass
+# permit = metrics.*
+
+[api:*]
+# anonymous access (no AUTH needed)
+# these permits are inherited by ALL users (anonymous + logged-in)
+permit = ping
+permit = metrics.get
 ```
 
 ### `[upbx]`
@@ -218,6 +245,46 @@ Extensions register using their extension number (e.g. `100`). Trunk assignment 
 - **`locality > 0`:** Trunks with the same `group` prefix form locality groups. Extensions matching a group prefix belong to that group. Short-dialing within the group works automatically.
 - **CID:** Outgoing calls use the selected trunk’s `cid` and `cid_name` in the From header (if configured).
 - **Pattern extensions:** `[ext:08540xxx]` matches any number where `08540` is literal and each `x` matches any single digit (0–9). Exact extension matches always take priority. Register using the full pattern string (e.g. `08540xxx` as the SIP username). Useful for upbx-as-trunk-server setups where downstream PBX instances register as pattern extensions.
+
+### `[api]`
+
+Optional section. When `listen` is set, a TCP server starts speaking the RESP2 (Redis) protocol. Connect with `redis-cli` or any Redis client library. Other modules register their commands with this API server (e.g. metrics exposes `metrics.*` commands).
+
+| Option | Description |
+|--------|-------------|
+| `listen` | TCP listen address (e.g. `127.0.0.1:6380`). Required to enable the API server. |
+
+### `[api:username]`
+
+Define API credentials and permissions. Each section creates a user that can authenticate via `AUTH username password`. Use `[api:*]` to define permissions for anonymous (unauthenticated) connections. Permissions granted to `[api:*]` are inherited by all users, so baseline commands only need to be permitted once.
+
+| Option | Description |
+|--------|-------------|
+| `secret` | Password for this user. |
+| `permit` | Repeatable. Command pattern this user is allowed to execute. `*` matches everything, `metrics.*` matches all commands starting with `metrics.`, exact match otherwise. |
+
+**Built-in commands** (`auth`, `ping`, `quit`, `command`) are always allowed regardless of permits. The `command` command lists only the commands the current user has access to.
+
+**Metrics commands** (registered by the metrics module):
+
+| Command | Response |
+|---------|----------|
+| `AUTH username password` | `+OK` or `-ERR invalid credentials` |
+| `PING` | `+PONG` |
+| `QUIT` | `+OK`, closes connection |
+| `COMMAND` | List of commands accessible to the current user |
+| `METRICS.KEYS` | `["calls", "extensions", "trunks", "load"]` |
+| `METRICS.LLEN key` | Integer count of items in the list |
+| `METRICS.LRANGE key start stop` | Array of elements (each element is a flat array of alternating key-value pairs) |
+| `METRICS.GET load:1` | Average active calls over the last 1 minute |
+| `METRICS.GET load:5` | Average active calls over the last 5 minutes |
+| `METRICS.GET load:15` | Average active calls over the last 15 minutes |
+
+**List keys and their fields:**
+
+- **calls**: `call_id`, `direction`, `source`, `destination`, `trunk`, `answered`, `created_at`, `answered_at`, `forks`, `pending`
+- **extensions**: `number`, `name`, `registered`, `contact`, `trunk`, `expires`
+- **trunks**: `name`, `host`, `port`, `available`, `group_prefix`, `cid`, `cid_name`, `did_count`, `filter_incoming`
 
 ## Plugin events
 

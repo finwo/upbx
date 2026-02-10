@@ -28,9 +28,11 @@
 #include "AppModule/sip_server.h"
 #include "AppModule/trunk_reg.h"
 #include "AppModule/sip_parse.h"
-#include "AppModule/sdp_parse.h"
+#include "AppModule/util/sdp_parse.h"
 #include "AppModule/call.h"
 #include "AppModule/registration.h"
+#include "AppModule/service/api.h"
+#include "AppModule/service/metrics.h"
 
 #define SIP_READ_BUF_SIZE  (64 * 1024)
 #define AUTH_REALM         "upbx"
@@ -438,6 +440,8 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
  * including timeout aging (which previously bypassed notifications). */
 static void call_pre_remove_handler(call_t *call) {
   if (!call) return;
+  if (call->answered)
+    metrics_call_inactive();
   int duration = 0;
   if (call->answered && call->answered_at > 0)
     duration = (int)(time(NULL) - call->answered_at);
@@ -1970,6 +1974,7 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
     log_debug("call answered: %.32s by %s", call_id_buf, callee_num ? callee_num : "?");
     call->answered = 1;
     call->answered_at = time(NULL);
+    metrics_call_active();
     memcpy(&call->b.sip_addr, &ctx->peer, sizeof(ctx->peer));
     call->b.sip_len = ctx->peerlen;
     if (callee_num) {
@@ -2279,10 +2284,14 @@ void daemon_root(int argc, void *argv[]) {
   notify_extension_and_trunk_lists(cfg);
 
   trunk_reg_start(cfg);
+  api_start(cfg);
+  metrics_init(cfg);
 
   PT_INIT(&pt_overflow);
   struct pt pt_trunk_reg;
   PT_INIT(&pt_trunk_reg);
+  struct pt pt_api;
+  PT_INIT(&pt_api);
 
   char buf[SIP_READ_BUF_SIZE];
   struct sockaddr_storage peer;
@@ -2295,6 +2304,7 @@ void daemon_root(int argc, void *argv[]) {
     int maxfd = sockfd;
     call_fill_rtp_fds(&r, &maxfd);
     trunk_reg_fill_fds(&r, &maxfd);
+    api_fill_fds(&r, &maxfd);
 
     struct timeval tv = { 0, 50000 }; /* 50ms */
     int n = select(maxfd + 1, &r, NULL, NULL, &tv);
@@ -2333,6 +2343,8 @@ void daemon_root(int argc, void *argv[]) {
     }
     PT_SCHEDULE(overflow_pt(&pt_overflow, cfg, sockfd));
     PT_SCHEDULE(trunk_reg_pt(&pt_trunk_reg, cfg));
+    PT_SCHEDULE(api_pt(&pt_api, &r, cfg));
+    metrics_tick();
     call_age_idle(120); /* remove calls with no RTP for 2 minutes */
   }
 }

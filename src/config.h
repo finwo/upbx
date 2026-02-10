@@ -42,6 +42,19 @@ typedef struct {
   char *secret;
 } config_extension;
 
+typedef struct {
+  char *username;     /* from section name; "*" = anonymous */
+  char *secret;       /* password */
+  char **permits;     /* array of permit patterns (e.g. "metrics.*") */
+  size_t permit_count;
+} config_api_user;
+
+typedef struct {
+  char *listen;         /* e.g. "127.0.0.1:6380"; NULL = API disabled */
+  config_api_user *users;
+  size_t user_count;
+} config_api;
+
 struct upbx_config {
   int locality;       /* 0 = disabled */
   int daemonize;      /* 0 or 1 */
@@ -59,6 +72,8 @@ struct upbx_config {
 
   config_extension *extensions;
   size_t extension_count;
+
+  config_api api;
 };
 
 /* Load config from file. Returns 0 on success, -1 on file error, >0 line number of first parse error. */

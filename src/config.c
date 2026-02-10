@@ -261,6 +261,50 @@ static int handler(void *user, const char *section, const char *name, const char
     return 1;
   }
 
+  if (strcmp(sec, "api") == 0) {
+    if (strcmp(key, "listen") == 0) {
+      free(cfg->api.listen);
+      cfg->api.listen = STRDUP(val);
+      return 1;
+    }
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
+    return 1;
+  }
+
+  if (PREFIX_MATCH(sec, "api:")) {
+    const char *uname = SECTION_TAIL(sec, "api:");
+    /* Find or create user entry */
+    config_api_user *u = NULL;
+    for (size_t i = 0; i < cfg->api.user_count; i++) {
+      if (strcmp(cfg->api.users[i].username, uname) == 0) { u = &cfg->api.users[i]; break; }
+    }
+    if (!u) {
+      size_t old = cfg->api.user_count++;
+      cfg->api.users = (config_api_user *)realloc(cfg->api.users, cfg->api.user_count * sizeof(config_api_user));
+      if (!cfg->api.users) { cfg->api.user_count = old; set_last_parse_error(sec, key); return 0; }
+      u = &cfg->api.users[old];
+      memset(u, 0, sizeof(*u));
+      u->username = STRDUP(uname);
+      if (!u->username) { cfg->api.user_count = old; set_last_parse_error(sec, key); return 0; }
+    }
+    if (strcmp(key, "secret") == 0) {
+      free(u->secret);
+      u->secret = STRDUP(val);
+      return 1;
+    }
+    if (strcmp(key, "permit") == 0) {
+      char **p = (char **)realloc(u->permits, (u->permit_count + 1) * sizeof(char *));
+      if (!p) { set_last_parse_error(sec, key); return 0; }
+      u->permits = p;
+      u->permits[u->permit_count] = STRDUP(val);
+      if (!u->permits[u->permit_count]) { set_last_parse_error(sec, key); return 0; }
+      u->permit_count++;
+      return 1;
+    }
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
+    return 1;
+  }
+
   if (PREFIX_MATCH(sec, "ext:")) {
     config_extension *e = find_or_add_extension(cfg, SECTION_TAIL(sec, "ext:"));
     if (!e) { set_last_parse_error(sec, key); return 0; }
@@ -338,6 +382,17 @@ void config_free(upbx_config *cfg) {
     free(cfg->extensions[i].secret);
   }
   free(cfg->extensions);
+
+  free(cfg->api.listen);
+  for (size_t i = 0; i < cfg->api.user_count; i++) {
+    config_api_user *u = &cfg->api.users[i];
+    free(u->username);
+    free(u->secret);
+    for (size_t j = 0; j < u->permit_count; j++)
+      free(u->permits[j]);
+    free(u->permits);
+  }
+  free(cfg->api.users);
 
   config_init(cfg);
 }
