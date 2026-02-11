@@ -1,0 +1,7 @@
+#!/bin/sh
+# stderr -> stdout; if logger exists, pipe combined output to system logger
+if command -v logger >/dev/null 2>&1; then
+  upbx daemon -D 2>&1 | logger -t upbx
+else
+  exec upbx daemon -D 2>&1
+fi

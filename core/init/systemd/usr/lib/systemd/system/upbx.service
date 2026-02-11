@@ -1,0 +1,20 @@
+[Unit]
+Description=upbx SIP PBX daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/upbx daemon -D
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=upbx
+Restart=on-failure
+RestartSec=5
+
+# Optional: uncomment and set for stricter confinement
+# User=upbx
+# Group=upbx
+
+[Install]
+WantedBy=multi-user.target
