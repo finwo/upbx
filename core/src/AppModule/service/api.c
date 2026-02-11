@@ -24,6 +24,7 @@
 #include "common/pt.h"
 #include "common/socket_util.h"
 #include "config.h"
+#include "PluginModule/plugin.h"
 #include "AppModule/service/api.h"
 
 /* Constants */
@@ -37,7 +38,7 @@
 
 struct api_client {
   int       fd;
-  config_api_user *user;   /* authenticated user (NULL = anonymous/[api:*]) */
+  char     *username;       /* authenticated username (NULL or "" = anonymous [api:*]) */
   char      rbuf[READ_BUF_SIZE];
   size_t    rlen;           /* bytes in read buffer */
   char     *wbuf;
@@ -54,10 +55,11 @@ typedef struct {
 
 /* Module state */
 
-static int              listen_fd = -1;
+static int       listen_fd = -1;
+static char     *current_listen = NULL;    /* current bind address for 60s rebind check */
+static time_t   next_listen_check = 0;    /* next time to check config api listen */
 static struct api_client clients[API_MAX_CLIENTS];
 static struct hashmap  *cmd_map = NULL;
-static config_api_user *anon_user = NULL;  /* [api:*] user, may be NULL */
 
 /* Write helpers */
 
@@ -164,7 +166,8 @@ static void client_close(struct api_client *c) {
   c->wbuf = NULL;
   c->wlen = c->wcap = 0;
   c->rlen = 0;
-  c->user = NULL;
+  free(c->username);
+  c->username = NULL;
 }
 
 static void client_flush(struct api_client *c) {
@@ -280,21 +283,33 @@ static bool permit_matches(const char *pattern, const char *cmd) {
   return strcasecmp(pattern, cmd) == 0;
 }
 
-/* Check if a user has permission for a command.
- * Checks user's own permits + anonymous user's permits (effective permissions). */
-static bool user_has_permit(config_api_user *user, const char *cmd) {
-  /* Check user's own permits */
-  if (user) {
-    for (size_t i = 0; i < user->permit_count; i++) {
-      if (permit_matches(user->permits[i], cmd))
-        return true;
+/* Check if client has permission for a command. Uses live config: api:<username> and api:* permit keys. */
+static bool user_has_permit(api_client_t *c, const char *cmd) {
+  char section[128];
+  const char *uname = (c->username && c->username[0]) ? c->username : "*";
+  snprintf(section, sizeof(section), "api:%s", uname);
+  plugmod_resp_object *permits = config_key_get(section, "permit");
+  if (permits && permits->type == PLUGMOD_RESPT_ARRAY) {
+    for (size_t i = 0; i < permits->u.arr.n; i++) {
+      if (permits->u.arr.elem[i].type == PLUGMOD_RESPT_BULK && permits->u.arr.elem[i].u.s &&
+          permit_matches(permits->u.arr.elem[i].u.s, cmd))
+        { plugmod_resp_free(permits); return true; }
     }
+    plugmod_resp_free(permits);
+  } else if (permits) {
+    plugmod_resp_free(permits);
   }
-  /* Check anonymous user's permits (inherited by all) */
-  if (anon_user && anon_user != user) {
-    for (size_t i = 0; i < anon_user->permit_count; i++) {
-      if (permit_matches(anon_user->permits[i], cmd))
-        return true;
+  if (strcmp(uname, "*") != 0) {
+    plugmod_resp_object *anon = config_key_get("api:*", "permit");
+    if (anon && anon->type == PLUGMOD_RESPT_ARRAY) {
+      for (size_t i = 0; i < anon->u.arr.n; i++) {
+        if (anon->u.arr.elem[i].type == PLUGMOD_RESPT_BULK && anon->u.arr.elem[i].u.s &&
+            permit_matches(anon->u.arr.elem[i].u.s, cmd))
+          { plugmod_resp_free(anon); return true; }
+      }
+      plugmod_resp_free(anon);
+    } else if (anon) {
+      plugmod_resp_free(anon);
     }
   }
   return false;
@@ -325,31 +340,30 @@ void api_register_cmd(const char *name, api_cmd_func func) {
 
 /* Built-in command handlers */
 
-static bool cmdAUTH(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
+static bool cmdAUTH(api_client_t *c, char **args, int nargs) {
   if (nargs != 3) {
     return api_write_err(c, "wrong number of arguments for 'auth' command (AUTH username password)");
   }
   const char *uname = args[1];
   const char *pass  = args[2];
-
-  /* Find matching user (not anonymous) */
-  for (size_t i = 0; i < cfg->api.user_count; i++) {
-    config_api_user *u = &cfg->api.users[i];
-    if (strcmp(u->username, "*") == 0) continue; /* skip anonymous */
-    if (strcmp(u->username, uname) == 0) {
-      if (u->secret && strcmp(u->secret, pass) == 0) {
-        c->user = u;
-        log_debug("api: client authenticated as '%s'", uname);
-        return api_write_ok(c);
-      }
-      return api_write_err(c, "invalid credentials");
+  char section[128];
+  snprintf(section, sizeof(section), "api:%s", uname);
+  plugmod_resp_object *secret_obj = config_key_get(section, "secret");
+  const char *secret = (secret_obj && (secret_obj->type == PLUGMOD_RESPT_BULK || secret_obj->type == PLUGMOD_RESPT_SIMPLE)) ? secret_obj->u.s : NULL;
+  if (secret && pass && strcmp(secret, pass) == 0) {
+    free(c->username);
+    c->username = strdup(uname);
+    if (c->username) {
+      plugmod_resp_free(secret_obj);
+      log_debug("api: client authenticated as '%s'", uname);
+      return api_write_ok(c);
     }
   }
+  if (secret_obj) plugmod_resp_free(secret_obj);
   return api_write_err(c, "invalid credentials");
 }
 
-static bool cmdPING(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
-  (void)cfg;
+static bool cmdPING(api_client_t *c, char **args, int nargs) {
   if (nargs == 1)
     return api_write_cstr(c, "+PONG\r\n");
   if (nargs == 2)
@@ -357,14 +371,14 @@ static bool cmdPING(api_client_t *c, struct upbx_config *cfg, char **args, int n
   return api_write_err(c, "wrong number of arguments for 'ping' command");
 }
 
-static bool cmdQUIT(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
-  (void)cfg; (void)args; (void)nargs;
+static bool cmdQUIT(api_client_t *c, char **args, int nargs) {
+  (void)args; (void)nargs;
   api_write_ok(c);
   return false; /* signal close */
 }
 
-static bool cmdCOMMAND(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
-  (void)cfg; (void)args; (void)nargs;
+static bool cmdCOMMAND(api_client_t *c, char **args, int nargs) {
+  (void)args; (void)nargs;
   if (!cmd_map)
     return api_write_array(c, 0);
 
@@ -374,19 +388,16 @@ static bool cmdCOMMAND(api_client_t *c, struct upbx_config *cfg, char **args, in
   void *item;
   while (hashmap_iter(cmd_map, &iter, &item)) {
     const api_cmd_entry *e = item;
-    if (user_has_permit(c->user, e->name))
+    if (user_has_permit(c, e->name))
       count++;
   }
 
-  /* Always include the built-ins */
-  /* (auth, quit, command are always allowed but may not be in the permit list) */
-  /* We list all commands the user can use */
   if (!api_write_array(c, count)) return false;
 
   iter = 0;
   while (hashmap_iter(cmd_map, &iter, &item)) {
     const api_cmd_entry *e = item;
-    if (user_has_permit(c->user, e->name)) {
+    if (user_has_permit(c, e->name)) {
       if (!api_write_bulk_cstr(c, e->name)) return false;
     }
   }
@@ -410,7 +421,7 @@ static bool is_builtin(const char *name) {
           strcasecmp(name, "command") == 0);
 }
 
-static void dispatch_command(struct api_client *c, struct upbx_config *cfg, char **args, int nargs) {
+static void dispatch_command(struct api_client *c, char **args, int nargs) {
   if (nargs <= 0) return;
 
   /* Lowercase the command name */
@@ -422,16 +433,15 @@ static void dispatch_command(struct api_client *c, struct upbx_config *cfg, char
     return;
   }
 
-  /* Built-ins (auth, quit, command) are always allowed */
+  /* Built-ins (auth, ping, quit, command) are always allowed */
   if (!is_builtin(args[0])) {
-    /* Check permission */
-    if (!user_has_permit(c->user, args[0])) {
+    if (!user_has_permit(c, args[0])) {
       api_write_err(c, "no permission");
       return;
     }
   }
 
-  if (!cmd->func(c, cfg, args, nargs)) {
+  if (!cmd->func(c, args, nargs)) {
     /* handler returned false = close connection */
     client_flush(c);
     client_close(c);
@@ -513,13 +523,12 @@ static void accept_connection(void) {
   } else {
     client_init(&clients[slot]);
     clients[slot].fd = fd;
-    /* Anonymous user starts with [api:*] permissions */
-    clients[slot].user = anon_user;
+    clients[slot].username = NULL; /* anonymous until AUTH */
     log_trace("api: accepted connection (slot %d)", slot);
   }
 }
 
-static void process_client(struct api_client *c, fd_set *read_set, struct upbx_config *cfg) {
+static void process_client(struct api_client *c, fd_set *read_set) {
   if (c->fd < 0) return;
 
   if (!FD_ISSET(c->fd, read_set)) {
@@ -544,7 +553,7 @@ static void process_client(struct api_client *c, fd_set *read_set, struct upbx_c
   int nargs;
   int rc;
   while (c->fd >= 0 && (rc = parse_resp_command(c, args, MAX_ARGS, &nargs)) > 0) {
-    dispatch_command(c, cfg, args, nargs);
+    dispatch_command(c, args, nargs);
     for (int j = 0; j < nargs; j++) free(args[j]);
   }
   if (rc < 0) {
@@ -558,26 +567,25 @@ static void process_client(struct api_client *c, fd_set *read_set, struct upbx_c
 
 /* Public API */
 
-void api_start(struct upbx_config *cfg) {
+void api_start(void) {
   for (int i = 0; i < API_MAX_CLIENTS; i++)
     client_init(&clients[i]);
 
-  if (!cfg->api.listen || !cfg->api.listen[0]) {
+  plugmod_resp_object *listen_val = config_key_get("api", "listen");
+  const char *listen_str = (listen_val && (listen_val->type == PLUGMOD_RESPT_BULK || listen_val->type == PLUGMOD_RESPT_SIMPLE) && listen_val->u.s && listen_val->u.s[0])
+    ? listen_val->u.s : NULL;
+  if (!listen_str) {
+    if (listen_val) plugmod_resp_free(listen_val);
     log_debug("api: no listen address configured, API server disabled");
+    next_listen_check = 0;
     return;
   }
-
-  /* Find anonymous user [api:*] */
-  anon_user = NULL;
-  for (size_t i = 0; i < cfg->api.user_count; i++) {
-    if (strcmp(cfg->api.users[i].username, "*") == 0) {
-      anon_user = &cfg->api.users[i];
-      break;
-    }
-  }
-
+  current_listen = strdup(listen_str);
+  plugmod_resp_free(listen_val);
+  if (!current_listen) return;
   init_builtins();
-  listen_fd = create_listen_socket(cfg->api.listen);
+  listen_fd = create_listen_socket(current_listen);
+  next_listen_check = 0; /* so first api_pt tick will set it from loop_timestamp + 60 */
 }
 
 void api_fill_fds(fd_set *read_set, int *maxfd) {
@@ -592,14 +600,33 @@ void api_fill_fds(fd_set *read_set, int *maxfd) {
   }
 }
 
-PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, struct upbx_config *cfg)) {
+PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp)) {
   PT_BEGIN(pt);
   for (;;) {
+    /* 60s listen rebind check */
+    if (listen_fd >= 0 && loop_timestamp >= next_listen_check) {
+      next_listen_check = loop_timestamp + 60;
+      plugmod_resp_object *listen_val = config_key_get("api", "listen");
+      const char *new_str = (listen_val && (listen_val->type == PLUGMOD_RESPT_BULK || listen_val->type == PLUGMOD_RESPT_SIMPLE) && listen_val->u.s)
+        ? listen_val->u.s : "";
+      int rebind = (current_listen && (!new_str[0] || strcmp(current_listen, new_str) != 0)) ||
+                   (!current_listen && new_str[0]);
+      if (listen_val) plugmod_resp_free(listen_val);
+      if (rebind) {
+        if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
+        free(current_listen);
+        current_listen = (new_str[0]) ? strdup(new_str) : NULL;
+        if (current_listen) {
+          listen_fd = create_listen_socket(current_listen);
+          if (listen_fd < 0) { free(current_listen); current_listen = NULL; }
+        }
+      }
+    }
     if (listen_fd >= 0) {
       if (FD_ISSET(listen_fd, read_set))
         accept_connection();
       for (int i = 0; i < API_MAX_CLIENTS; i++)
-        process_client(&clients[i], read_set, cfg);
+        process_client(&clients[i], read_set);
     }
     PT_YIELD(pt);
   }
@@ -614,9 +641,10 @@ void api_stop(void) {
     close(listen_fd);
     listen_fd = -1;
   }
+  free(current_listen);
+  current_listen = NULL;
   if (cmd_map) {
     hashmap_free(cmd_map);
     cmd_map = NULL;
   }
-  anon_user = NULL;
 }

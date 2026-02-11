@@ -137,7 +137,7 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
     return 1;
 
   log_info("daemon starting");
-  plugin_start(&cfg);
+  plugin_sync();
 
   void *av[1];
   av[0] = &cfg;

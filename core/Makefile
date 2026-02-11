@@ -118,7 +118,7 @@ test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/util/sdp_parse.o
 test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o lib/rxi/log/src/log.o
 	$(CC) $^ $(CFLAGS) -o $@
 
-test_config: src/test/test_config.o src/config.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
+test_config: src/test/test_config.o src/config.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o src/PluginModule/plugin.o src/common/socket_util.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_digest_auth: src/test/test_digest_auth.o src/common/digest_auth.o src/common/md5.o

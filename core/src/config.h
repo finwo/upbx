@@ -2,6 +2,7 @@
 #define UPBX_CONFIG_H
 
 #include <stddef.h>
+#include "PluginModule/plugin.h"
 
 typedef struct upbx_config upbx_config;
 
@@ -90,5 +91,21 @@ void config_free(upbx_config *cfg);
 
 /* Initialize cfg to defaults (zeros). */
 void config_init(upbx_config *cfg);
+
+/* --- Live config API (re-read file each call; no cache). Caller frees with plugmod_resp_free. --- */
+
+/* Set/get config file path (used by default getters). Set once at startup. */
+void config_set_path(const char *path);
+const char *config_get_path(void);
+
+/* Path-taking (low-level). Return NULL on error or missing path. */
+plugmod_resp_object *config_sections_list_path(const char *path);
+plugmod_resp_object *config_section_get_path(const char *path, const char *section);
+plugmod_resp_object *config_key_get_path(const char *path, const char *section, const char *key);
+
+/* Default getters (use stored path). Return NULL if path not set or on error. */
+plugmod_resp_object *config_sections_list(void);
+plugmod_resp_object *config_section_get(const char *section);
+plugmod_resp_object *config_key_get(const char *section, const char *key);
 
 #endif

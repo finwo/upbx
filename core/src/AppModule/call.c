@@ -104,6 +104,7 @@ void call_remove(call_t *call) {
   free(call->source_str);
   free(call->dest_str);
   free(call->direction);
+  free(call->trunk_name);
   free(call);
 }
 

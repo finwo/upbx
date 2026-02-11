@@ -7,10 +7,11 @@
 
 #include <stddef.h>
 
-/* One plugin to start: name and exec path (passed to sh -c). */
+/* One plugin to start: name and exec path (passed to sh -c). config_hash: 0 = do not compare for "config updated". */
 typedef struct plugmod_config_item {
   const char *name;
   const char *exec;
+  unsigned long long config_hash;
 } plugmod_config_item;
 
 #define PLUGMOD_RESPT_SIMPLE  0
@@ -47,6 +48,19 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
   const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes);
 
 void plugmod_stop(void);
+
+/* Stop one plugin by name: send SIGINT, mark STOPPING. Non-blocking. */
+void plugmod_stop_plugin(const char *name);
+
+/* Reap STOPPING plugins: if 30s elapsed since SIGINT, send SIGKILL and remove. Call each main-loop iteration. */
+void plugmod_tick(void);
+
+/* Start one plugin (spawn, discovery). discovery_cmd and event_prefixes must be set (e.g. by prior plugmod_start or plugmod_sync). config_hash stored for later comparison; 0 = ignore. Returns 0 on success. */
+int plugmod_start_plugin(const char *name, const char *exec, unsigned long long config_hash);
+
+/* Sync plugins to config: tick, then stop removed/changed, start added. Stores discovery_cmd and event_prefixes for plugmod_start_plugin. */
+void plugmod_sync(const plugmod_config_item *configs, size_t n,
+  const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes);
 
 /* Invoke method; response is consumed and discarded. Returns 0 on success. */
 int plugmod_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv);

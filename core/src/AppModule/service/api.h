@@ -11,9 +11,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/select.h>
+#include <time.h>
 #include "common/pt.h"
-
-struct upbx_config;
 
 /* Client handle (opaque to command implementations) */
 typedef struct api_client api_client_t;
@@ -21,7 +20,7 @@ typedef struct api_client api_client_t;
 /* Command handler signature.
  * args[0] = command name (lowercased), args[1..nargs-1] = arguments.
  * Return true to keep connection open, false to close it. */
-typedef bool (*api_cmd_func)(api_client_t *c, struct upbx_config *cfg, char **args, int nargs);
+typedef bool (*api_cmd_func)(api_client_t *c, char **args, int nargs);
 
 /* Register a command with the API server. Call from module init (before api_start). */
 void api_register_cmd(const char *name, api_cmd_func func);
@@ -41,10 +40,10 @@ bool api_write_kv(api_client_t *c, const char *key, const char *val);
 bool api_write_kv_int(api_client_t *c, const char *key, int val);
 bool api_write_kv_time(api_client_t *c, const char *key, long t);
 
-/* Lifecycle + protothread */
-void api_start(struct upbx_config *cfg);
+/* Lifecycle + protothread. loop_timestamp: global timestamp from daemon (for 60s listen rebind). */
+void api_start(void);
 void api_fill_fds(fd_set *read_set, int *maxfd);
-PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, struct upbx_config *cfg));
+PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp));
 void api_stop(void);
 
 #endif

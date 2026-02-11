@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
+#include <sys/wait.h>
 
 #include "common/socket_util.h"
 #include "rxi/log.h"
@@ -254,6 +256,10 @@ typedef struct {
   size_t method_count;
   char **events;
   size_t event_count;
+  int stopping;
+  time_t stop_sent_at;
+  unsigned long long config_hash;
+  char *exec;
 } plugin_state_t;
 
 static plugin_state_t *plugins;
@@ -266,6 +272,7 @@ static size_t event_prefixes_n;
 static void plugin_state_free(plugin_state_t *p) {
   if (!p) return;
   free(p->name);
+  free(p->exec);
   for (size_t i = 0; i < p->method_count; i++) free(p->methods[i]);
   free(p->methods);
   for (size_t i = 0; i < p->event_count; i++) free(p->events[i]);
@@ -312,7 +319,10 @@ static int spawn_plugin(const char *name, const char *exec_path, plugin_state_t 
   out->method_count = 0;
   out->events = NULL;
   out->event_count = 0;
-  /* Use blocking I/O on plugin pipes so we don't need select(); plugins are local and expected to respond quickly. */
+  out->stopping = 0;
+  out->stop_sent_at = 0;
+  out->config_hash = 0;
+  out->exec = strdup(exec_path);
   if (set_socket_nonblocking(out->fd_read, 0) != 0 || set_socket_nonblocking(out->fd_write, 0) != 0) {
     plugin_state_free(out);
     return -1;
@@ -382,6 +392,7 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
     p->fd_read = p->fd_write = -1;
     if (spawn_plugin(configs[i].name, configs[i].exec, p) != 0)
       continue;
+    p->config_hash = configs[i].config_hash;
     if (discovery_cmd_used && do_discovery(p) != 0) {
       log_error("plugin %s: discovery failed", p->name);
       plugin_state_free(p);
@@ -389,6 +400,93 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
     }
     log_debug("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
     plugin_n++;
+  }
+}
+
+void plugmod_stop_plugin(const char *name) {
+  plugin_state_t *p = find_plugin(name);
+  if (!p || p->stopping || p->pid <= 0) return;
+  kill(p->pid, SIGINT);
+  p->stopping = 1;
+  p->stop_sent_at = time(NULL);
+}
+
+static void remove_plugin_at(size_t i) {
+  plugin_state_free(&plugins[i]);
+  if (i < plugin_n - 1)
+    memmove(&plugins[i], &plugins[i + 1], (plugin_n - 1 - i) * sizeof(plugin_state_t));
+  plugin_n--;
+}
+
+void plugmod_tick(void) {
+  time_t now = time(NULL);
+  for (size_t i = plugin_n; i > 0; i--) {
+    size_t idx = i - 1;
+    plugin_state_t *p = &plugins[idx];
+    if (!p->stopping || p->pid <= 0) continue;
+    if (now - p->stop_sent_at < 30) continue;
+    kill(p->pid, SIGKILL);
+    int status;
+    waitpid(p->pid, &status, 0);
+    remove_plugin_at(idx);
+  }
+}
+
+int plugmod_start_plugin(const char *name, const char *exec, unsigned long long config_hash) {
+  if (!name || !exec || !exec[0]) return -1;
+  if (find_plugin(name) != NULL) return -1; /* already running or stopping */
+  if (!discovery_cmd_used) return -1;
+  if (plugin_n >= plugin_cap) {
+    size_t newcap = plugin_cap ? plugin_cap * 2 : 4;
+    plugin_state_t *new_p = realloc(plugins, newcap * sizeof(plugin_state_t));
+    if (!new_p) return -1;
+    plugins = new_p;
+    plugin_cap = newcap;
+  }
+  plugin_state_t *p = &plugins[plugin_n];
+  memset(p, 0, sizeof(*p));
+  p->fd_read = p->fd_write = -1;
+  if (spawn_plugin(name, exec, p) != 0) return -1;
+  p->config_hash = config_hash;
+  if (do_discovery(p) != 0) {
+    log_error("plugin %s: discovery failed", p->name);
+    plugin_state_free(p);
+    return -1;
+  }
+  log_debug("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
+  plugin_n++;
+  return 0;
+}
+
+void plugmod_sync(const plugmod_config_item *configs, size_t n,
+  const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes) {
+  plugmod_tick();
+  discovery_cmd_used = discovery_cmd;
+  event_prefixes_used = event_prefixes;
+  event_prefixes_n = n_event_prefixes;
+  for (size_t i = 0; i < plugin_n; i++) {
+    plugin_state_t *p = &plugins[i];
+    if (p->stopping) continue;
+    const plugmod_config_item *c = NULL;
+    for (size_t j = 0; j < n; j++)
+      if (configs[j].name && strcmp(p->name, configs[j].name) == 0) { c = &configs[j]; break; }
+    if (!c) {
+      plugmod_stop_plugin(p->name);
+      continue;
+    }
+    if (c->exec && p->exec && strcmp(c->exec, p->exec) != 0) {
+      plugmod_stop_plugin(p->name);
+      continue;
+    }
+    if (c->config_hash != 0 && p->config_hash != c->config_hash) {
+      plugmod_stop_plugin(p->name);
+      continue;
+    }
+  }
+  for (size_t j = 0; j < n; j++) {
+    if (!configs[j].exec || !configs[j].exec[0]) continue;
+    if (find_plugin(configs[j].name) != NULL) continue;
+    plugmod_start_plugin(configs[j].name, configs[j].exec, configs[j].config_hash);
   }
 }
 
@@ -407,7 +505,7 @@ void plugmod_stop(void) {
 int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv,
   plugmod_resp_object **out) {
   plugin_state_t *p = find_plugin(plugin_name);
-  if (!p || !out) return -1;
+  if (!p || p->stopping || !out) return -1;
   *out = NULL;
   char *buf = NULL;
   size_t len = 0;
@@ -431,7 +529,7 @@ int plugmod_invoke(const char *plugin_name, const char *method, int argc, const 
 
 int plugmod_has_event(const char *plugin_name, const char *event_name) {
   plugin_state_t *p = find_plugin(plugin_name);
-  if (!p) return 0;
+  if (!p || p->stopping) return 0;
   for (size_t i = 0; i < p->event_count; i++)
     if (strcmp(p->events[i], event_name) == 0)
       return 1;
@@ -441,6 +539,7 @@ int plugmod_has_event(const char *plugin_name, const char *event_name) {
 void plugmod_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv) {
   log_debug("plugin event %s (%d args)", event_name, argc);
   for (size_t i = 0; i < plugin_n; i++) {
+    if (plugins[i].stopping) continue;
     if (!plugmod_has_event(plugins[i].name, event_name)) continue;
     plugmod_invoke(plugins[i].name, event_name, argc, argv);
   }

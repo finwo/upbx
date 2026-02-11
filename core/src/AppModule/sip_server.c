@@ -51,10 +51,43 @@ static char *auth_generate_nonce(void) {
 /* Registration state is managed by AppModule/registration.c.
  * See registration.h for the ext_reg_t struct and query/update API. */
 
-static config_extension *get_extension_config(upbx_config *cfg, const char *number) {
-  for (size_t i = 0; i < cfg->extension_count; i++)
-    if (strcmp(cfg->extensions[i].number, number) == 0)
-      return &cfg->extensions[i];
+static int ext_pattern_match(const char *pattern, const char *number);
+
+/* Get extension section from live config: exact ext:<number> first, then first pattern match in config order. Caller plugmod_resp_free. If section_name_out non-NULL, copy the section name used (e.g. "ext:206" or "ext:20x"). */
+static plugmod_resp_object *get_extension_section(const char *number, char *section_name_out, size_t section_name_size) {
+  if (!number || !number[0]) return NULL;
+  char section[128];
+  snprintf(section, sizeof(section), "ext:%s", number);
+  plugmod_resp_object *exact = config_section_get(section);
+  if (exact && exact->type == PLUGMOD_RESPT_ARRAY) {
+    if (section_name_out && section_name_size) {
+      strncpy(section_name_out, section, section_name_size - 1);
+      section_name_out[section_name_size - 1] = '\0';
+    }
+    return exact;
+  }
+  if (exact) { plugmod_resp_free(exact); exact = NULL; }
+
+  plugmod_resp_object *list = config_sections_list();
+  if (!list || list->type != PLUGMOD_RESPT_ARRAY) {
+    if (list) plugmod_resp_free(list);
+    return NULL;
+  }
+  for (size_t i = 0; i < list->u.arr.n; i++) {
+    plugmod_resp_object *e = &list->u.arr.elem[i];
+    if ((e->type != PLUGMOD_RESPT_BULK && e->type != PLUGMOD_RESPT_SIMPLE) || !e->u.s) continue;
+    if (strncmp(e->u.s, "ext:", 4) != 0) continue;
+    const char *tail = e->u.s + 4;
+    if (!ext_pattern_match(tail, number)) continue;
+    plugmod_resp_object *sec = config_section_get(e->u.s);
+    if (sec && section_name_out && section_name_size) {
+      strncpy(section_name_out, e->u.s, section_name_size - 1);
+      section_name_out[section_name_size - 1] = '\0';
+    }
+    plugmod_resp_free(list);
+    return sec;
+  }
+  plugmod_resp_free(list);
   return NULL;
 }
 
@@ -220,17 +253,7 @@ static int ext_pattern_match(const char *pattern, const char *number) {
   return (*pattern == '\0' && *number == '\0');
 }
 
-/* Pattern-aware extension config lookup: exact match first, then x-wildcard. */
-static config_extension *get_extension_config_match(upbx_config *cfg, const char *number) {
-  config_extension *exact = get_extension_config(cfg, number);
-  if (exact) return exact;
-  for (size_t i = 0; i < cfg->extension_count; i++) {
-    if (strchr(cfg->extensions[i].number, 'x') || strchr(cfg->extensions[i].number, 'X'))
-      if (ext_pattern_match(cfg->extensions[i].number, number))
-        return &cfg->extensions[i];
-  }
-  return NULL;
-}
+/* get_extension_section() above does exact then first pattern match. Use it for both lookup types. */
 
 /* Regex match: return pointer to regmatch_t array on match, NULL otherwise. First-match only (NMATCHES). */
 #define REWRITE_NMATCHES 10
@@ -804,76 +827,70 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     send_reply(ctx, req_buf, req_len, 503, 0, 0);
     return;
   }
-  /* Look up extension by number only (no trunk marker); config uses [ext:number]. */
-  config_extension *ext = get_extension_config(cfg, extension_num);
-  if (!ext) {
+  /* Look up extension from live config (exact ext:<number> then first pattern match). */
+  plugmod_resp_object *ext_section = get_extension_section(extension_num, NULL, 0);
+  if (!ext_section) {
     log_warn("REGISTER: 403 Forbidden — extension \"%s\" not in config (username \"%s\")", extension_num, user);
     free(raw_uri_user);
     free(extension_num);
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
     return;
   }
+  const char *secret = plugmod_resp_map_get_string(ext_section, "secret");
   config_trunk *trunk = resolve_trunk_for_extension(cfg, extension_num);
-  /* trunk may be NULL when no trunks are configured or no group matches — that's OK (ext-to-ext only). */
-  /* Get Authorization from parser (single place; no string scraping). */
+  const char *trunk_name_str = trunk ? trunk->name : "";
+
   const char *auth_val;
   size_t auth_len;
   int has_auth = sip_header_get(req_buf, req_len, "Authorization", &auth_val, &auth_len);
-  log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk ? trunk->name : "(none)", has_auth ? 1 : 0);
+  log_trace("REGISTER: extension_num=%s trunk=%s has_Authorization=%d", extension_num, trunk_name_str, has_auth ? 1 : 0);
 
-  /* Plugin extension.register: can reject, accept, or continue (built-in auth). */
   int plugin_allow = -1;
-  const char *trunk_name_str = trunk ? trunk->name : "";
   if (plugin_count() > 0) {
     log_debug("REGISTER: querying plugins for ext %s on trunk %s", extension_num, trunk_name_str);
     plugin_query_register(extension_num, trunk_name_str, user, &plugin_allow);
   }
   if (plugin_allow == 0) {
     log_info("REGISTER: plugin denied registration for extension %s", extension_num);
+    plugmod_resp_free(ext_section);
     free(raw_uri_user);
     free(extension_num);
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
     return;
   }
   if (plugin_allow != 1) {
-    /* Built-in auth: require Authorization Digest. No header → 401 immediately (avoid parser/mutex path). */
-    log_trace("REGISTER: step 401 path plugin-dont-deny");
-    if (!has_auth || !ext->secret) {
-      log_trace("REGISTER: step 401 path no-auth-or-no-secret");
-      log_trace("REGISTER: sending 401 (no Authorization or no secret), returning");
+    if (!has_auth || !secret) {
       log_debug("REGISTER: 401 challenge for extension %s (no credentials or no secret)", extension_num);
       char *r = build_reply(req_buf, req_len, 401, 0, 1, NULL);
-      if (r) {
-        log_hexdump_trace(r, strlen(r));
-        send_response_buf(ctx, r, strlen(r));
-        free(r);
-      }
+      if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
+      plugmod_resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       return;
     }
     char *auth_user = NULL, *auth_stripped = NULL;
-    log_trace("REGISTER: parsing Authorization digest");
     if (!sip_parse_authorization_digest(req_buf, req_len, &auth_user, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
       log_debug("REGISTER: 401 challenge for extension %s (invalid Authorization header)", extension_num);
       send_reply(ctx, req_buf, req_len, 401, 0, 1);
+      plugmod_resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       free(auth_user);
       return;
     }
     if (auth_user)
-      auth_stripped = extension_part_from_username(auth_user);  /* before first @ or %40; digest uses raw auth_user */
+      auth_stripped = extension_part_from_username(auth_user);
     if (!auth_stripped || strcmp(auth_stripped, extension_num) != 0) {
       log_warn("REGISTER: 403 Forbidden — Authorization username \"%s\" does not match extension \"%s\"", auth_stripped ? auth_stripped : "(null)", extension_num);
+      plugmod_resp_free(ext_section);
       free(raw_uri_user);
       free(auth_user); free(auth_stripped); free(extension_num);
       send_reply(ctx, req_buf, req_len, 403, 0, 0);
       return;
     }
-    /* Use the username from the Authorization header verbatim for digest verification. */
-    if (!verify_digest(req_buf, req_len, "REGISTER", ext->secret, AUTH_REALM, auth_user)) {
+    if (!verify_digest(req_buf, req_len, "REGISTER", secret, AUTH_REALM, auth_user)) {
       log_warn("REGISTER: 403 Forbidden — digest verification failed for extension %s", extension_num);
+      plugmod_resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       free(auth_user);
@@ -883,20 +900,19 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     }
     free(auth_user);
     free(auth_stripped);
-    /* keep raw_uri_user for storing in reg below */
   }
 
-  /* Store registration (transfers ownership of extension_num, raw_uri_user, contact_val). */
   log_trace("REGISTER: auth OK, extension=%s", extension_num);
-  if (trunk)
-    log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk->name);
+  if (trunk_name_str[0])
+    log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk_name_str);
   else
     log_info("REGISTER: extension %s registered (no trunk)", extension_num);
   char *contact_val = get_contact_value(req_buf, req_len);
   registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL);
-  raw_uri_user = NULL;  /* ownership transferred */
+  raw_uri_user = NULL;
+  plugmod_resp_free(ext_section);
   send_reply(ctx, req_buf, req_len, 200, 1, 0);
-  free(raw_uri_user);  /* no-op if transferred to reg */
+  free(raw_uri_user);
 }
 
 static const char *reason_phrase(int code) {
@@ -989,23 +1005,31 @@ static int get_advertise_addr(upbx_config *cfg, char *host_out, size_t host_size
 static int get_advertise_addr_for_ext(upbx_config *cfg, const ext_reg_t *reg, char *host_out, size_t host_size, char *port_out, size_t port_size);
 static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg, ext_reg_t *ext, const char *source_str, int sockfd);
 
-/* Apply overflow action for one call (busy/redirect/include). Single-threaded. */
+/* Apply overflow action for one call (busy/redirect/include). Single-threaded. Uses live config. */
 static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
-  if (!call || !call->trunk) return;
+  if (!call || !call->trunk_name) return;
   if (call->answered || call->overflow_done) return;
   log_trace("overflow_apply_one: call=%.32s", call->call_id);
-  int timeout_sec = call->trunk->overflow_timeout;
+  char section[128];
+  snprintf(section, sizeof(section), "trunk:%s", call->trunk_name);
+  plugmod_resp_object *to_obj = config_key_get(section, "overflow_timeout");
+  int timeout_sec = (to_obj && to_obj->type == PLUGMOD_RESPT_INT) ? (int)to_obj->u.i : 0;
+  if (to_obj) plugmod_resp_free(to_obj);
   if (timeout_sec <= 0) return;
   time_t deadline = call->created_at + (time_t)timeout_sec;
   if (time(NULL) < deadline) return;
   call->overflow_done = 1;
-  const char *strategy = call->trunk->overflow_strategy ? call->trunk->overflow_strategy : "none";
-  log_debug("overflow: call %.32s strategy=%s target=%s", call->call_id, strategy,
-            call->trunk->overflow_target ? call->trunk->overflow_target : "(none)");
+  plugmod_resp_object *strat_obj = config_key_get(section, "overflow_strategy");
+  plugmod_resp_object *tgt_obj = config_key_get(section, "overflow_target");
+  const char *strategy = (strat_obj && (strat_obj->type == PLUGMOD_RESPT_BULK || strat_obj->type == PLUGMOD_RESPT_SIMPLE) && strat_obj->u.s) ? strat_obj->u.s : "none";
+  const char *target = (tgt_obj && (tgt_obj->type == PLUGMOD_RESPT_BULK || tgt_obj->type == PLUGMOD_RESPT_SIMPLE)) ? tgt_obj->u.s : NULL;
+  log_debug("overflow: call %.32s strategy=%s target=%s", call->call_id, strategy, target ? target : "(none)");
   int do_busy = 0, do_include = 0, do_redirect = 0;
   if (strcasecmp(strategy, "busy") == 0) do_busy = 1;
-  else if (strcasecmp(strategy, "include") == 0 && call->trunk->overflow_target && call->trunk->overflow_target[0]) do_include = 1;
-  else if (strcasecmp(strategy, "redirect") == 0 && call->trunk->overflow_target && call->trunk->overflow_target[0]) do_redirect = 1;
+  else if (strcasecmp(strategy, "include") == 0 && target && target[0]) do_include = 1;
+  else if (strcasecmp(strategy, "redirect") == 0 && target && target[0]) do_redirect = 1;
+  if (strat_obj) plugmod_resp_free(strat_obj);
+  if (tgt_obj) plugmod_resp_free(tgt_obj);
 
   if (do_busy) {
     if (call->original_invite && call->original_invite_len > 0) {
@@ -1019,17 +1043,18 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
     return;
   }
 
+  plugmod_resp_object *tgt2 = config_key_get(section, "overflow_target");
+  const char *overflow_target = (tgt2 && (tgt2->type == PLUGMOD_RESPT_BULK || tgt2->type == PLUGMOD_RESPT_SIMPLE) && tgt2->u.s) ? tgt2->u.s : NULL;
   if (do_redirect) {
-    /* Redirect: cancel all existing forks and pending, then add overflow target. */
     cancel_active_forks(call, sockfd);
     clear_pending_exts(call);
-    if (call->trunk->overflow_target && call->n_pending_exts < CALL_MAX_FORKS)
-      call->pending_exts[call->n_pending_exts++] = strdup(call->trunk->overflow_target);
+    if (overflow_target && overflow_target[0] && call->n_pending_exts < CALL_MAX_FORKS)
+      call->pending_exts[call->n_pending_exts++] = strdup(overflow_target);
   } else if (do_include) {
-    /* Include: add overflow target alongside existing forks. */
-    if (call->trunk->overflow_target && call->n_pending_exts < CALL_MAX_FORKS)
-      call->pending_exts[call->n_pending_exts++] = strdup(call->trunk->overflow_target);
+    if (overflow_target && overflow_target[0] && call->n_pending_exts < CALL_MAX_FORKS)
+      call->pending_exts[call->n_pending_exts++] = strdup(overflow_target);
   }
+  if (tgt2) plugmod_resp_free(tgt2);
 }
 
 /* Return 1 if the given extension has any answered (active) call, excluding 'exclude'. */
@@ -1063,8 +1088,8 @@ static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
           if (!extension_has_active_call(c->pending_exts[p], c)) {
             /* Extension is free — look up registration and send INVITE. */
             ext_reg_t *reg = NULL;
-            if (c->trunk && c->trunk->name) {
-              reg = registration_get_by_number(c->trunk->name, c->pending_exts[p]);
+            if (c->trunk_name && c->trunk_name[0]) {
+              reg = registration_get_by_number(c->trunk_name, c->pending_exts[p]);
             } else {
               /* Ext-to-ext: no trunk context, find any registration for this number. */
               ext_reg_t **regs = NULL;
@@ -1172,17 +1197,16 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
   char from_val[384];
   from_val[0] = '\0';
   if (source_str) {
-    config_extension *ext_caller = get_extension_config(cfg, source_str);
-    if (ext_caller) {
-      const char *caller_display = (ext_caller->name && ext_caller->name[0]) ? ext_caller->name : NULL;
-      sip_format_from_to_value(caller_display, source_str, via_host, via_port, from_val, sizeof(from_val));
-      /* Preserve original From tag. */
+    plugmod_resp_object *ext_caller_sec = get_extension_section(source_str, NULL, 0);
+    if (ext_caller_sec) {
+      const char *caller_display = plugmod_resp_map_get_string(ext_caller_sec, "name");
+      sip_format_from_to_value((caller_display && caller_display[0]) ? caller_display : NULL, source_str, via_host, via_port, from_val, sizeof(from_val));
       char tag_buf[64];
       tag_buf[0] = '\0';
       if (sip_header_get_param(req_buf, req_len, "From", "tag", tag_buf, sizeof(tag_buf)) && tag_buf[0])
         sip_append_tag_param(from_val, sizeof(from_val), tag_buf);
+      plugmod_resp_free(ext_caller_sec);
     }
-    /* else: from_val stays empty → original From header passes through unchanged */
   }
 
   /* Chain rewrites on the original INVITE: URI → Via → Contact → From → SDP → body. */
@@ -1268,7 +1292,7 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
     return;
   }
   call->sockfd = ctx->sockfd;
-  call->trunk  = trunk;
+  call->trunk_name = trunk && trunk->name ? strdup(trunk->name) : NULL;
   call->direction = strdup(direction ? direction : "dialin");
   call->source_str = source_str ? strdup(source_str) : NULL;
   memcpy(&call->a.sip_addr, &ctx->peer, sizeof(ctx->peer));
@@ -1383,15 +1407,18 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   size_t ext_match_count = registration_get_regs(NULL, ext_num, &ext_matches);
   ext_reg_t *reg = ext_match_count > 0 ? ext_matches[0] : NULL;
   free(ext_matches);
-  /* Pattern-aware fallback: if direct lookup failed, find the pattern config
-   * and look up the registration under the pattern's literal number. */
   if (!reg) {
-    config_extension *pat_ext = get_extension_config_match(cfg, ext_num);
-    if (pat_ext && strcmp(pat_ext->number, ext_num) != 0) {
-      ext_matches = NULL;
-      ext_match_count = registration_get_regs(NULL, pat_ext->number, &ext_matches);
-      reg = ext_match_count > 0 ? ext_matches[0] : NULL;
-      free(ext_matches);
+    char pat_sec[128];
+    plugmod_resp_object *pat_sec_obj = get_extension_section(ext_num, pat_sec, sizeof(pat_sec));
+    if (pat_sec_obj) {
+      const char *section_tail = (strlen(pat_sec) > 4) ? pat_sec + 4 : "";
+      plugmod_resp_free(pat_sec_obj);
+      if (section_tail[0] && strcmp(section_tail, ext_num) != 0) {
+        ext_matches = NULL;
+        ext_match_count = registration_get_regs(NULL, section_tail, &ext_matches);
+        reg = ext_match_count > 0 ? ext_matches[0] : NULL;
+        free(ext_matches);
+      }
     }
   }
   /* Find primary trunk: try registration first, then fall back to prefix-based resolution. */
@@ -1481,7 +1508,7 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   call_t *call = call_create(call_id_buf);
   if (call) {
     call->sockfd = ctx->sockfd;
-    call->trunk  = trunk;
+    call->trunk_name = trunk && trunk->name ? strdup(trunk->name) : NULL;
     call->direction = strdup("dialout");
     call->source_str = from_user ? strdup(from_user) : NULL;
     memcpy(&call->a.sip_addr, &ctx->peer, sizeof(ctx->peer));
@@ -1628,7 +1655,12 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   log_trace("handle_invite: To=%s From=%s Call-ID=%.32s", to_user[0] ? to_user : "(null)", from_user[0] ? from_user : "(null)", call_id);
 
   /* 1. From a known extension */
-  if (from_ext[0] && get_extension_config_match(cfg, from_ext)) {
+  int from_ext_configured = 0;
+  if (from_ext[0]) {
+    plugmod_resp_object *s = get_extension_section(from_ext, NULL, 0);
+    if (s) { from_ext_configured = 1; plugmod_resp_free(s); }
+  }
+  if (from_ext_configured) {
     char *ext_num = strdup(from_ext);
     if (!ext_num) {
       send_reply(ctx, buf, len, 503, 0, 0);
@@ -1651,48 +1683,50 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
       if (caller_trunk && caller_trunk->group_prefix && caller_trunk->group_prefix[0]) {
         snprintf(expanded_to_ext, sizeof(expanded_to_ext), "%s%s", caller_trunk->group_prefix, to_ext);
-        if (get_extension_config_match(cfg, expanded_to_ext)) {
-          log_debug("short-dial: %s expanded to %s (prefix %s)", to_ext, expanded_to_ext, caller_trunk->group_prefix);
-          to_ext = expanded_to_ext;
-        } else {
-          expanded_to_ext[0] = '\0'; /* expansion didn't match, revert */
+        {
+          plugmod_resp_object *xs = get_extension_section(expanded_to_ext, NULL, 0);
+          if (xs) {
+            plugmod_resp_free(xs);
+            log_debug("short-dial: %s expanded to %s (prefix %s)", to_ext, expanded_to_ext, caller_trunk->group_prefix);
+            to_ext = expanded_to_ext;
+          } else {
+            expanded_to_ext[0] = '\0';
+          }
         }
       }
     }
 
     /* 1a. Extension-to-extension: callee is a known extension (exact or pattern). */
-    config_extension *callee_ext = (to_ext[0] && strcmp(ext_num, to_ext) != 0) ? get_extension_config_match(cfg, to_ext) : NULL;
-    if (callee_ext) {
-      /* Cross-group call blocking: when locality > 0 and cross_group_calls == 0, block if different groups. */
+    plugmod_resp_object *callee_ext_sec = (to_ext[0] && strcmp(ext_num, to_ext) != 0) ? get_extension_section(to_ext, NULL, 0) : NULL;
+    if (callee_ext_sec) {
       if (cfg->locality > 0 && !cfg->cross_group_calls) {
         config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
-        config_trunk *callee_trunk = resolve_trunk_for_extension(cfg, callee_ext->number);
+        config_trunk *callee_trunk = resolve_trunk_for_extension(cfg, to_ext);
         const char *caller_prefix = caller_trunk ? caller_trunk->group_prefix : NULL;
         const char *callee_prefix = callee_trunk ? callee_trunk->group_prefix : NULL;
         int same_group = 0;
-        if (!caller_prefix && !callee_prefix) same_group = 1; /* both trunk-less */
+        if (!caller_prefix && !callee_prefix) same_group = 1;
         else if (caller_prefix && callee_prefix && strcmp(caller_prefix, callee_prefix) == 0) same_group = 1;
         if (!same_group) {
           log_info("INVITE: cross-group ext-to-ext blocked %s -> %s", ext_num, to_ext);
+          plugmod_resp_free(callee_ext_sec);
           free(ext_num);
           send_reply(ctx, buf, len, 403, 0, 0);
           return;
         }
       }
-
-      /* Look up registrations: for pattern matches, use the pattern string as the registered number. */
-      const char *reg_lookup = callee_ext->number;
       ext_reg_t **exts = NULL;
-      size_t n_ext = registration_get_regs(NULL, reg_lookup, &exts);
+      size_t n_ext = registration_get_regs(NULL, to_ext, &exts);
       if (n_ext > 0 && exts) {
         log_info("new call: ext %s -> ext %s (ext-to-ext, %zu reg(s))", ext_num, to_ext, n_ext);
         fork_invite_to_extension_regs(cfg, buf, len, ctx, exts, n_ext, NULL, ext_num, "dialin");
         free(exts);
+        plugmod_resp_free(callee_ext_sec);
         free(ext_num);
         return;
       }
-      /* RFC 3261: callee not registered → 480 Temporarily Unavailable so caller gets clear failure */
       log_debug("INVITE %s->%s: no registration for callee, sending 480", ext_num, to_ext);
+      plugmod_resp_free(callee_ext_sec);
       send_reply(ctx, buf, len, 480, 0, 0);
       free(exts);
       free(ext_num);
@@ -1704,15 +1738,18 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     size_t dmc = registration_get_regs(NULL, ext_num, &dm);
     ext_reg_t *reg = dmc > 0 ? dm[0] : NULL;
     free(dm);
-    /* Pattern-aware fallback: if direct lookup failed, find the pattern config
-     * and look up the registration under the pattern's literal number. */
     if (!reg) {
-      config_extension *pat_ext = get_extension_config_match(cfg, ext_num);
-      if (pat_ext && strcmp(pat_ext->number, ext_num) != 0) {
-        dm = NULL;
-        dmc = registration_get_regs(NULL, pat_ext->number, &dm);
-        reg = dmc > 0 ? dm[0] : NULL;
-        free(dm);
+      char pat_sec2[128];
+      plugmod_resp_object *pat_sec2_obj = get_extension_section(ext_num, pat_sec2, sizeof(pat_sec2));
+      if (pat_sec2_obj) {
+        const char *section_tail2 = (strlen(pat_sec2) > 4) ? pat_sec2 + 4 : "";
+        plugmod_resp_free(pat_sec2_obj);
+        if (section_tail2[0] && strcmp(section_tail2, ext_num) != 0) {
+          dm = NULL;
+          dmc = registration_get_regs(NULL, section_tail2, &dm);
+          reg = dmc > 0 ? dm[0] : NULL;
+          free(dm);
+        }
       }
     }
     const char *destination = to_user[0] ? to_user : "";
@@ -1872,10 +1909,11 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         break;
       }
     }
-    config_extension *match_ext = fi_trunk ? get_extension_config_match(cfg, to_user) : NULL;
-    if (fi_trunk && match_ext) {
-      /* Determine destination extension's group for cross-group check. */
-      config_trunk *ext_trunk = resolve_trunk_for_extension(cfg, match_ext->number);
+    char match_sec[128];
+    plugmod_resp_object *match_ext_sec = fi_trunk ? get_extension_section(to_user, match_sec, sizeof(match_sec)) : NULL;
+    if (fi_trunk && match_ext_sec) {
+      const char *match_ext_number = (strlen(match_sec) > 4) ? match_sec + 4 : to_user;
+      config_trunk *ext_trunk = resolve_trunk_for_extension(cfg, match_ext_number);
       const char *fi_prefix  = fi_trunk->group_prefix  ? fi_trunk->group_prefix  : "";
       const char *ext_prefix = ext_trunk && ext_trunk->group_prefix ? ext_trunk->group_prefix : "";
       int same_group = (cfg->locality == 0) || (strcmp(fi_prefix, ext_prefix) == 0);
@@ -1923,10 +1961,12 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
           }
         }
       }
+      plugmod_resp_free(match_ext_sec);
       if (exts) free(exts);
       handle_invite_incoming(cfg, buf, len, ctx, to_user, NULL, 0);
       return;
     }
+    if (match_ext_sec) plugmod_resp_free(match_ext_sec);
   }
 
   /* 3. Fallback: from_user with @, extension prefix match → outgoing */
@@ -1937,10 +1977,14 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     if (ext_num) {
       memcpy(ext_num, from_user, ext_len);
       ext_num[ext_len] = '\0';
-      if (get_extension_config_match(cfg, ext_num)) {
-        free(ext_num);
-        handle_invite_outgoing(cfg, buf, len, ctx, from_user, NULL, -1);
-        return;
+      {
+        plugmod_resp_object *s3 = get_extension_section(ext_num, NULL, 0);
+        if (s3) {
+          plugmod_resp_free(s3);
+          free(ext_num);
+          handle_invite_outgoing(cfg, buf, len, ctx, from_user, NULL, -1);
+          return;
+        }
       }
       free(ext_num);
     }
@@ -2437,25 +2481,32 @@ void daemon_root(int argc, void *argv[]) {
   /* Initialize registration subsystem. */
   registration_init();
 
-  if (cfg->trunk_count > 0)
-    log_info("trunk registration started (%zu trunk(s))", cfg->trunk_count);
+  log_info("trunk registration started");
   notify_extension_and_trunk_lists(cfg);
 
-  trunk_reg_start(cfg);
-  api_start(cfg);
-  metrics_init(cfg);
+  trunk_reg_start();
+  api_start();
+  metrics_init();
 
   PT_INIT(&pt_overflow);
   struct pt pt_trunk_reg;
   PT_INIT(&pt_trunk_reg);
   struct pt pt_api;
   PT_INIT(&pt_api);
+  struct pt pt_reg_expiry;
+  PT_INIT(&pt_reg_expiry);
+  struct pt pt_metrics;
+  PT_INIT(&pt_metrics);
 
   char buf[SIP_READ_BUF_SIZE];
   struct sockaddr_storage peer;
   socklen_t peerlen;
 
   for (;;) {
+    plugmod_tick();
+    plugin_sync();
+    time_t loop_timestamp = time(NULL);
+
     fd_set r;
     FD_ZERO(&r);
     FD_SET(sockfd, &r);
@@ -2500,9 +2551,10 @@ void daemon_root(int argc, void *argv[]) {
       trunk_reg_poll(&r);
     }
     PT_SCHEDULE(overflow_pt(&pt_overflow, cfg, sockfd));
-    PT_SCHEDULE(trunk_reg_pt(&pt_trunk_reg, cfg));
-    PT_SCHEDULE(api_pt(&pt_api, &r, cfg));
-    metrics_tick();
+    PT_SCHEDULE(trunk_reg_pt(&pt_trunk_reg));
+    PT_SCHEDULE(api_pt(&pt_api, &r, loop_timestamp));
+    PT_SCHEDULE(registration_remove_expired_pt(&pt_reg_expiry, loop_timestamp));
+    PT_SCHEDULE(metrics_tick_pt(&pt_metrics, loop_timestamp));
     call_age_idle(120); /* remove calls with no RTP for 2 minutes */
   }
 }

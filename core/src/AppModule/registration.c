@@ -7,9 +7,10 @@
 #include <time.h>
 
 #include "rxi/log.h"
+#include "common/pt.h"
 #include "AppModule/registration.h"
 
-#define DEFAULT_EXPIRES 3600
+#define DEFAULT_EXPIRES 300  /* 5 minutes */
 
 static ext_reg_t *reg_list;
 static size_t reg_count;
@@ -107,10 +108,10 @@ void registration_update(char *number, char *uri_user, const char *trunk_name,
 
 ext_reg_t *registration_get_by_number(const char *trunk_name, const char *number) {
   time_t now = time(NULL);
-  if (!reg_list_ready || !reg_list || !trunk_name || !number) return NULL;
+  if (!reg_list_ready || !reg_list || !number) return NULL;
   for (size_t i = 0; i < reg_count; i++) {
     if (reg_list[i].expires <= now) continue;
-    if (strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
+    if (trunk_name && reg_list[i].trunk_name && strcmp(reg_list[i].trunk_name, trunk_name) != 0) continue;
     if (strcmp(reg_list[i].number, number) == 0)
       return &reg_list[i];
   }
@@ -171,5 +172,36 @@ int registration_get_advertise_addr(char *host_out, size_t host_size, char *port
   else if (port_size > 0)
     memcpy(port_out, "5060", 5 < port_size ? 5 : port_size);
   return 1;
+}
+
+/* Expiry removal protothread: wait 60s, then remove expired entries, repeat. */
+static time_t next_reg_expiry_check = 0;
+
+PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp)) {
+  PT_BEGIN(pt);
+  for (;;) {
+    PT_WAIT_UNTIL(pt, next_reg_expiry_check == 0 || loop_timestamp >= next_reg_expiry_check);
+    next_reg_expiry_check = loop_timestamp + 60;
+
+    time_t now = time(NULL);
+    size_t w = 0;
+    for (size_t i = 0; i < reg_count; i++) {
+      if (reg_list[i].expires <= now) {
+        free(reg_list[i].number);
+        free(reg_list[i].trunk_name);
+        free(reg_list[i].contact);
+        free(reg_list[i].uri_user);
+        free(reg_list[i].plugin_data);
+      } else {
+        if (w != i)
+          reg_list[w] = reg_list[i];
+        w++;
+      }
+    }
+    if (w != reg_count)
+      registration_set_notify_pending();
+    reg_count = w;
+  }
+  PT_END(pt);
 }
 

@@ -13,6 +13,69 @@
 
 static const char *event_prefixes[] = { "extension.", "trunk.", "call." };
 #define N_EVENT_PREFIXES (sizeof(event_prefixes) / sizeof(event_prefixes[0]))
+#define PLUGIN_SECTION_PREFIX "plugin:"
+#define PLUGIN_SECTION_PREFIX_LEN (sizeof(PLUGIN_SECTION_PREFIX) - 1)
+
+static unsigned long long section_hash(plugmod_resp_object *map) {
+  if (!map || map->type != PLUGMOD_RESPT_ARRAY) return 0;
+  unsigned long long h = 0;
+  for (size_t i = 0; i < map->u.arr.n; i++) {
+    plugmod_resp_object *e = &map->u.arr.elem[i];
+    if (e->type == PLUGMOD_RESPT_BULK || e->type == PLUGMOD_RESPT_SIMPLE) {
+      const char *s = e->u.s;
+      if (s) for (; *s; s++) h = h * 33ULL + (unsigned char)*s;
+    }
+  }
+  return h;
+}
+
+void plugin_sync(void) {
+  plugmod_resp_object *sections = config_sections_list();
+  if (!sections || sections->type != PLUGMOD_RESPT_ARRAY) {
+    if (sections) plugmod_resp_free(sections);
+    plugmod_sync(NULL, 0, "command", event_prefixes, N_EVENT_PREFIXES);
+    return;
+  }
+  plugmod_config_item *configs = NULL;
+  char **names = NULL;
+  char **execs = NULL;
+  size_t n = 0;
+  for (size_t i = 0; i < sections->u.arr.n; i++) {
+    plugmod_resp_object *e = &sections->u.arr.elem[i];
+    const char *sec_name = (e->type == PLUGMOD_RESPT_BULK || e->type == PLUGMOD_RESPT_SIMPLE) ? e->u.s : NULL;
+    if (!sec_name || strncmp(sec_name, PLUGIN_SECTION_PREFIX, PLUGIN_SECTION_PREFIX_LEN) != 0) continue;
+    plugmod_resp_object *sec = config_section_get(sec_name);
+    if (!sec) continue;
+    const char *exec_str = plugmod_resp_map_get_string(sec, "exec");
+    if (!exec_str || !exec_str[0]) { plugmod_resp_free(sec); continue; }
+    char *name_copy = strdup(sec_name + PLUGIN_SECTION_PREFIX_LEN);
+    char *exec_copy = strdup(exec_str);
+    if (!name_copy || !exec_copy) { free(name_copy); free(exec_copy); plugmod_resp_free(sec); break; }
+    plugmod_config_item *p = realloc(configs, (n + 1) * sizeof(plugmod_config_item));
+    char **n_re = realloc(names, (n + 1) * sizeof(char *));
+    char **e_re = realloc(execs, (n + 1) * sizeof(char *));
+    if (!p || !n_re || !e_re) { free(name_copy); free(exec_copy); plugmod_resp_free(sec); break; }
+    configs = p;
+    names = n_re;
+    execs = e_re;
+    names[n] = name_copy;
+    execs[n] = exec_copy;
+    configs[n].name = name_copy;
+    configs[n].exec = exec_copy;
+    configs[n].config_hash = section_hash(sec);
+    n++;
+    plugmod_resp_free(sec);
+  }
+  plugmod_resp_free(sections);
+  plugmod_sync(configs, n, "command", event_prefixes, N_EVENT_PREFIXES);
+  for (size_t j = 0; j < n; j++) {
+    free(names[j]);
+    free(execs[j]);
+  }
+  free(names);
+  free(execs);
+  free(configs);
+}
 
 /* Start all plugins from config; uses COMMAND for discovery and extension./trunk./call. events. */
 void plugin_start(upbx_config *cfg) {
@@ -27,6 +90,7 @@ void plugin_start(upbx_config *cfg) {
     configs = p;
     configs[n].name = cfg->plugins[i].name;
     configs[n].exec = cfg->plugins[i].exec;
+    configs[n].config_hash = 0;
     n++;
   }
   plugmod_start(configs, n, "command", event_prefixes, N_EVENT_PREFIXES);

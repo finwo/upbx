@@ -87,7 +87,7 @@ struct pt {
  * Opens a block; PT_END closes it. PT_YIELD_FLAG is in scope between them.
  * \param pt  Pointer to the protothread control structure.
  */
-#define PT_BEGIN(pt)  { char PT_YIELD_FLAG = 1; PT_RESUME((pt))
+#define PT_BEGIN(pt)  { char PT_YIELD_FLAG = 1; (void)PT_YIELD_FLAG; PT_RESUME((pt))
 
 /**
  * End of a protothread.

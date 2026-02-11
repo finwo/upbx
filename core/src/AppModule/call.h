@@ -7,8 +7,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#include "config.h"
-
 /* Maximum Call-ID length we store. */
 #define CALL_ID_MAX 256
 
@@ -73,7 +71,7 @@ typedef struct call {
   char         *caller_via;           /* caller's first Via (restored on responses) */
 
   /* Routing / plugin metadata */
-  config_trunk *trunk;                /* NULL for ext-to-ext              */
+  char         *trunk_name;           /* trunk name (NULL for ext-to-ext) */
   char         *source_str;           /* caller id (for plugins)          */
   char         *dest_str;             /* callee id (for plugins)          */
   char         *direction;            /* "dialin" or "dialout" (for CALL.ANSWER/HANGUP events) */

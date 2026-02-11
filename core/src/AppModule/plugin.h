@@ -15,6 +15,9 @@ void plugin_start(upbx_config *cfg);
 /* Stop all plugins (close pipes, kill processes). */
 void plugin_stop(void);
 
+/* Sync plugins with live config: config_sections_list (plugin:*), compare section hash for changes, call plugmod_sync. Call on startup and each daemon iteration. */
+void plugin_sync(void);
+
 /* Invoke plugin method: send RESP array (method, arg0, arg1, ...), read response.
  * Returns 0 on success, -1 on transport error. Response is consumed/discarded. */
 int plugin_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv);

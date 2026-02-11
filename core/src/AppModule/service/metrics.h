@@ -5,14 +5,16 @@
 #ifndef UPBX_SERVICE_METRICS_H
 #define UPBX_SERVICE_METRICS_H
 
-struct upbx_config;
+#include <time.h>
+
+#include "common/pt.h"
 
 /* Register metrics commands with the API server and initialise state.
  * Call after api_start() but before the main loop. */
-void metrics_init(struct upbx_config *cfg);
+void metrics_init(void);
 
-/* Update load-average EMAs. Call once per main loop iteration. */
-void metrics_tick(void);
+/* Protothread: update load-average EMAs every second. Schedule from main loop with loop_timestamp. */
+PT_THREAD(metrics_tick_pt(struct pt *pt, time_t loop_timestamp));
 
 /* Call when a call is answered (2xx). */
 void metrics_call_active(void);

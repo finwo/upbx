@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <time.h>
+#include "common/pt.h"
 
 typedef struct {
   char *number;       /* Extension number (e.g. "206") for config lookup */
@@ -47,5 +48,8 @@ const char *registration_get_trunk_for_ext(const char *ext_number);
 /* Learned advertise address (from Request-URI of REGISTER). */
 void registration_set_advertise_addr(const char *host, const char *port);
 int  registration_get_advertise_addr(char *host_out, size_t host_size, char *port_out, size_t port_size);
+
+/* Protothread: every 60s removes expired entries from the registration list. Run each daemon iteration. */
+PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp));
 
 #endif

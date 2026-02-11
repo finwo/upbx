@@ -15,6 +15,7 @@ extern "C" {
 #include "CliModule/setup.h"
 #include "CliModule/execute_command.h"
 #include "CliModule/common.h"
+#include "config.h"
 
 #ifdef __cplusplus
 }
@@ -233,6 +234,7 @@ int main(int argc, const char **argv) {
   if (!config_path || !config_path[0])
     config_path = cli_resolve_default_config();
   cli_set_config_path(config_path);
+  config_set_path(config_path);
 
   int level = LOG_INFO;
   if (0) {
