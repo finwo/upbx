@@ -175,9 +175,9 @@ static int start_registration(const char *trunk_name, const char *host, const ch
   size_t req_len;
   int with_auth = (state->auth_nonce && state->auth_realm) ? 1 : 0;
 
-  plugmod_resp_object *listen_obj = config_key_get("upbx", "listen");
-  const char *listen = (listen_obj && (listen_obj->type == PLUGMOD_RESPT_BULK || listen_obj->type == PLUGMOD_RESPT_SIMPLE) && listen_obj->u.s) ? listen_obj->u.s : "0.0.0.0:5060";
-  if (listen_obj) plugmod_resp_free(listen_obj);
+  resp_object *listen_obj = config_key_get("upbx", "listen");
+  const char *listen = (listen_obj && (listen_obj->type == RESPT_BULK || listen_obj->type == RESPT_SIMPLE) && listen_obj->u.s) ? listen_obj->u.s : "0.0.0.0:5060";
+  if (listen_obj) resp_free(listen_obj);
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
@@ -227,8 +227,8 @@ static void handle_reg_response(const char *trunk_name, trunk_state_t *state, ch
   if (status_code == 401) {
     char section[128];
     snprintf(section, sizeof(section), "trunk:%s", trunk_name);
-    plugmod_resp_object *pw_obj = config_key_get(section, "password");
-    const char *password = (pw_obj && (pw_obj->type == PLUGMOD_RESPT_BULK || pw_obj->type == PLUGMOD_RESPT_SIMPLE)) ? pw_obj->u.s : NULL;
+    resp_object *pw_obj = config_key_get(section, "password");
+    const char *password = (pw_obj && (pw_obj->type == RESPT_BULK || pw_obj->type == RESPT_SIMPLE)) ? pw_obj->u.s : NULL;
     if (password && password[0]) {
       free(state->auth_nonce);
       free(state->auth_realm);
@@ -239,16 +239,16 @@ static void handle_reg_response(const char *trunk_name, trunk_state_t *state, ch
       if (sip_parse_www_authenticate(buf, buflen, &state->auth_nonce, &state->auth_realm,
               &state->auth_algorithm, &state->auth_opaque, &state->auth_qop)) {
         log_debug("trunk %s: 401 challenge received, retrying REGISTER with Digest", trunk_name);
-        plugmod_resp_object *host_o = config_key_get(section, "host");
-        plugmod_resp_object *port_o = config_key_get(section, "port");
-        plugmod_resp_object *user_o = config_key_get(section, "username");
-        plugmod_resp_object *ua_o = config_key_get(section, "user_agent");
-        const char *host = (host_o && (host_o->type == PLUGMOD_RESPT_BULK || host_o->type == PLUGMOD_RESPT_SIMPLE)) ? host_o->u.s : "";
-        const char *port = (port_o && (port_o->type == PLUGMOD_RESPT_BULK || port_o->type == PLUGMOD_RESPT_SIMPLE)) ? port_o->u.s : "5060";
-        const char *user = (user_o && (user_o->type == PLUGMOD_RESPT_BULK || user_o->type == PLUGMOD_RESPT_SIMPLE)) ? user_o->u.s : "";
-        const char *ua = (ua_o && (ua_o->type == PLUGMOD_RESPT_BULK || ua_o->type == PLUGMOD_RESPT_SIMPLE)) ? ua_o->u.s : "";
-        plugmod_resp_object *listen_obj = config_key_get("upbx", "listen");
-        const char *listen = (listen_obj && (listen_obj->type == PLUGMOD_RESPT_BULK || listen_obj->type == PLUGMOD_RESPT_SIMPLE) && listen_obj->u.s) ? listen_obj->u.s : "0.0.0.0:5060";
+        resp_object *host_o = config_key_get(section, "host");
+        resp_object *port_o = config_key_get(section, "port");
+        resp_object *user_o = config_key_get(section, "username");
+        resp_object *ua_o = config_key_get(section, "user_agent");
+        const char *host = (host_o && (host_o->type == RESPT_BULK || host_o->type == RESPT_SIMPLE)) ? host_o->u.s : "";
+        const char *port = (port_o && (port_o->type == RESPT_BULK || port_o->type == RESPT_SIMPLE)) ? port_o->u.s : "5060";
+        const char *user = (user_o && (user_o->type == RESPT_BULK || user_o->type == RESPT_SIMPLE)) ? user_o->u.s : "";
+        const char *ua = (ua_o && (ua_o->type == RESPT_BULK || ua_o->type == RESPT_SIMPLE)) ? ua_o->u.s : "";
+        resp_object *listen_obj = config_key_get("upbx", "listen");
+        const char *listen = (listen_obj && (listen_obj->type == RESPT_BULK || listen_obj->type == RESPT_SIMPLE) && listen_obj->u.s) ? listen_obj->u.s : "0.0.0.0:5060";
         char *req_str = NULL;
         size_t req_len = build_register(host, port, user, password, listen, ua, state, 1, &req_str);
         if (req_len > 0 && req_str && state->reg_res) {
@@ -256,16 +256,16 @@ static void handle_reg_response(const char *trunk_name, trunk_state_t *state, ch
             state->reg_deadline = time(NULL) + TRUNK_UDP_RECV_TIMEOUT_SEC;
         }
         free(req_str);
-        if (host_o) plugmod_resp_free(host_o);
-        if (port_o) plugmod_resp_free(port_o);
-        if (user_o) plugmod_resp_free(user_o);
-        if (ua_o) plugmod_resp_free(ua_o);
-        if (listen_obj) plugmod_resp_free(listen_obj);
-        if (pw_obj) plugmod_resp_free(pw_obj);
+        if (host_o) resp_free(host_o);
+        if (port_o) resp_free(port_o);
+        if (user_o) resp_free(user_o);
+        if (ua_o) resp_free(ua_o);
+        if (listen_obj) resp_free(listen_obj);
+        if (pw_obj) resp_free(pw_obj);
         return;
       }
     }
-    if (pw_obj) plugmod_resp_free(pw_obj);
+    if (pw_obj) resp_free(pw_obj);
   }
   if (status_code >= 200 && status_code < 300) {
     int refresh = sip_response_contact_expires(buf, buflen);
@@ -344,9 +344,9 @@ void trunk_reg_poll(fd_set *read_set) {
 PT_THREAD(trunk_reg_pt(struct pt *pt)) {
   PT_BEGIN(pt);
   for (;;) {
-    plugmod_resp_object *sections = config_sections_list();
-    if (!sections || sections->type != PLUGMOD_RESPT_ARRAY) {
-      if (sections) plugmod_resp_free(sections);
+    resp_object *sections = config_sections_list();
+    if (!sections || sections->type != RESPT_ARRAY) {
+      if (sections) resp_free(sections);
       PT_YIELD(pt);
       continue;
     }
@@ -355,8 +355,8 @@ PT_THREAD(trunk_reg_pt(struct pt *pt)) {
     size_t names_n = 0;
     size_t names_cap = 0;
     for (size_t i = 0; i < sections->u.arr.n; i++) {
-      plugmod_resp_object *e = &sections->u.arr.elem[i];
-      if ((e->type != PLUGMOD_RESPT_BULK && e->type != PLUGMOD_RESPT_SIMPLE) || !e->u.s) continue;
+      resp_object *e = &sections->u.arr.elem[i];
+      if ((e->type != RESPT_BULK && e->type != RESPT_SIMPLE) || !e->u.s) continue;
       if (strncmp(e->u.s, TRUNK_PREFIX, TRUNK_PREFIX_LEN) != 0) continue;
       const char *tail = e->u.s + TRUNK_PREFIX_LEN;
       if (!tail[0]) continue;
@@ -370,7 +370,7 @@ PT_THREAD(trunk_reg_pt(struct pt *pt)) {
       names[names_n] = strdup(tail);
       if (names[names_n]) names_n++;
     }
-    plugmod_resp_free(sections);
+    resp_free(sections);
 
     /* Ensure we have an entry for each configured trunk */
     for (size_t k = 0; k < names_n; k++)
@@ -397,22 +397,22 @@ PT_THREAD(trunk_reg_pt(struct pt *pt)) {
 
       char section[128];
       snprintf(section, sizeof(section), "trunk:%s", ent->name);
-      plugmod_resp_object *sec = config_section_get(section);
-      if (!sec || sec->type != PLUGMOD_RESPT_ARRAY) {
-        if (sec) plugmod_resp_free(sec);
+      resp_object *sec = config_section_get(section);
+      if (!sec || sec->type != RESPT_ARRAY) {
+        if (sec) resp_free(sec);
         continue;
       }
-      const char *host = plugmod_resp_map_get_string(sec, "host");
-      const char *port = plugmod_resp_map_get_string(sec, "port");
-      const char *user = plugmod_resp_map_get_string(sec, "username");
-      const char *password = plugmod_resp_map_get_string(sec, "password");
-      const char *user_agent = plugmod_resp_map_get_string(sec, "user_agent");
+      const char *host = resp_map_get_string(sec, "host");
+      const char *port = resp_map_get_string(sec, "port");
+      const char *user = resp_map_get_string(sec, "username");
+      const char *password = resp_map_get_string(sec, "password");
+      const char *user_agent = resp_map_get_string(sec, "user_agent");
       if (!host || !host[0]) {
-        plugmod_resp_free(sec);
+        resp_free(sec);
         continue;
       }
       start_registration(ent->name, host, port ? port : "5060", user, password, user_agent, &ent->state);
-      plugmod_resp_free(sec);
+      resp_free(sec);
     }
 
     PT_YIELD(pt);

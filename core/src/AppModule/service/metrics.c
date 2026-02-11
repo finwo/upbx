@@ -78,26 +78,26 @@ static bool write_extension_map(api_client_t *c, ext_reg_t *reg) {
 static bool write_trunk_map(api_client_t *c, const char *trunk_name) {
   char section[128];
   snprintf(section, sizeof(section), "trunk:%s", trunk_name);
-  plugmod_resp_object *map = config_section_get(section);
+  resp_object *map = config_section_get(section);
   int available = trunk_reg_is_available(trunk_name);
-  if (!map || map->type != PLUGMOD_RESPT_ARRAY) {
-    if (map) plugmod_resp_free(map);
+  if (!map || map->type != RESPT_ARRAY) {
+    if (map) resp_free(map);
     return false;
   }
-  const char *host = plugmod_resp_map_get_string(map, "host");
-  const char *port = plugmod_resp_map_get_string(map, "port");
-  const char *group = plugmod_resp_map_get_string(map, "group");
-  const char *cid = plugmod_resp_map_get_string(map, "cid");
-  const char *cid_name = plugmod_resp_map_get_string(map, "cid_name");
-  if (!api_write_array(c, 18)) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "name", trunk_name)) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "host", host ? host : "")) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "port", port ? port : "")) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv_int(c, "available", available)) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "group_prefix", group ? group : "")) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "cid", cid ? cid : "")) { plugmod_resp_free(map); return false; }
-  if (!api_write_kv(c, "cid_name", cid_name ? cid_name : "")) { plugmod_resp_free(map); return false; }
-  plugmod_resp_free(map);
+  const char *host = resp_map_get_string(map, "host");
+  const char *port = resp_map_get_string(map, "port");
+  const char *group = resp_map_get_string(map, "group");
+  const char *cid = resp_map_get_string(map, "cid");
+  const char *cid_name = resp_map_get_string(map, "cid_name");
+  if (!api_write_array(c, 18)) { resp_free(map); return false; }
+  if (!api_write_kv(c, "name", trunk_name)) { resp_free(map); return false; }
+  if (!api_write_kv(c, "host", host ? host : "")) { resp_free(map); return false; }
+  if (!api_write_kv(c, "port", port ? port : "")) { resp_free(map); return false; }
+  if (!api_write_kv_int(c, "available", available)) { resp_free(map); return false; }
+  if (!api_write_kv(c, "group_prefix", group ? group : "")) { resp_free(map); return false; }
+  if (!api_write_kv(c, "cid", cid ? cid : "")) { resp_free(map); return false; }
+  if (!api_write_kv(c, "cid_name", cid_name ? cid_name : "")) { resp_free(map); return false; }
+  resp_free(map);
   return true;
 }
 

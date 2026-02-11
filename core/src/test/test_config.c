@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include "finwo/assert.h"
 #include "config.h"
-#include "PluginModule/plugin.h"
+#include "RespModule/resp.h"
 
 /* Write a temporary config file and return its path (caller frees). */
 static char *write_temp_config(const char *content) {
@@ -130,14 +130,14 @@ void test_config_missing_file(void) {
 void test_config_sections_list_path(void) {
   char *path = write_temp_config(TEST_CONFIG);
   ASSERT("temp file created", path != NULL);
-  plugmod_resp_object *arr = config_sections_list_path(path);
+  resp_object *arr = config_sections_list_path(path);
   ASSERT("sections list non-NULL", arr != NULL);
-  ASSERT_EQUALS(PLUGMOD_RESPT_ARRAY, arr->type);
+  ASSERT_EQUALS(RESPT_ARRAY, arr->type);
   ASSERT("has sections", arr->u.arr.n >= 4);
   int has_upbx = 0, has_trunk = 0, has_ext = 0, has_plugin = 0;
   for (size_t i = 0; i < arr->u.arr.n; i++) {
-    plugmod_resp_object *e = &arr->u.arr.elem[i];
-    if (e->type == PLUGMOD_RESPT_BULK && e->u.s) {
+    resp_object *e = &arr->u.arr.elem[i];
+    if (e->type == RESPT_BULK && e->u.s) {
       if (strcmp(e->u.s, "upbx") == 0) has_upbx = 1;
       if (strncmp(e->u.s, "trunk:", 6) == 0) has_trunk = 1;
       if (strncmp(e->u.s, "ext:", 4) == 0) has_ext = 1;
@@ -148,7 +148,7 @@ void test_config_sections_list_path(void) {
   ASSERT("has trunk section", has_trunk);
   ASSERT("has ext section", has_ext);
   ASSERT("has plugin section", has_plugin);
-  plugmod_resp_free(arr);
+  resp_free(arr);
   unlink(path);
   free(path);
 }
@@ -156,18 +156,18 @@ void test_config_sections_list_path(void) {
 void test_config_section_get_path(void) {
   char *path = write_temp_config(TEST_CONFIG);
   ASSERT("temp file created", path != NULL);
-  plugmod_resp_object *map = config_section_get_path(path, "upbx");
+  resp_object *map = config_section_get_path(path, "upbx");
   ASSERT("section get non-NULL", map != NULL);
-  ASSERT_EQUALS(PLUGMOD_RESPT_ARRAY, map->type);
-  const char *listen = plugmod_resp_map_get_string(map, "listen");
+  ASSERT_EQUALS(RESPT_ARRAY, map->type);
+  const char *listen = resp_map_get_string(map, "listen");
   ASSERT("listen key present", listen != NULL);
   ASSERT_STRING_EQUALS("0.0.0.0:5060", listen);
-  plugmod_resp_free(map);
+  resp_free(map);
   map = config_section_get_path(path, "ext:200");
   ASSERT("ext:200 section non-NULL", map != NULL);
-  ASSERT_STRING_EQUALS("pass200", plugmod_resp_map_get_string(map, "secret"));
-  ASSERT_STRING_EQUALS("Reception", plugmod_resp_map_get_string(map, "name"));
-  plugmod_resp_free(map);
+  ASSERT_STRING_EQUALS("pass200", resp_map_get_string(map, "secret"));
+  ASSERT_STRING_EQUALS("Reception", resp_map_get_string(map, "name"));
+  resp_free(map);
   unlink(path);
   free(path);
 }
@@ -175,16 +175,16 @@ void test_config_section_get_path(void) {
 void test_config_key_get_path(void) {
   char *path = write_temp_config(TEST_CONFIG);
   ASSERT("temp file created", path != NULL);
-  plugmod_resp_object *v = config_key_get_path(path, "upbx", "listen");
+  resp_object *v = config_key_get_path(path, "upbx", "listen");
   ASSERT("key get non-NULL", v != NULL);
-  ASSERT_EQUALS(PLUGMOD_RESPT_BULK, v->type);
+  ASSERT_EQUALS(RESPT_BULK, v->type);
   ASSERT_STRING_EQUALS("0.0.0.0:5060", v->u.s);
-  plugmod_resp_free(v);
+  resp_free(v);
   v = config_key_get_path(path, "upbx", "locality");
   ASSERT("locality key non-NULL", v != NULL);
-  ASSERT_EQUALS(PLUGMOD_RESPT_INT, v->type);
+  ASSERT_EQUALS(RESPT_INT, v->type);
   ASSERT_EQUALS(3, (int)v->u.i);
-  plugmod_resp_free(v);
+  resp_free(v);
   unlink(path);
   free(path);
 }
@@ -193,18 +193,18 @@ void test_config_default_getters(void) {
   char *path = write_temp_config(TEST_CONFIG);
   ASSERT("temp file created", path != NULL);
   config_set_path(path);
-  plugmod_resp_object *arr = config_sections_list();
+  resp_object *arr = config_sections_list();
   ASSERT("default sections list non-NULL", arr != NULL);
-  ASSERT_EQUALS(PLUGMOD_RESPT_ARRAY, arr->type);
-  plugmod_resp_free(arr);
-  plugmod_resp_object *map = config_section_get("upbx");
+  ASSERT_EQUALS(RESPT_ARRAY, arr->type);
+  resp_free(arr);
+  resp_object *map = config_section_get("upbx");
   ASSERT("default section get non-NULL", map != NULL);
-  ASSERT_STRING_EQUALS("0.0.0.0:5060", plugmod_resp_map_get_string(map, "listen"));
-  plugmod_resp_free(map);
-  plugmod_resp_object *kv = config_key_get("upbx", "listen");
+  ASSERT_STRING_EQUALS("0.0.0.0:5060", resp_map_get_string(map, "listen"));
+  resp_free(map);
+  resp_object *kv = config_key_get("upbx", "listen");
   ASSERT("default key get non-NULL", kv != NULL);
   ASSERT_STRING_EQUALS("0.0.0.0:5060", kv->u.s);
-  plugmod_resp_free(kv);
+  resp_free(kv);
   config_set_path(NULL);
   ASSERT("sections_list with no path returns NULL", config_sections_list() == NULL);
   unlink(path);

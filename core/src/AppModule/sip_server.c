@@ -53,41 +53,41 @@ static char *auth_generate_nonce(void) {
 
 static int ext_pattern_match(const char *pattern, const char *number);
 
-/* Get extension section from live config: exact ext:<number> first, then first pattern match in config order. Caller plugmod_resp_free. If section_name_out non-NULL, copy the section name used (e.g. "ext:206" or "ext:20x"). */
-static plugmod_resp_object *get_extension_section(const char *number, char *section_name_out, size_t section_name_size) {
+/* Get extension section from live config: exact ext:<number> first, then first pattern match in config order. Caller resp_free. If section_name_out non-NULL, copy the section name used (e.g. "ext:206" or "ext:20x"). */
+static resp_object *get_extension_section(const char *number, char *section_name_out, size_t section_name_size) {
   if (!number || !number[0]) return NULL;
   char section[128];
   snprintf(section, sizeof(section), "ext:%s", number);
-  plugmod_resp_object *exact = config_section_get(section);
-  if (exact && exact->type == PLUGMOD_RESPT_ARRAY) {
+  resp_object *exact = config_section_get(section);
+  if (exact && exact->type == RESPT_ARRAY) {
     if (section_name_out && section_name_size) {
       strncpy(section_name_out, section, section_name_size - 1);
       section_name_out[section_name_size - 1] = '\0';
     }
     return exact;
   }
-  if (exact) { plugmod_resp_free(exact); exact = NULL; }
+  if (exact) { resp_free(exact); exact = NULL; }
 
-  plugmod_resp_object *list = config_sections_list();
-  if (!list || list->type != PLUGMOD_RESPT_ARRAY) {
-    if (list) plugmod_resp_free(list);
+  resp_object *list = config_sections_list();
+  if (!list || list->type != RESPT_ARRAY) {
+    if (list) resp_free(list);
     return NULL;
   }
   for (size_t i = 0; i < list->u.arr.n; i++) {
-    plugmod_resp_object *e = &list->u.arr.elem[i];
-    if ((e->type != PLUGMOD_RESPT_BULK && e->type != PLUGMOD_RESPT_SIMPLE) || !e->u.s) continue;
+    resp_object *e = &list->u.arr.elem[i];
+    if ((e->type != RESPT_BULK && e->type != RESPT_SIMPLE) || !e->u.s) continue;
     if (strncmp(e->u.s, "ext:", 4) != 0) continue;
     const char *tail = e->u.s + 4;
     if (!ext_pattern_match(tail, number)) continue;
-    plugmod_resp_object *sec = config_section_get(e->u.s);
+    resp_object *sec = config_section_get(e->u.s);
     if (sec && section_name_out && section_name_size) {
       strncpy(section_name_out, e->u.s, section_name_size - 1);
       section_name_out[section_name_size - 1] = '\0';
     }
-    plugmod_resp_free(list);
+    resp_free(list);
     return sec;
   }
-  plugmod_resp_free(list);
+  resp_free(list);
   return NULL;
 }
 
@@ -322,150 +322,89 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
 
 /* Trunk lookup for extension is now registration_get_trunk_for_ext() in registration.c. */
 
-/* Build one map for extension.list: key "extensions" = array of maps { number, name, trunk }. Caller plugmod_resp_frees. */
-static plugmod_resp_object *build_extension_list_map(upbx_config *cfg) {
-  size_t n = cfg->extension_count;
-  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+/* Build one map for extension.list: key "extensions" = array of maps { number, name, trunk }. Caller resp_frees. */
+static resp_object *build_extension_list_map(upbx_config *cfg) {
+  resp_object *map = resp_array_init();
   if (!map) return NULL;
-  map->type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.n = 2;
-  map->u.arr.elem = calloc(2, sizeof(plugmod_resp_object));
-  if (!map->u.arr.elem) { free(map); return NULL; }
-  map->u.arr.elem[0].type = PLUGMOD_RESPT_BULK;
-  map->u.arr.elem[0].u.s = strdup("extensions");
-  if (!map->u.arr.elem[0].u.s) { free(map->u.arr.elem); free(map); return NULL; }
-  plugmod_resp_object *arr = calloc(1, sizeof(plugmod_resp_object));
-  if (!arr) { free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
-  arr->type = PLUGMOD_RESPT_ARRAY;
-  arr->u.arr.n = n;
-  arr->u.arr.elem = n ? calloc(n, sizeof(plugmod_resp_object)) : NULL;
-  if (n && !arr->u.arr.elem) { free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
-  for (size_t i = 0; i < n; i++) {
+  if (resp_array_append_bulk(map, "extensions") != 0) { resp_free(map); return NULL; }
+  resp_object *arr = resp_array_init();
+  if (!arr) { resp_free(map); return NULL; }
+  for (size_t i = 0; i < cfg->extension_count; i++) {
     config_extension *e = &cfg->extensions[i];
-    plugmod_resp_object *em = &arr->u.arr.elem[i];
-    em->type = PLUGMOD_RESPT_ARRAY;
-    em->u.arr.n = 6;
-    em->u.arr.elem = calloc(6, sizeof(plugmod_resp_object));
-    if (!em->u.arr.elem) {
-      for (size_t k = 0; k < i; k++) {
-        free(arr->u.arr.elem[k].u.arr.elem[0].u.s); free(arr->u.arr.elem[k].u.arr.elem[1].u.s);
-        free(arr->u.arr.elem[k].u.arr.elem[2].u.s); free(arr->u.arr.elem[k].u.arr.elem[3].u.s);
-        free(arr->u.arr.elem[k].u.arr.elem[4].u.s); free(arr->u.arr.elem[k].u.arr.elem[5].u.s);
-        free(arr->u.arr.elem[k].u.arr.elem);
-      }
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
-      return NULL;
-    }
     const char *trunk_str = registration_get_trunk_for_ext(e->number);
-    em->u.arr.elem[0].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[0].u.s = strdup("number");
-    em->u.arr.elem[1].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[1].u.s = strdup(e->number ? e->number : "");
-    em->u.arr.elem[2].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[2].u.s = strdup("name");
-    em->u.arr.elem[3].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[3].u.s = strdup(e->name ? e->name : "");
-    em->u.arr.elem[4].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[4].u.s = strdup("trunk");
-    em->u.arr.elem[5].type = PLUGMOD_RESPT_BULK; em->u.arr.elem[5].u.s = strdup(trunk_str ? trunk_str : "");
-    if (!em->u.arr.elem[0].u.s || !em->u.arr.elem[1].u.s || !em->u.arr.elem[2].u.s || !em->u.arr.elem[3].u.s || !em->u.arr.elem[4].u.s || !em->u.arr.elem[5].u.s) {
-      for (int k = 0; k < 6; k++) free(em->u.arr.elem[k].u.s);
-      free(em->u.arr.elem);
-      for (size_t k = 0; k < i; k++) {
-        for (int q = 0; q < 6; q++) free(arr->u.arr.elem[k].u.arr.elem[q].u.s);
-        free(arr->u.arr.elem[k].u.arr.elem);
-      }
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+    resp_object *em = resp_array_init();
+    if (!em) { resp_free(arr); resp_free(map); return NULL; }
+    if (resp_array_append_bulk(em, "number") != 0 || resp_array_append_bulk(em, e->number ? e->number : "") != 0 ||
+        resp_array_append_bulk(em, "name") != 0 || resp_array_append_bulk(em, e->name ? e->name : "") != 0 ||
+        resp_array_append_bulk(em, "trunk") != 0 || resp_array_append_bulk(em, trunk_str ? trunk_str : "") != 0) {
+      resp_free(em);
+      resp_free(arr);
+      resp_free(map);
       return NULL;
     }
+    if (resp_array_append_obj(arr, em) != 0) { resp_free(em); resp_free(arr); resp_free(map); return NULL; }
   }
-  map->u.arr.elem[1].type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.elem[1].u.arr = arr->u.arr;
-  free(arr);
+  if (resp_array_append_obj(map, arr) != 0) { resp_free(arr); resp_free(map); return NULL; }
   return map;
 }
 
-/* Build one map for trunk.list: key "trunks" = array of maps { name, group_prefix, dids, cid, extensions }. Caller plugmod_resp_frees. */
-static plugmod_resp_object *build_trunk_list_map(upbx_config *cfg) {
-  size_t n = cfg->trunk_count;
-  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+/* Build one map for trunk.list: key "trunks" = array of maps { name, group_prefix, dids, cid, extensions }. Caller resp_frees. */
+static resp_object *build_trunk_list_map(upbx_config *cfg) {
+  resp_object *map = resp_array_init();
   if (!map) return NULL;
-  map->type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.n = 2;
-  map->u.arr.elem = calloc(2, sizeof(plugmod_resp_object));
-  if (!map->u.arr.elem) { free(map); return NULL; }
-  map->u.arr.elem[0].type = PLUGMOD_RESPT_BULK;
-  map->u.arr.elem[0].u.s = strdup("trunks");
-  if (!map->u.arr.elem[0].u.s) { free(map->u.arr.elem); free(map); return NULL; }
-  plugmod_resp_object *arr = calloc(1, sizeof(plugmod_resp_object));
-  if (!arr) { free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
-  arr->type = PLUGMOD_RESPT_ARRAY;
-  arr->u.arr.n = n;
-  arr->u.arr.elem = n ? calloc(n, sizeof(plugmod_resp_object)) : NULL;
-  if (n && !arr->u.arr.elem) { free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); return NULL; }
-  for (size_t i = 0; i < n; i++) {
+  if (resp_array_append_bulk(map, "trunks") != 0) { resp_free(map); return NULL; }
+  resp_object *arr = resp_array_init();
+  if (!arr) { resp_free(map); return NULL; }
+  for (size_t i = 0; i < cfg->trunk_count; i++) {
     config_trunk *t = &cfg->trunks[i];
-    plugmod_resp_object *tm = &arr->u.arr.elem[i];
-    tm->type = PLUGMOD_RESPT_ARRAY;
-    tm->u.arr.n = 10; /* 5 keys + 5 values */
-    tm->u.arr.elem = calloc(10, sizeof(plugmod_resp_object));
-    if (!tm->u.arr.elem) {
-      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
+    resp_object *tm = resp_array_init();
+    if (!tm) { resp_free(arr); resp_free(map); return NULL; }
+    if (resp_array_append_bulk(tm, "name") != 0 || resp_array_append_bulk(tm, t->name ? t->name : "") != 0 ||
+        resp_array_append_bulk(tm, "group_prefix") != 0 || resp_array_append_bulk(tm, t->group_prefix ? t->group_prefix : "") != 0 ||
+        resp_array_append_bulk(tm, "dids") != 0) {
+      resp_free(tm);
+      resp_free(arr);
+      resp_free(map);
       return NULL;
     }
-    plugmod_resp_object *e = tm->u.arr.elem;
-    e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("name");
-    e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(t->name ? t->name : "");
-    e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("group_prefix");
-    e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(t->group_prefix ? t->group_prefix : "");
-    e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("dids");
-    plugmod_resp_object *dids_arr = calloc(1, sizeof(plugmod_resp_object));
-    if (!dids_arr) {
-      for (int k = 0; k < 10; k++) free(e[k].u.s);
-      free(tm->u.arr.elem);
-      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
-      return NULL;
-    }
-    dids_arr->type = PLUGMOD_RESPT_ARRAY;
-    dids_arr->u.arr.n = t->did_count;
-    dids_arr->u.arr.elem = t->did_count ? calloc(t->did_count, sizeof(plugmod_resp_object)) : NULL;
-    if (t->did_count && !dids_arr->u.arr.elem) {
-      free(dids_arr);
-      for (int k = 0; k < 10; k++) free(e[k].u.s);
-      free(tm->u.arr.elem);
-      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
-      return NULL;
-    }
+    resp_object *dids_arr = resp_array_init();
+    if (!dids_arr) { resp_free(tm); resp_free(arr); resp_free(map); return NULL; }
     for (size_t d = 0; d < t->did_count; d++) {
-      dids_arr->u.arr.elem[d].type = PLUGMOD_RESPT_BULK;
-      dids_arr->u.arr.elem[d].u.s = strdup(t->dids[d] ? t->dids[d] : "");
+      if (resp_array_append_bulk(dids_arr, t->dids[d] ? t->dids[d] : "") != 0) {
+        resp_free(dids_arr);
+        resp_free(tm);
+        resp_free(arr);
+        resp_free(map);
+        return NULL;
+      }
     }
-    e[5].type = PLUGMOD_RESPT_ARRAY; e[5].u.arr = dids_arr->u.arr; free(dids_arr);
-    e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("cid");
-    e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(t->cid ? t->cid : "");
-    e[8].type = PLUGMOD_RESPT_BULK; e[8].u.s = strdup("extensions");
+    if (resp_array_append_obj(tm, dids_arr) != 0) { resp_free(dids_arr); resp_free(tm); resp_free(arr); resp_free(map); return NULL; }
+    if (resp_array_append_bulk(tm, "cid") != 0 || resp_array_append_bulk(tm, t->cid ? t->cid : "") != 0 ||
+        resp_array_append_bulk(tm, "extensions") != 0) {
+      resp_free(tm);
+      resp_free(arr);
+      resp_free(map);
+      return NULL;
+    }
     ext_reg_t **tregs = NULL;
     size_t treg_count = registration_get_regs(t->name, NULL, &tregs);
-    plugmod_resp_object *exts_arr = calloc(1, sizeof(plugmod_resp_object));
-    if (!exts_arr) {
-      plugmod_resp_free(tm);
-      for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]);
-      free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map);
-      if (tregs) free(tregs);
-      return NULL;
-    }
-    exts_arr->type = PLUGMOD_RESPT_ARRAY;
-    exts_arr->u.arr.n = treg_count;
-    exts_arr->u.arr.elem = treg_count ? calloc(treg_count, sizeof(plugmod_resp_object)) : NULL;
-    if (treg_count && !exts_arr->u.arr.elem) { free(exts_arr); plugmod_resp_free(tm); for (size_t k = 0; k < i; k++) plugmod_resp_free(&arr->u.arr.elem[k]); free(arr->u.arr.elem); free(arr); free(map->u.arr.elem[0].u.s); free(map->u.arr.elem); free(map); if (tregs) free(tregs); return NULL; }
+    resp_object *exts_arr = resp_array_init();
+    if (!exts_arr) { resp_free(tm); resp_free(arr); resp_free(map); if (tregs) free(tregs); return NULL; }
     for (size_t r = 0; r < treg_count; r++) {
-      exts_arr->u.arr.elem[r].type = PLUGMOD_RESPT_BULK;
-      exts_arr->u.arr.elem[r].u.s = strdup(tregs[r]->number ? tregs[r]->number : "");
+      if (resp_array_append_bulk(exts_arr, tregs[r]->number ? tregs[r]->number : "") != 0) {
+        resp_free(exts_arr);
+        resp_free(tm);
+        resp_free(arr);
+        resp_free(map);
+        if (tregs) free(tregs);
+        return NULL;
+      }
     }
     if (tregs) free(tregs);
-    e[9].type = PLUGMOD_RESPT_ARRAY; e[9].u.arr = exts_arr->u.arr; free(exts_arr);
+    if (resp_array_append_obj(tm, exts_arr) != 0) { resp_free(exts_arr); resp_free(tm); resp_free(arr); resp_free(map); return NULL; }
+    if (resp_array_append_obj(arr, tm) != 0) { resp_free(tm); resp_free(arr); resp_free(map); return NULL; }
   }
-  map->u.arr.elem[1].type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.elem[1].u.arr = arr->u.arr;
-  free(arr);
+  if (resp_array_append_obj(map, arr) != 0) { resp_free(arr); resp_free(map); return NULL; }
   return map;
 }
 
@@ -478,10 +417,10 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
     if (plugin_has_event(plugin_name_at(i), "extension.list")) break;
   }
   if (i < plugin_count()) {
-    plugmod_resp_object *map = build_extension_list_map(cfg);
+    resp_object *map = build_extension_list_map(cfg);
     if (map) {
-      plugin_notify_event("extension.list", 1, (const plugmod_resp_object *const *)&map);
-      plugmod_resp_free(map);
+      plugin_notify_event("extension.list", 1, (const resp_object *const *)&map);
+      resp_free(map);
     }
   }
 
@@ -489,10 +428,10 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
     if (plugin_has_event(plugin_name_at(i), "trunk.list")) break;
   }
   if (i < plugin_count()) {
-    plugmod_resp_object *map = build_trunk_list_map(cfg);
+    resp_object *map = build_trunk_list_map(cfg);
     if (map) {
-      plugin_notify_event("trunk.list", 1, (const plugmod_resp_object *const *)&map);
-      plugmod_resp_free(map);
+      plugin_notify_event("trunk.list", 1, (const resp_object *const *)&map);
+      resp_free(map);
     }
   }
 }
@@ -517,51 +456,31 @@ static int fork_uri_from_addr(const struct sockaddr_storage *addr, const char *u
 }
 
 /* Notify plugins of call.answer (direction, call_id, source, destination). */
-/* Build one map for call.answer: direction, call_id, source, destination. Caller plugmod_resp_frees. */
-static plugmod_resp_object *build_call_answer_map(const char *direction, const char *call_id, const char *source, const char *destination) {
-  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+/* Build one map for call.answer: direction, call_id, source, destination. Caller resp_frees. */
+static resp_object *build_call_answer_map(const char *direction, const char *call_id, const char *source, const char *destination) {
+  resp_object *map = resp_array_init();
   if (!map) return NULL;
-  map->type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.n = 8;
-  map->u.arr.elem = calloc(8, sizeof(plugmod_resp_object));
-  if (!map->u.arr.elem) { free(map); return NULL; }
-  plugmod_resp_object *e = map->u.arr.elem;
-  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("direction");
-  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(direction ? direction : "");
-  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("call_id");
-  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(call_id ? call_id : "");
-  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("source");
-  e[5].type = PLUGMOD_RESPT_BULK; e[5].u.s = strdup(source ? source : "");
-  e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("destination");
-  e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(destination ? destination : "");
-  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[5].u.s || !e[6].u.s || !e[7].u.s) {
-    plugmod_resp_free(map);
+  if (resp_array_append_bulk(map, "direction") != 0 || resp_array_append_bulk(map, direction ? direction : "") != 0 ||
+      resp_array_append_bulk(map, "call_id") != 0 || resp_array_append_bulk(map, call_id ? call_id : "") != 0 ||
+      resp_array_append_bulk(map, "source") != 0 || resp_array_append_bulk(map, source ? source : "") != 0 ||
+      resp_array_append_bulk(map, "destination") != 0 || resp_array_append_bulk(map, destination ? destination : "") != 0) {
+    resp_free(map);
     return NULL;
   }
   return map;
 }
 
-/* Build one map for call.hangup: call_id, source, destination, duration_sec. Caller plugmod_resp_frees. */
-static plugmod_resp_object *build_call_hangup_map(const char *call_id, const char *source, const char *destination, int duration_sec) {
+/* Build one map for call.hangup: call_id, source, destination, duration_sec. Caller resp_frees. */
+static resp_object *build_call_hangup_map(const char *call_id, const char *source, const char *destination, int duration_sec) {
   char dur_buf[32];
   snprintf(dur_buf, sizeof(dur_buf), "%d", duration_sec);
-  plugmod_resp_object *map = calloc(1, sizeof(plugmod_resp_object));
+  resp_object *map = resp_array_init();
   if (!map) return NULL;
-  map->type = PLUGMOD_RESPT_ARRAY;
-  map->u.arr.n = 8;
-  map->u.arr.elem = calloc(8, sizeof(plugmod_resp_object));
-  if (!map->u.arr.elem) { free(map); return NULL; }
-  plugmod_resp_object *e = map->u.arr.elem;
-  e[0].type = PLUGMOD_RESPT_BULK; e[0].u.s = strdup("call_id");
-  e[1].type = PLUGMOD_RESPT_BULK; e[1].u.s = strdup(call_id ? call_id : "");
-  e[2].type = PLUGMOD_RESPT_BULK; e[2].u.s = strdup("source");
-  e[3].type = PLUGMOD_RESPT_BULK; e[3].u.s = strdup(source ? source : "");
-  e[4].type = PLUGMOD_RESPT_BULK; e[4].u.s = strdup("destination");
-  e[5].type = PLUGMOD_RESPT_BULK; e[5].u.s = strdup(destination ? destination : "");
-  e[6].type = PLUGMOD_RESPT_BULK; e[6].u.s = strdup("duration_sec");
-  e[7].type = PLUGMOD_RESPT_BULK; e[7].u.s = strdup(dur_buf);
-  if (!e[0].u.s || !e[1].u.s || !e[2].u.s || !e[3].u.s || !e[4].u.s || !e[5].u.s || !e[6].u.s || !e[7].u.s) {
-    plugmod_resp_free(map);
+  if (resp_array_append_bulk(map, "call_id") != 0 || resp_array_append_bulk(map, call_id ? call_id : "") != 0 ||
+      resp_array_append_bulk(map, "source") != 0 || resp_array_append_bulk(map, source ? source : "") != 0 ||
+      resp_array_append_bulk(map, "destination") != 0 || resp_array_append_bulk(map, destination ? destination : "") != 0 ||
+      resp_array_append_bulk(map, "duration_sec") != 0 || resp_array_append_bulk(map, dur_buf) != 0) {
+    resp_free(map);
     return NULL;
   }
   return map;
@@ -575,10 +494,10 @@ static void notify_call_answer(const char *direction, const char *call_id, const
   }
   if (i >= plugin_count()) return;
   log_debug("call.answer: notifying plugins, call=%.32s %s -> %s (%s)", call_id ? call_id : "", source ? source : "", destination ? destination : "", direction ? direction : "");
-  plugmod_resp_object *map = build_call_answer_map(direction, call_id, source, destination);
+  resp_object *map = build_call_answer_map(direction, call_id, source, destination);
   if (map) {
-    plugin_notify_event("call.answer", 1, (const plugmod_resp_object *const *)&map);
-    plugmod_resp_free(map);
+    plugin_notify_event("call.answer", 1, (const resp_object *const *)&map);
+    resp_free(map);
   }
 }
 
@@ -590,10 +509,10 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
   }
   if (i >= plugin_count()) return;
   log_debug("call.hangup: notifying plugins, call=%.32s %s -> %s (%ds)", call_id ? call_id : "", source ? source : "", destination ? destination : "", duration_sec);
-  plugmod_resp_object *map = build_call_hangup_map(call_id, source, destination, duration_sec);
+  resp_object *map = build_call_hangup_map(call_id, source, destination, duration_sec);
   if (map) {
-    plugin_notify_event("call.hangup", 1, (const plugmod_resp_object *const *)&map);
-    plugmod_resp_free(map);
+    plugin_notify_event("call.hangup", 1, (const resp_object *const *)&map);
+    resp_free(map);
   }
 }
 
@@ -828,7 +747,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     return;
   }
   /* Look up extension from live config (exact ext:<number> then first pattern match). */
-  plugmod_resp_object *ext_section = get_extension_section(extension_num, NULL, 0);
+  resp_object *ext_section = get_extension_section(extension_num, NULL, 0);
   if (!ext_section) {
     log_warn("REGISTER: 403 Forbidden — extension \"%s\" not in config (username \"%s\")", extension_num, user);
     free(raw_uri_user);
@@ -836,7 +755,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
     return;
   }
-  const char *secret = plugmod_resp_map_get_string(ext_section, "secret");
+  const char *secret = resp_map_get_string(ext_section, "secret");
   config_trunk *trunk = resolve_trunk_for_extension(cfg, extension_num);
   const char *trunk_name_str = trunk ? trunk->name : "";
 
@@ -852,7 +771,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   }
   if (plugin_allow == 0) {
     log_info("REGISTER: plugin denied registration for extension %s", extension_num);
-    plugmod_resp_free(ext_section);
+    resp_free(ext_section);
     free(raw_uri_user);
     free(extension_num);
     send_reply(ctx, req_buf, req_len, 403, 0, 0);
@@ -863,7 +782,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
       log_debug("REGISTER: 401 challenge for extension %s (no credentials or no secret)", extension_num);
       char *r = build_reply(req_buf, req_len, 401, 0, 1, NULL);
       if (r) { send_response_buf(ctx, r, strlen(r)); free(r); }
-      plugmod_resp_free(ext_section);
+      resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       return;
@@ -872,7 +791,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     if (!sip_parse_authorization_digest(req_buf, req_len, &auth_user, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
       log_debug("REGISTER: 401 challenge for extension %s (invalid Authorization header)", extension_num);
       send_reply(ctx, req_buf, req_len, 401, 0, 1);
-      plugmod_resp_free(ext_section);
+      resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       free(auth_user);
@@ -882,7 +801,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
       auth_stripped = extension_part_from_username(auth_user);
     if (!auth_stripped || strcmp(auth_stripped, extension_num) != 0) {
       log_warn("REGISTER: 403 Forbidden — Authorization username \"%s\" does not match extension \"%s\"", auth_stripped ? auth_stripped : "(null)", extension_num);
-      plugmod_resp_free(ext_section);
+      resp_free(ext_section);
       free(raw_uri_user);
       free(auth_user); free(auth_stripped); free(extension_num);
       send_reply(ctx, req_buf, req_len, 403, 0, 0);
@@ -890,7 +809,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     }
     if (!verify_digest(req_buf, req_len, "REGISTER", secret, AUTH_REALM, auth_user)) {
       log_warn("REGISTER: 403 Forbidden — digest verification failed for extension %s", extension_num);
-      plugmod_resp_free(ext_section);
+      resp_free(ext_section);
       free(raw_uri_user);
       free(extension_num);
       free(auth_user);
@@ -910,7 +829,7 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   char *contact_val = get_contact_value(req_buf, req_len);
   registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL);
   raw_uri_user = NULL;
-  plugmod_resp_free(ext_section);
+  resp_free(ext_section);
   send_reply(ctx, req_buf, req_len, 200, 1, 0);
   free(raw_uri_user);
 }
@@ -1012,24 +931,24 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
   log_trace("overflow_apply_one: call=%.32s", call->call_id);
   char section[128];
   snprintf(section, sizeof(section), "trunk:%s", call->trunk_name);
-  plugmod_resp_object *to_obj = config_key_get(section, "overflow_timeout");
-  int timeout_sec = (to_obj && to_obj->type == PLUGMOD_RESPT_INT) ? (int)to_obj->u.i : 0;
-  if (to_obj) plugmod_resp_free(to_obj);
+  resp_object *to_obj = config_key_get(section, "overflow_timeout");
+  int timeout_sec = (to_obj && to_obj->type == RESPT_INT) ? (int)to_obj->u.i : 0;
+  if (to_obj) resp_free(to_obj);
   if (timeout_sec <= 0) return;
   time_t deadline = call->created_at + (time_t)timeout_sec;
   if (time(NULL) < deadline) return;
   call->overflow_done = 1;
-  plugmod_resp_object *strat_obj = config_key_get(section, "overflow_strategy");
-  plugmod_resp_object *tgt_obj = config_key_get(section, "overflow_target");
-  const char *strategy = (strat_obj && (strat_obj->type == PLUGMOD_RESPT_BULK || strat_obj->type == PLUGMOD_RESPT_SIMPLE) && strat_obj->u.s) ? strat_obj->u.s : "none";
-  const char *target = (tgt_obj && (tgt_obj->type == PLUGMOD_RESPT_BULK || tgt_obj->type == PLUGMOD_RESPT_SIMPLE)) ? tgt_obj->u.s : NULL;
+  resp_object *strat_obj = config_key_get(section, "overflow_strategy");
+  resp_object *tgt_obj = config_key_get(section, "overflow_target");
+  const char *strategy = (strat_obj && (strat_obj->type == RESPT_BULK || strat_obj->type == RESPT_SIMPLE) && strat_obj->u.s) ? strat_obj->u.s : "none";
+  const char *target = (tgt_obj && (tgt_obj->type == RESPT_BULK || tgt_obj->type == RESPT_SIMPLE)) ? tgt_obj->u.s : NULL;
   log_debug("overflow: call %.32s strategy=%s target=%s", call->call_id, strategy, target ? target : "(none)");
   int do_busy = 0, do_include = 0, do_redirect = 0;
   if (strcasecmp(strategy, "busy") == 0) do_busy = 1;
   else if (strcasecmp(strategy, "include") == 0 && target && target[0]) do_include = 1;
   else if (strcasecmp(strategy, "redirect") == 0 && target && target[0]) do_redirect = 1;
-  if (strat_obj) plugmod_resp_free(strat_obj);
-  if (tgt_obj) plugmod_resp_free(tgt_obj);
+  if (strat_obj) resp_free(strat_obj);
+  if (tgt_obj) resp_free(tgt_obj);
 
   if (do_busy) {
     if (call->original_invite && call->original_invite_len > 0) {
@@ -1043,8 +962,8 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
     return;
   }
 
-  plugmod_resp_object *tgt2 = config_key_get(section, "overflow_target");
-  const char *overflow_target = (tgt2 && (tgt2->type == PLUGMOD_RESPT_BULK || tgt2->type == PLUGMOD_RESPT_SIMPLE) && tgt2->u.s) ? tgt2->u.s : NULL;
+  resp_object *tgt2 = config_key_get(section, "overflow_target");
+  const char *overflow_target = (tgt2 && (tgt2->type == RESPT_BULK || tgt2->type == RESPT_SIMPLE) && tgt2->u.s) ? tgt2->u.s : NULL;
   if (do_redirect) {
     cancel_active_forks(call, sockfd);
     clear_pending_exts(call);
@@ -1054,7 +973,7 @@ static void overflow_apply_one(call_t *call, upbx_config *cfg, int sockfd) {
     if (overflow_target && overflow_target[0] && call->n_pending_exts < CALL_MAX_FORKS)
       call->pending_exts[call->n_pending_exts++] = strdup(overflow_target);
   }
-  if (tgt2) plugmod_resp_free(tgt2);
+  if (tgt2) resp_free(tgt2);
 }
 
 /* Return 1 if the given extension has any answered (active) call, excluding 'exclude'. */
@@ -1197,15 +1116,15 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
   char from_val[384];
   from_val[0] = '\0';
   if (source_str) {
-    plugmod_resp_object *ext_caller_sec = get_extension_section(source_str, NULL, 0);
+    resp_object *ext_caller_sec = get_extension_section(source_str, NULL, 0);
     if (ext_caller_sec) {
-      const char *caller_display = plugmod_resp_map_get_string(ext_caller_sec, "name");
+      const char *caller_display = resp_map_get_string(ext_caller_sec, "name");
       sip_format_from_to_value((caller_display && caller_display[0]) ? caller_display : NULL, source_str, via_host, via_port, from_val, sizeof(from_val));
       char tag_buf[64];
       tag_buf[0] = '\0';
       if (sip_header_get_param(req_buf, req_len, "From", "tag", tag_buf, sizeof(tag_buf)) && tag_buf[0])
         sip_append_tag_param(from_val, sizeof(from_val), tag_buf);
-      plugmod_resp_free(ext_caller_sec);
+      resp_free(ext_caller_sec);
     }
   }
 
@@ -1409,10 +1328,10 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   free(ext_matches);
   if (!reg) {
     char pat_sec[128];
-    plugmod_resp_object *pat_sec_obj = get_extension_section(ext_num, pat_sec, sizeof(pat_sec));
+    resp_object *pat_sec_obj = get_extension_section(ext_num, pat_sec, sizeof(pat_sec));
     if (pat_sec_obj) {
       const char *section_tail = (strlen(pat_sec) > 4) ? pat_sec + 4 : "";
-      plugmod_resp_free(pat_sec_obj);
+      resp_free(pat_sec_obj);
       if (section_tail[0] && strcmp(section_tail, ext_num) != 0) {
         ext_matches = NULL;
         ext_match_count = registration_get_regs(NULL, section_tail, &ext_matches);
@@ -1657,8 +1576,8 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   /* 1. From a known extension */
   int from_ext_configured = 0;
   if (from_ext[0]) {
-    plugmod_resp_object *s = get_extension_section(from_ext, NULL, 0);
-    if (s) { from_ext_configured = 1; plugmod_resp_free(s); }
+    resp_object *s = get_extension_section(from_ext, NULL, 0);
+    if (s) { from_ext_configured = 1; resp_free(s); }
   }
   if (from_ext_configured) {
     char *ext_num = strdup(from_ext);
@@ -1684,9 +1603,9 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       if (caller_trunk && caller_trunk->group_prefix && caller_trunk->group_prefix[0]) {
         snprintf(expanded_to_ext, sizeof(expanded_to_ext), "%s%s", caller_trunk->group_prefix, to_ext);
         {
-          plugmod_resp_object *xs = get_extension_section(expanded_to_ext, NULL, 0);
+          resp_object *xs = get_extension_section(expanded_to_ext, NULL, 0);
           if (xs) {
-            plugmod_resp_free(xs);
+            resp_free(xs);
             log_debug("short-dial: %s expanded to %s (prefix %s)", to_ext, expanded_to_ext, caller_trunk->group_prefix);
             to_ext = expanded_to_ext;
           } else {
@@ -1697,7 +1616,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     }
 
     /* 1a. Extension-to-extension: callee is a known extension (exact or pattern). */
-    plugmod_resp_object *callee_ext_sec = (to_ext[0] && strcmp(ext_num, to_ext) != 0) ? get_extension_section(to_ext, NULL, 0) : NULL;
+    resp_object *callee_ext_sec = (to_ext[0] && strcmp(ext_num, to_ext) != 0) ? get_extension_section(to_ext, NULL, 0) : NULL;
     if (callee_ext_sec) {
       if (cfg->locality > 0 && !cfg->cross_group_calls) {
         config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
@@ -1709,7 +1628,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         else if (caller_prefix && callee_prefix && strcmp(caller_prefix, callee_prefix) == 0) same_group = 1;
         if (!same_group) {
           log_info("INVITE: cross-group ext-to-ext blocked %s -> %s", ext_num, to_ext);
-          plugmod_resp_free(callee_ext_sec);
+          resp_free(callee_ext_sec);
           free(ext_num);
           send_reply(ctx, buf, len, 403, 0, 0);
           return;
@@ -1721,12 +1640,12 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
         log_info("new call: ext %s -> ext %s (ext-to-ext, %zu reg(s))", ext_num, to_ext, n_ext);
         fork_invite_to_extension_regs(cfg, buf, len, ctx, exts, n_ext, NULL, ext_num, "dialin");
         free(exts);
-        plugmod_resp_free(callee_ext_sec);
+        resp_free(callee_ext_sec);
         free(ext_num);
         return;
       }
       log_debug("INVITE %s->%s: no registration for callee, sending 480", ext_num, to_ext);
-      plugmod_resp_free(callee_ext_sec);
+      resp_free(callee_ext_sec);
       send_reply(ctx, buf, len, 480, 0, 0);
       free(exts);
       free(ext_num);
@@ -1740,10 +1659,10 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     free(dm);
     if (!reg) {
       char pat_sec2[128];
-      plugmod_resp_object *pat_sec2_obj = get_extension_section(ext_num, pat_sec2, sizeof(pat_sec2));
+      resp_object *pat_sec2_obj = get_extension_section(ext_num, pat_sec2, sizeof(pat_sec2));
       if (pat_sec2_obj) {
         const char *section_tail2 = (strlen(pat_sec2) > 4) ? pat_sec2 + 4 : "";
-        plugmod_resp_free(pat_sec2_obj);
+        resp_free(pat_sec2_obj);
         if (section_tail2[0] && strcmp(section_tail2, ext_num) != 0) {
           dm = NULL;
           dmc = registration_get_regs(NULL, section_tail2, &dm);
@@ -1910,7 +1829,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       }
     }
     char match_sec[128];
-    plugmod_resp_object *match_ext_sec = fi_trunk ? get_extension_section(to_user, match_sec, sizeof(match_sec)) : NULL;
+    resp_object *match_ext_sec = fi_trunk ? get_extension_section(to_user, match_sec, sizeof(match_sec)) : NULL;
     if (fi_trunk && match_ext_sec) {
       const char *match_ext_number = (strlen(match_sec) > 4) ? match_sec + 4 : to_user;
       config_trunk *ext_trunk = resolve_trunk_for_extension(cfg, match_ext_number);
@@ -1961,12 +1880,12 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
           }
         }
       }
-      plugmod_resp_free(match_ext_sec);
+      resp_free(match_ext_sec);
       if (exts) free(exts);
       handle_invite_incoming(cfg, buf, len, ctx, to_user, NULL, 0);
       return;
     }
-    if (match_ext_sec) plugmod_resp_free(match_ext_sec);
+    if (match_ext_sec) resp_free(match_ext_sec);
   }
 
   /* 3. Fallback: from_user with @, extension prefix match → outgoing */
@@ -1978,9 +1897,9 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
       memcpy(ext_num, from_user, ext_len);
       ext_num[ext_len] = '\0';
       {
-        plugmod_resp_object *s3 = get_extension_section(ext_num, NULL, 0);
+        resp_object *s3 = get_extension_section(ext_num, NULL, 0);
         if (s3) {
-          plugmod_resp_free(s3);
+          resp_free(s3);
           free(ext_num);
           handle_invite_outgoing(cfg, buf, len, ctx, from_user, NULL, -1);
           return;

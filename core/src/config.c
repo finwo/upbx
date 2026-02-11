@@ -6,7 +6,7 @@
 #include "benhoyt/inih.h"
 #include "rxi/log.h"
 #include "config.h"
-#include "PluginModule/plugin.h"
+#include "RespModule/resp.h"
 
 #define STRDUP(s) ((s) ? strdup(s) : NULL)
 
@@ -488,7 +488,7 @@ static int sections_handler(void *user, const char *section, const char *name, c
   return 1;
 }
 
-plugmod_resp_object *config_sections_list_path(const char *path) {
+resp_object *config_sections_list_path(const char *path) {
   if (!path) return NULL;
   sections_ctx_t ctx = { NULL, 0, 0 };
   int r = ini_parse(path, sections_handler, &ctx);
@@ -497,15 +497,15 @@ plugmod_resp_object *config_sections_list_path(const char *path) {
     free(ctx.sections);
     return NULL;
   }
-  plugmod_resp_object *o = (plugmod_resp_object *)calloc(1, sizeof(plugmod_resp_object));
+  resp_object *o = (resp_object *)calloc(1, sizeof(resp_object));
   if (!o) {
     for (size_t i = 0; i < ctx.n; i++) free(ctx.sections[i]);
     free(ctx.sections);
     return NULL;
   }
-  o->type = PLUGMOD_RESPT_ARRAY;
+  o->type = RESPT_ARRAY;
   o->u.arr.n = ctx.n;
-  o->u.arr.elem = (plugmod_resp_object *)calloc(ctx.n, sizeof(plugmod_resp_object));
+  o->u.arr.elem = (resp_object *)calloc(ctx.n, sizeof(resp_object));
   if (!o->u.arr.elem && ctx.n) {
     free(o);
     for (size_t i = 0; i < ctx.n; i++) free(ctx.sections[i]);
@@ -513,7 +513,7 @@ plugmod_resp_object *config_sections_list_path(const char *path) {
     return NULL;
   }
   for (size_t i = 0; i < ctx.n; i++) {
-    o->u.arr.elem[i].type = PLUGMOD_RESPT_BULK;
+    o->u.arr.elem[i].type = RESPT_BULK;
     o->u.arr.elem[i].u.s = ctx.sections[i];
   }
   free(ctx.sections);
@@ -626,7 +626,7 @@ static int section_get_handler(void *user, const char *section, const char *name
   return 1;
 }
 
-plugmod_resp_object *config_section_get_path(const char *path, const char *section) {
+resp_object *config_section_get_path(const char *path, const char *section) {
   if (!path || !section) return NULL;
   section_get_ctx_t ctx = { section, NULL, 0, 0, "", 0 };
   int r = ini_parse(path, section_get_handler, &ctx);
@@ -634,38 +634,38 @@ plugmod_resp_object *config_section_get_path(const char *path, const char *secti
     section_get_ctx_free(&ctx);
     return NULL;
   }
-  plugmod_resp_object *o = (plugmod_resp_object *)calloc(1, sizeof(plugmod_resp_object));
+  resp_object *o = (resp_object *)calloc(1, sizeof(resp_object));
   if (!o) { section_get_ctx_free(&ctx); return NULL; }
-  o->type = PLUGMOD_RESPT_ARRAY;
+  o->type = RESPT_ARRAY;
   o->u.arr.n = ctx.n * 2;
-  o->u.arr.elem = (plugmod_resp_object *)calloc(o->u.arr.n, sizeof(plugmod_resp_object));
+  o->u.arr.elem = (resp_object *)calloc(o->u.arr.n, sizeof(resp_object));
   if (!o->u.arr.elem) {
     free(o);
     section_get_ctx_free(&ctx);
     return NULL;
   }
   for (size_t i = 0, j = 0; i < ctx.n; i++, j += 2) {
-    o->u.arr.elem[j].type = PLUGMOD_RESPT_BULK;
+    o->u.arr.elem[j].type = RESPT_BULK;
     o->u.arr.elem[j].u.s = strdup(ctx.entries[i].key);
     if (ctx.entries[i].is_array) {
-      o->u.arr.elem[j + 1].type = PLUGMOD_RESPT_ARRAY;
+      o->u.arr.elem[j + 1].type = RESPT_ARRAY;
       o->u.arr.elem[j + 1].u.arr.n = ctx.entries[i].val.arr.n;
-      o->u.arr.elem[j + 1].u.arr.elem = (plugmod_resp_object *)calloc(ctx.entries[i].val.arr.n, sizeof(plugmod_resp_object));
+      o->u.arr.elem[j + 1].u.arr.elem = (resp_object *)calloc(ctx.entries[i].val.arr.n, sizeof(resp_object));
       if (!o->u.arr.elem[j + 1].u.arr.elem) {
-        while (j > 0) { j -= 2; free(o->u.arr.elem[j].u.s); if (o->u.arr.elem[j+1].type == PLUGMOD_RESPT_ARRAY) { for (size_t k = 0; k < o->u.arr.elem[j+1].u.arr.n; k++) free(o->u.arr.elem[j+1].u.arr.elem[k].u.s); free(o->u.arr.elem[j+1].u.arr.elem); } }
+        while (j > 0) { j -= 2; free(o->u.arr.elem[j].u.s); if (o->u.arr.elem[j+1].type == RESPT_ARRAY) { for (size_t k = 0; k < o->u.arr.elem[j+1].u.arr.n; k++) free(o->u.arr.elem[j+1].u.arr.elem[k].u.s); free(o->u.arr.elem[j+1].u.arr.elem); } }
         free(o->u.arr.elem);
         free(o);
         section_get_ctx_free(&ctx);
         return NULL;
       }
       for (size_t k = 0; k < ctx.entries[i].val.arr.n; k++) {
-        o->u.arr.elem[j + 1].u.arr.elem[k].type = PLUGMOD_RESPT_BULK;
+        o->u.arr.elem[j + 1].u.arr.elem[k].type = RESPT_BULK;
         o->u.arr.elem[j + 1].u.arr.elem[k].u.s = ctx.entries[i].val.arr.ptr[k];
       }
       free(ctx.entries[i].val.arr.ptr);
       ctx.entries[i].val.arr.ptr = NULL;
     } else {
-      o->u.arr.elem[j + 1].type = PLUGMOD_RESPT_BULK;
+      o->u.arr.elem[j + 1].type = RESPT_BULK;
       o->u.arr.elem[j + 1].u.s = ctx.entries[i].val.single;
     }
     free(ctx.entries[i].key);
@@ -718,7 +718,7 @@ static int key_get_handler(void *user, const char *section, const char *name, co
   return 1;
 }
 
-plugmod_resp_object *config_key_get_path(const char *path, const char *section, const char *key) {
+resp_object *config_key_get_path(const char *path, const char *section, const char *key) {
   if (!path || !section || !key) return NULL;
   key_get_ctx_t ctx = {
     .target_section = section,
@@ -739,7 +739,7 @@ plugmod_resp_object *config_key_get_path(const char *path, const char *section, 
     free(ctx.single_val);
     return NULL;
   }
-  plugmod_resp_object *o = (plugmod_resp_object *)calloc(1, sizeof(plugmod_resp_object));
+  resp_object *o = (resp_object *)calloc(1, sizeof(resp_object));
   if (!o) {
     for (size_t i = 0; i < ctx.val_count; i++) free(ctx.vals[i]);
     free(ctx.vals);
@@ -747,9 +747,9 @@ plugmod_resp_object *config_key_get_path(const char *path, const char *section, 
     return NULL;
   }
   if (ctx.is_repeatable) {
-    o->type = PLUGMOD_RESPT_ARRAY;
+    o->type = RESPT_ARRAY;
     o->u.arr.n = ctx.val_count;
-    o->u.arr.elem = (plugmod_resp_object *)calloc(ctx.val_count, sizeof(plugmod_resp_object));
+    o->u.arr.elem = (resp_object *)calloc(ctx.val_count, sizeof(resp_object));
     if (!o->u.arr.elem && ctx.val_count) {
       free(o);
       for (size_t i = 0; i < ctx.val_count; i++) free(ctx.vals[i]);
@@ -757,29 +757,29 @@ plugmod_resp_object *config_key_get_path(const char *path, const char *section, 
       return NULL;
     }
     for (size_t i = 0; i < ctx.val_count; i++) {
-      o->u.arr.elem[i].type = PLUGMOD_RESPT_BULK;
+      o->u.arr.elem[i].type = RESPT_BULK;
       o->u.arr.elem[i].u.s = ctx.vals[i];
     }
     free(ctx.vals);
   } else if (ctx.want_int) {
-    o->type = PLUGMOD_RESPT_INT;
+    o->type = RESPT_INT;
     o->u.i = ctx.int_val;
     free(ctx.single_val);
   } else {
-    o->type = PLUGMOD_RESPT_BULK;
+    o->type = RESPT_BULK;
     o->u.s = ctx.single_val;
   }
   return o;
 }
 
-plugmod_resp_object *config_sections_list(void) {
+resp_object *config_sections_list(void) {
   return config_sections_list_path(stored_config_path);
 }
 
-plugmod_resp_object *config_section_get(const char *section) {
+resp_object *config_section_get(const char *section) {
   return config_section_get_path(stored_config_path, section);
 }
 
-plugmod_resp_object *config_key_get(const char *section, const char *key) {
+resp_object *config_key_get(const char *section, const char *key) {
   return config_key_get_path(stored_config_path, section, key);
 }

@@ -107,7 +107,7 @@ $(BIN): $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
 # ---- Test targets (finwo/assert) ----
-TEST_BINS:=test_md5 test_sdp_parse test_sip_parse test_config test_digest_auth
+TEST_BINS:=test_md5 test_sdp_parse test_sip_parse test_config test_resp test_digest_auth
 
 test_md5: src/test/test_md5.o src/common/md5.o
 	$(CC) $^ $(CFLAGS) -o $@
@@ -118,7 +118,10 @@ test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/util/sdp_parse.o
 test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o lib/rxi/log/src/log.o
 	$(CC) $^ $(CFLAGS) -o $@
 
-test_config: src/test/test_config.o src/config.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o src/PluginModule/plugin.o src/common/socket_util.o
+test_config: src/test/test_config.o src/config.o src/RespModule/resp.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_resp: src/test/test_resp.o src/RespModule/resp.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_digest_auth: src/test/test_digest_auth.o src/common/digest_auth.o src/common/md5.o

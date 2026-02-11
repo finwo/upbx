@@ -20,14 +20,14 @@ void plugin_sync(void);
 
 /* Invoke plugin method: send RESP array (method, arg0, arg1, ...), read response.
  * Returns 0 on success, -1 on transport error. Response is consumed/discarded. */
-int plugin_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv);
+int plugin_invoke(const char *plugin_name, const char *method, int argc, const resp_object *const *argv);
 
 /* Check if plugin has registered an event (e.g. "extension.register", "call.dialout"). */
 int plugin_has_event(const char *plugin_name, const char *event_name);
 
 /* Notify all plugins that have this event. Sends RESP array (event_name, arg0, arg1, ...).
  * Each plugin's response is read and discarded. */
-void plugin_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv);
+void plugin_notify_event(const char *event_name, int argc, const resp_object *const *argv);
 
 /* Query events: plugin response alters PBX behavior */
 

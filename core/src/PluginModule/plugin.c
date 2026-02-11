@@ -14,238 +14,7 @@
 #include "common/socket_util.h"
 #include "rxi/log.h"
 #include "PluginModule/plugin.h"
-
-#define MAX_BULK_LEN    (256 * 1024)
-#define LINE_BUF        4096
-
-static void resp_free_internal(plugmod_resp_object *o);
-
-static int resp_read_byte(int fd) {
-  unsigned char c;
-  if (read(fd, &c, 1) != 1)
-    return -1;
-  return (int)c;
-}
-
-static int resp_read_line(int fd, char *buf, size_t buf_size) {
-  size_t i = 0;
-  int prev = -1;
-  while (i + 1 < buf_size) {
-    int b = resp_read_byte(fd);
-    if (b < 0) return -1;
-    if (prev == '\r' && b == '\n') {
-      buf[i - 1] = '\0';
-      return 0;
-    }
-    prev = b;
-    buf[i++] = (char)b;
-  }
-  return -1;
-}
-
-static plugmod_resp_object *resp_read(int fd) {
-  int type_c = resp_read_byte(fd);
-  if (type_c < 0) return NULL;
-  plugmod_resp_object *o = calloc(1, sizeof(plugmod_resp_object));
-  if (!o) return NULL;
-  char line[LINE_BUF];
-  switch ((char)type_c) {
-    case '+':
-      o->type = PLUGMOD_RESPT_SIMPLE;
-      if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o); return NULL; }
-      o->u.s = strdup(line);
-      break;
-    case '-':
-      o->type = PLUGMOD_RESPT_ERROR;
-      if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o); return NULL; }
-      o->u.s = strdup(line);
-      break;
-    case ':': {
-      if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o); return NULL; }
-      o->type = PLUGMOD_RESPT_INT;
-      o->u.i = (long long)strtoll(line, NULL, 10);
-      break;
-    }
-    case '$': {
-      if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o); return NULL; }
-      long len = strtol(line, NULL, 10);
-      if (len < 0 || len > (long)MAX_BULK_LEN) { free(o); return NULL; }
-      o->type = PLUGMOD_RESPT_BULK;
-      if (len == 0) {
-        o->u.s = strdup("");
-        if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o->u.s); free(o); return NULL; }
-      } else {
-        o->u.s = malloc((size_t)len + 1);
-        if (!o->u.s) { free(o); return NULL; }
-        if (read(fd, o->u.s, (size_t)len) != (ssize_t)len) { free(o->u.s); free(o); return NULL; }
-        o->u.s[len] = '\0';
-        if (resp_read_byte(fd) != '\r' || resp_read_byte(fd) != '\n') { free(o->u.s); free(o); return NULL; }
-      }
-      break;
-    }
-    case '*': {
-      if (resp_read_line(fd, line, sizeof(line)) != 0) { free(o); return NULL; }
-      long n = strtol(line, NULL, 10);
-      if (n < 0 || n > 65536) { free(o); return NULL; }
-      o->type = PLUGMOD_RESPT_ARRAY;
-      o->u.arr.n = (size_t)n;
-      o->u.arr.elem = n ? calloc((size_t)n, sizeof(plugmod_resp_object)) : NULL;
-      if (n && !o->u.arr.elem) { free(o); return NULL; }
-      for (size_t i = 0; i < (size_t)n; i++) {
-        plugmod_resp_object *sub = resp_read(fd);
-        if (!sub) {
-          for (size_t j = 0; j < i; j++) resp_free_internal(&o->u.arr.elem[j]);
-          free(o->u.arr.elem);
-          free(o);
-          return NULL;
-        }
-        o->u.arr.elem[i] = *sub;
-        free(sub);
-      }
-      break;
-    }
-    default:
-      free(o);
-      return NULL;
-  }
-  return o;
-}
-
-static void resp_free_internal(plugmod_resp_object *o) {
-  if (!o) return;
-  if (o->type == PLUGMOD_RESPT_SIMPLE || o->type == PLUGMOD_RESPT_ERROR || o->type == PLUGMOD_RESPT_BULK) {
-    free(o->u.s);
-  } else if (o->type == PLUGMOD_RESPT_ARRAY) {
-    for (size_t i = 0; i < o->u.arr.n; i++)
-      resp_free_internal(&o->u.arr.elem[i]);
-    free(o->u.arr.elem);
-  }
-}
-
-void plugmod_resp_free(plugmod_resp_object *o) {
-  resp_free_internal(o);
-}
-
-/* Given a RESP array interpreted as a map (even-length: key, value, key, value, ...), return a pointer
- * to the value element for the given key, or NULL. Key comparison uses string value of BULK/SIMPLE elements.
- * Returned pointer is into the array; valid until the response object is freed. */
-plugmod_resp_object *plugmod_resp_map_get(const plugmod_resp_object *o, const char *key) {
-  if (!o || !key || o->type != PLUGMOD_RESPT_ARRAY) return NULL;
-  size_t n = o->u.arr.n;
-  if (n & 1) return NULL; /* odd length is not a valid map */
-  for (size_t i = 0; i < n; i += 2) {
-    const plugmod_resp_object *k = &o->u.arr.elem[i];
-    const char *s = (k->type == PLUGMOD_RESPT_BULK || k->type == PLUGMOD_RESPT_SIMPLE) ? k->u.s : NULL;
-    if (s && strcmp(s, key) == 0 && i + 1 < n)
-      return (plugmod_resp_object *)&o->u.arr.elem[i + 1];
-  }
-  return NULL;
-}
-
-/* Given a map and key, return the value's string (BULK/SIMPLE) or NULL. Does not allocate; valid until map freed. */
-const char *plugmod_resp_map_get_string(const plugmod_resp_object *o, const char *key) {
-  plugmod_resp_object *val = plugmod_resp_map_get(o, key);
-  if (!val) return NULL;
-  if (val->type == PLUGMOD_RESPT_BULK || val->type == PLUGMOD_RESPT_SIMPLE)
-    return val->u.s;
-  return NULL;
-}
-
-/* Append one RESP-encoded object to buf; realloc as needed. *buf may change. Returns 0 on success. */
-static int resp_append_object(char **buf, size_t *cap, size_t *len, const plugmod_resp_object *o) {
-  if (!o) return -1;
-  size_t need = *len + 256;
-  if (o->type == PLUGMOD_RESPT_BULK || o->type == PLUGMOD_RESPT_SIMPLE || o->type == PLUGMOD_RESPT_ERROR) {
-    size_t slen = o->u.s ? strlen(o->u.s) : 0;
-    need = *len + 32 + slen + 2;
-  } else if (o->type == PLUGMOD_RESPT_ARRAY) {
-    need = *len + 32;
-    for (size_t i = 0; i < o->u.arr.n; i++)
-      need += 64; /* rough; will grow in recurse */
-  }
-  if (need > *cap) {
-    size_t newcap = need + 4096;
-    char *n = realloc(*buf, newcap);
-    if (!n) return -1;
-    *buf = n;
-    *cap = newcap;
-  }
-  switch (o->type) {
-    case PLUGMOD_RESPT_SIMPLE: {
-      const char *s = o->u.s ? o->u.s : "";
-      *len += (size_t)snprintf(*buf + *len, *cap - *len, "+%s\r\n", s);
-      break;
-    }
-    case PLUGMOD_RESPT_ERROR: {
-      const char *s = o->u.s ? o->u.s : "";
-      *len += (size_t)snprintf(*buf + *len, *cap - *len, "-%s\r\n", s);
-      break;
-    }
-    case PLUGMOD_RESPT_INT:
-      *len += (size_t)snprintf(*buf + *len, *cap - *len, ":%lld\r\n", (long long)o->u.i);
-      break;
-    case PLUGMOD_RESPT_BULK: {
-      const char *s = o->u.s ? o->u.s : "";
-      size_t slen = strlen(s);
-      *len += (size_t)snprintf(*buf + *len, *cap - *len, "$%zu\r\n%s\r\n", slen, s);
-      break;
-    }
-    case PLUGMOD_RESPT_ARRAY: {
-      size_t n = o->u.arr.n;
-      *len += (size_t)snprintf(*buf + *len, *cap - *len, "*%zu\r\n", n);
-      for (size_t i = 0; i < n; i++) {
-        if (resp_append_object(buf, cap, len, &o->u.arr.elem[i]) != 0)
-          return -1;
-      }
-      break;
-    }
-    default:
-      return -1;
-  }
-  return 0;
-}
-
-static int resp_encode_array_objects(int argc, const plugmod_resp_object *const *argv, char **out_buf, size_t *out_len) {
-  size_t cap = 64;
-  size_t len = 0;
-  char *buf = malloc(cap);
-  if (!buf) return -1;
-  len += (size_t)snprintf(buf + len, cap - len, "*%d\r\n", argc);
-  if (len >= cap) { free(buf); return -1; }
-  for (int i = 0; i < argc; i++) {
-    if (resp_append_object(&buf, &cap, &len, argv[i]) != 0) {
-      free(buf);
-      return -1;
-    }
-  }
-  *out_buf = buf;
-  *out_len = len;
-  return 0;
-}
-
-static int resp_encode_request(const char *method, int argc, const plugmod_resp_object *const *argv,
-  char **out_buf, size_t *out_len) {
-  plugmod_resp_object method_obj = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)method } };
-  size_t cap = 128;
-  size_t len = 0;
-  char *buf = malloc(cap);
-  if (!buf) return -1;
-  len += (size_t)snprintf(buf + len, cap - len, "*%d\r\n", argc + 1);
-  if (len >= cap) { free(buf); return -1; }
-  if (resp_append_object(&buf, &cap, &len, &method_obj) != 0) {
-    free(buf);
-    return -1;
-  }
-  for (int i = 0; i < argc; i++) {
-    if (resp_append_object(&buf, &cap, &len, argv[i]) != 0) {
-      free(buf);
-      return -1;
-    }
-  }
-  *out_buf = buf;
-  *out_len = len;
-  return 0;
-}
+#include "RespModule/resp.h"
 
 typedef struct {
   char *name;
@@ -332,23 +101,23 @@ static int spawn_plugin(const char *name, const char *exec_path, plugin_state_t 
 
 static int do_discovery(plugin_state_t *p) {
   if (!discovery_cmd_used) return 0;
-  plugmod_resp_object disc_obj = { .type = PLUGMOD_RESPT_BULK, .u = { .s = (char *)discovery_cmd_used } };
-  const plugmod_resp_object *av[] = { &disc_obj };
+  resp_object disc_obj = { .type = RESPT_BULK, .u = { .s = (char *)discovery_cmd_used } };
+  const resp_object *av[] = { &disc_obj };
   char *req = NULL;
   size_t req_len;
-  if (resp_encode_array_objects(1, av, &req, &req_len) != 0) return -1;
+  if (resp_encode_array(1, av, &req, &req_len) != 0) return -1;
   ssize_t n = write(p->fd_write, req, req_len);
   free(req);
   if (n != (ssize_t)req_len) return -1;
-  plugmod_resp_object *r = resp_read(p->fd_read);
-  if (!r || r->type != PLUGMOD_RESPT_ARRAY) {
-    if (r) plugmod_resp_free(r);
+  resp_object *r = resp_read(p->fd_read);
+  if (!r || r->type != RESPT_ARRAY) {
+    if (r) resp_free(r);
     return -1;
   }
   int is_event;
   for (size_t i = 0; i < r->u.arr.n; i++) {
-    plugmod_resp_object *e = &r->u.arr.elem[i];
-    const char *s = (e->type == PLUGMOD_RESPT_BULK || e->type == PLUGMOD_RESPT_SIMPLE) ? e->u.s : NULL;
+    resp_object *e = &r->u.arr.elem[i];
+    const char *s = (e->type == RESPT_BULK || e->type == RESPT_SIMPLE) ? e->u.s : NULL;
     if (!s) continue;
     is_event = 0;
     for (size_t p = 0; p < event_prefixes_n && event_prefixes_used && event_prefixes_used[p]; p++) {
@@ -367,7 +136,7 @@ static int do_discovery(plugin_state_t *p) {
       p->methods[p->method_count++] = strdup(s);
     }
   }
-  plugmod_resp_free(r);
+  resp_free(r);
   return 0;
 }
 
@@ -502,14 +271,20 @@ void plugmod_stop(void) {
   plugin_cap = 0;
 }
 
-int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv,
-  plugmod_resp_object **out) {
+int plugmod_invoke_response(const char *plugin_name, const char *method, int argc, const resp_object *const *argv,
+  resp_object **out) {
   plugin_state_t *p = find_plugin(plugin_name);
   if (!p || p->stopping || !out) return -1;
   *out = NULL;
+  resp_object method_obj = { .type = RESPT_BULK, .u = { .s = (char *)method } };
+  const resp_object *arr[256];
+  int n = argc + 1;
+  if (n > 256) return -1;
+  arr[0] = &method_obj;
+  for (int i = 0; i < argc; i++) arr[i + 1] = argv[i];
   char *buf = NULL;
   size_t len = 0;
-  if (resp_encode_request(method, argc, argv, &buf, &len) != 0) return -1;
+  if (resp_encode_array(n, arr, &buf, &len) != 0) return -1;
   if (write(p->fd_write, buf, len) != (ssize_t)len) {
     free(buf);
     return -1;
@@ -519,11 +294,11 @@ int plugmod_invoke_response(const char *plugin_name, const char *method, int arg
   return (*out) ? 0 : -1;
 }
 
-int plugmod_invoke(const char *plugin_name, const char *method, int argc, const plugmod_resp_object *const *argv) {
+int plugmod_invoke(const char *plugin_name, const char *method, int argc, const resp_object *const *argv) {
   log_debug("plugin call: %s -> %s (%d args)", plugin_name, method, argc);
-  plugmod_resp_object *r = NULL;
+  resp_object *r = NULL;
   int ret = plugmod_invoke_response(plugin_name, method, argc, argv, &r);
-  if (r) plugmod_resp_free(r);
+  if (r) resp_free(r);
   return ret;
 }
 
@@ -536,7 +311,7 @@ int plugmod_has_event(const char *plugin_name, const char *event_name) {
   return 0;
 }
 
-void plugmod_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv) {
+void plugmod_notify_event(const char *event_name, int argc, const resp_object *const *argv) {
   log_debug("plugin event %s (%d args)", event_name, argc);
   for (size_t i = 0; i < plugin_n; i++) {
     if (plugins[i].stopping) continue;

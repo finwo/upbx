@@ -288,28 +288,28 @@ static bool user_has_permit(api_client_t *c, const char *cmd) {
   char section[128];
   const char *uname = (c->username && c->username[0]) ? c->username : "*";
   snprintf(section, sizeof(section), "api:%s", uname);
-  plugmod_resp_object *permits = config_key_get(section, "permit");
-  if (permits && permits->type == PLUGMOD_RESPT_ARRAY) {
+  resp_object *permits = config_key_get(section, "permit");
+  if (permits && permits->type == RESPT_ARRAY) {
     for (size_t i = 0; i < permits->u.arr.n; i++) {
-      if (permits->u.arr.elem[i].type == PLUGMOD_RESPT_BULK && permits->u.arr.elem[i].u.s &&
+      if (permits->u.arr.elem[i].type == RESPT_BULK && permits->u.arr.elem[i].u.s &&
           permit_matches(permits->u.arr.elem[i].u.s, cmd))
-        { plugmod_resp_free(permits); return true; }
+        { resp_free(permits); return true; }
     }
-    plugmod_resp_free(permits);
+    resp_free(permits);
   } else if (permits) {
-    plugmod_resp_free(permits);
+    resp_free(permits);
   }
   if (strcmp(uname, "*") != 0) {
-    plugmod_resp_object *anon = config_key_get("api:*", "permit");
-    if (anon && anon->type == PLUGMOD_RESPT_ARRAY) {
+    resp_object *anon = config_key_get("api:*", "permit");
+    if (anon && anon->type == RESPT_ARRAY) {
       for (size_t i = 0; i < anon->u.arr.n; i++) {
-        if (anon->u.arr.elem[i].type == PLUGMOD_RESPT_BULK && anon->u.arr.elem[i].u.s &&
+        if (anon->u.arr.elem[i].type == RESPT_BULK && anon->u.arr.elem[i].u.s &&
             permit_matches(anon->u.arr.elem[i].u.s, cmd))
-          { plugmod_resp_free(anon); return true; }
+          { resp_free(anon); return true; }
       }
-      plugmod_resp_free(anon);
+      resp_free(anon);
     } else if (anon) {
-      plugmod_resp_free(anon);
+      resp_free(anon);
     }
   }
   return false;
@@ -348,18 +348,18 @@ static bool cmdAUTH(api_client_t *c, char **args, int nargs) {
   const char *pass  = args[2];
   char section[128];
   snprintf(section, sizeof(section), "api:%s", uname);
-  plugmod_resp_object *secret_obj = config_key_get(section, "secret");
-  const char *secret = (secret_obj && (secret_obj->type == PLUGMOD_RESPT_BULK || secret_obj->type == PLUGMOD_RESPT_SIMPLE)) ? secret_obj->u.s : NULL;
+  resp_object *secret_obj = config_key_get(section, "secret");
+  const char *secret = (secret_obj && (secret_obj->type == RESPT_BULK || secret_obj->type == RESPT_SIMPLE)) ? secret_obj->u.s : NULL;
   if (secret && pass && strcmp(secret, pass) == 0) {
     free(c->username);
     c->username = strdup(uname);
     if (c->username) {
-      plugmod_resp_free(secret_obj);
+      resp_free(secret_obj);
       log_debug("api: client authenticated as '%s'", uname);
       return api_write_ok(c);
     }
   }
-  if (secret_obj) plugmod_resp_free(secret_obj);
+  if (secret_obj) resp_free(secret_obj);
   return api_write_err(c, "invalid credentials");
 }
 
@@ -571,17 +571,17 @@ void api_start(void) {
   for (int i = 0; i < API_MAX_CLIENTS; i++)
     client_init(&clients[i]);
 
-  plugmod_resp_object *listen_val = config_key_get("api", "listen");
-  const char *listen_str = (listen_val && (listen_val->type == PLUGMOD_RESPT_BULK || listen_val->type == PLUGMOD_RESPT_SIMPLE) && listen_val->u.s && listen_val->u.s[0])
+  resp_object *listen_val = config_key_get("api", "listen");
+  const char *listen_str = (listen_val && (listen_val->type == RESPT_BULK || listen_val->type == RESPT_SIMPLE) && listen_val->u.s && listen_val->u.s[0])
     ? listen_val->u.s : NULL;
   if (!listen_str) {
-    if (listen_val) plugmod_resp_free(listen_val);
+    if (listen_val) resp_free(listen_val);
     log_debug("api: no listen address configured, API server disabled");
     next_listen_check = 0;
     return;
   }
   current_listen = strdup(listen_str);
-  plugmod_resp_free(listen_val);
+  resp_free(listen_val);
   if (!current_listen) return;
   init_builtins();
   listen_fd = create_listen_socket(current_listen);
@@ -606,12 +606,12 @@ PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp)) {
     /* 60s listen rebind check */
     if (listen_fd >= 0 && loop_timestamp >= next_listen_check) {
       next_listen_check = loop_timestamp + 60;
-      plugmod_resp_object *listen_val = config_key_get("api", "listen");
-      const char *new_str = (listen_val && (listen_val->type == PLUGMOD_RESPT_BULK || listen_val->type == PLUGMOD_RESPT_SIMPLE) && listen_val->u.s)
+      resp_object *listen_val = config_key_get("api", "listen");
+      const char *new_str = (listen_val && (listen_val->type == RESPT_BULK || listen_val->type == RESPT_SIMPLE) && listen_val->u.s)
         ? listen_val->u.s : "";
       int rebind = (current_listen && (!new_str[0] || strcmp(current_listen, new_str) != 0)) ||
                    (!current_listen && new_str[0]);
-      if (listen_val) plugmod_resp_free(listen_val);
+      if (listen_val) resp_free(listen_val);
       if (rebind) {
         if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
         free(current_listen);
