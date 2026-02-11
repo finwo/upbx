@@ -15,10 +15,10 @@
 /// **Subcommands**
 ///
 /// - **bash**  
-///   Emit a bash completion script. Install with: **eval "$(upbx completion bash)"** (or **eval "$(./upbx completion bash)"**). Completes: global options and values (`-f` path, `-v` level, `--log` path), command names, and command-specific arguments (e.g. extension numbers for **extension remove** &lt;number&gt;).
+///   Emit a bash completion script. Install with: **eval "\$(upbx completion bash)"** (or **eval "\$(./upbx completion bash)"**). Completes: global options and values (`-f` path, `-v` level, `--log` path), command names, and command-specific arguments (e.g. extension numbers for **extension remove** &lt;number&gt;).
 ///
 /// - **zsh**  
-///   Emit a zsh completion script. Install with: **eval "$(upbx completion zsh)"**. Same context-aware behaviour as bash.
+///   Emit a zsh completion script. Install with: **eval "\$(upbx completion zsh)"**. Same context-aware behaviour as bash.
 ///
 /// - **_extensions**, **_trunks**, **_api_users**  
 ///   Internal: output one extension number, trunk name, or API username per line (from config). Used by the completion script; not intended for direct use.
