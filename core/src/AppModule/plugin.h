@@ -26,7 +26,7 @@ int plugin_has_event(const char *plugin_name, const char *event_name);
  * Each plugin's response is read and discarded. */
 void plugin_notify_event(const char *event_name, int argc, const plugmod_resp_object *const *argv);
 
-/* --- Query events: plugin response alters PBX behavior --- */
+/* Query events: plugin response alters PBX behavior */
 
 /* extension.register: after parsing extension/trunk, before or instead of built-in auth.
  * Input: one map (extension, trunk, from_user). Response: map with action = reject | accept | continue.

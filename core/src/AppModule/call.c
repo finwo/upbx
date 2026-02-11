@@ -21,7 +21,7 @@
 
 #define RTP_BUF_SIZE 1520
 
-/* ---- Linked list of active calls ---- */
+/* Linked list of active calls */
 
 static call_t *call_list = NULL;
 
@@ -35,7 +35,7 @@ void call_set_pre_remove_callback(call_pre_remove_cb cb) {
   pre_remove_cb = cb;
 }
 
-/* ---- Helpers ---- */
+/* Helpers */
 
 static void party_free(call_party_t *p) {
   free(p->id);   p->id  = NULL;
@@ -46,7 +46,7 @@ static void rtp_close(int *sock) {
   if (*sock > 0) { close(*sock); *sock = 0; }
 }
 
-/* ---- Lifecycle ---- */
+/* Lifecycle */
 
 call_t *call_create(const char *call_id) {
   log_trace("call_create: %.32s", call_id ? call_id : "");
@@ -109,7 +109,7 @@ void call_remove(call_t *call) {
 
 call_t *call_first(void) { return call_list; }
 
-/* ---- RTP port allocation ---- */
+/* RTP port allocation */
 
 static int bind_udp(struct in_addr ip, int port) {
   int sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -161,7 +161,7 @@ int call_rtp_alloc_port(struct in_addr local_ip, int port_low, int port_high,
   return -1;
 }
 
-/* ---- select() integration ---- */
+/* select() integration */
 
 static void fd_add(int fd, fd_set *set, int *maxfd) {
   if (fd <= 0) return;

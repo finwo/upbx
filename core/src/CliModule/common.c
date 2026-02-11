@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #include "CliModule/common.h"
 
@@ -53,4 +54,36 @@ const char *cli_resolve_default_config(void) {
   if (access("/etc/upbx/upbx.conf", R_OK) == 0) return "/etc/upbx/upbx.conf";
   if (access("/etc/upbx.conf", R_OK) == 0) return "/etc/upbx.conf";
   return NULL;
+}
+
+int cli_get_output_width(int default_width) {
+  if (!isatty(STDOUT_FILENO))
+    return default_width;
+  struct winsize w;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) < 0 || w.ws_col <= 0)
+    return default_width;
+  return (int)w.ws_col;
+}
+
+void cli_print_wrapped(FILE *out, const char *text, int width, int left_col_width) {
+  if (!text || width <= left_col_width)
+    return;
+  char *copy = strdup(text);
+  if (!copy)
+    return;
+  int len = left_col_width;
+  char *tok = strtok(copy, " ");
+  while (tok) {
+    int toklen = (int)strlen(tok);
+    if (len + 1 + toklen > width) {
+      fprintf(out, "\n%*s", left_col_width, "");
+      len = left_col_width;
+    }
+    if (len > left_col_width)
+      fputc(' ', out);
+    fputs(tok, out);
+    len += (len > left_col_width ? 1 : 0) + toklen;
+    tok = strtok(NULL, " ");
+  }
+  free(copy);
 }

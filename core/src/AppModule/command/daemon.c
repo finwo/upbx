@@ -1,3 +1,4 @@
+/// <!-- path: src/AppModule/command/daemon.c -->
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,31 @@
 #include "AppModule/plugin.h"
 #include "AppModule/sip_server.h"
 
+/// # DAEMON
+/// **daemon** is the command that runs the SIP PBX server. It has no subcommands, only local options.
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **daemon** [options]
+///
+/// **Description**
+///
+/// Run the SIP PBX daemon: extension and trunk REGISTER handling, INVITE routing, built-in RTP relay, and optional plugins. Loads config (see global `-f`), binds the SIP UDP socket, and serves until the process is stopped.
+///
+/// **Options**
+///
+/// `-d`, `--daemonize`  
+///   Run in background: double fork, detach from terminal, close stdin/stdout/stderr. Use for production or when started by an init system.
+///
+/// `-D`, `--no-daemonize`  
+///   Force foreground. Overrides **daemonize=1** in the **[upbx]** config section. Use when you want to keep the process attached to the terminal even if config says daemonize.
+///
+/// **Daemonize behaviour**
+///
+/// - By default the daemon runs in the **foreground**.
+/// - It goes to the **background** only if **daemonize=1** is set in **[upbx]** **or** you pass `-d` / `--daemonize`.
+/// - `-D` / `--no-daemonize` always forces foreground.
+///
 static const char *const daemon_usages[] = {
   "upbx daemon [options]",
   NULL,

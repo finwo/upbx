@@ -18,10 +18,10 @@
 #ifndef __PT_H__
 #define __PT_H__
 
-/* ---------------------------------------------------------------------------
+/* ==========================================================================
  * Internal: unique labels for continuation points (GCC addrlabels).
  * Not for direct use; merged into PT_BEGIN / PT_WAIT_UNTIL / PT_YIELD etc.
- * --------------------------------------------------------------------------- */
+ * ========================================================================== */
 #define PT_CONCAT2(s1, s2)   s1##s2
 #define PT_CONCAT(s1, s2)    PT_CONCAT2(s1, s2)
 
@@ -40,9 +40,9 @@
     (pt)->lc = &&PT_CONCAT(PT_LABEL, __LINE__); \
   } while (0)
 
-/* ---------------------------------------------------------------------------
+/* ==========================================================================
  * Protothread control structure
- * --------------------------------------------------------------------------- */
+ * ========================================================================== */
 
 /** Protothread state. Only the PT_* macros should touch \a lc. */
 struct pt {
@@ -268,7 +268,7 @@ struct pt_sem {
  * EXAMPLES (for reference; block not compiled when header is included)
  * ===========================================================================
  *
- * --- Example 1: Minimal protothread ---------------------------------------
+ * Example 1: Minimal protothread
  *
  *   #include "pt.h"
  *
@@ -293,7 +293,7 @@ struct pt_sem {
  *     return 0;
  *   }
  *
- * --- Example 2: Producer-consumer with semaphores (bounded buffer) ---------
+ * Example 2: Producer-consumer with semaphores (bounded buffer)
  *
  *   #include "pt.h"
  *
@@ -362,7 +362,7 @@ struct pt_sem {
  *   >= PT_EXITED). Implement add_to_buffer, get_from_buffer, produce_item,
  *   consume_item, and the buffer as needed.
  *
- * --- Example 3: Spawning a child protothread -------------------------------
+ * Example 3: Spawning a child protothread
  *
  *   static struct pt pt_parent, pt_child;
  *
@@ -388,7 +388,7 @@ struct pt_sem {
  *     return 0;
  *   }
  *
- * --- Example 4: Yielding ---------------------------------------------------
+ * Example 4: Yielding
  *
  *   static PT_THREAD(periodic(struct pt *pt))
  *   {

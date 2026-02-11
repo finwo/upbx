@@ -1,47 +1,40 @@
+/// <!-- path: src/CliModule/command/list_commands.c -->
+/// # LIST-COMMANDS
+/// **list-commands** is the command that lists all available CLI commands and their short descriptions. It has no subcommands or options.
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **list-commands**
+///
+/// **Description**
+///
+/// Prints a two-column layout (command name, description). Use it to discover **daemon**, **extension**, **trunk**, **api-user**, **completion**, and any other registered commands.
+///
 #include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
 
 #include "../common.h"
 #include "list_commands.h"
 
 int climodule_cmd_list_commands(int argc, const char **argv) {
-
-  // Detect name lenghts
+  int len;
   int name_longest = 0;
-  int len, toklen;
   struct climodule_command *cmd = climodule_commands;
   while(cmd) {
-    len = strlen(cmd->cmd);
+    len = (int)strlen(cmd->cmd);
     if (len > name_longest) { name_longest = len; }
     cmd = cmd->next;
   }
 
-  // Get terminal width
-  struct winsize w;
-  ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+  int width = cli_get_output_width(80);
+  int left_col = name_longest + 3; /* "  " + name + " " */
 
-  // Print basic table
   printf("\n");
   printf("Available commands:\n");
   cmd = climodule_commands;
-  char *desc, *tok;
-  while(cmd) {
-    len  = name_longest + 4;
-    desc = strdup(cmd->desc);
+  while (cmd) {
     printf("\n  %*s ", name_longest, cmd->cmd);
-    tok = strtok(desc, " ");
-    do {
-      if (!tok) break;
-      toklen = strlen(tok);
-      if (len + 1 + toklen >= w.ws_col) {
-        printf("\n  %*s ", name_longest, "");
-        len = name_longest + 4;
-      }
-      printf(" %s", tok);
-      len += toklen + 1;
-    } while((tok = strtok(NULL, " ")));
+    cli_print_wrapped(stdout, cmd->desc, width, left_col);
     cmd = cmd->next;
   }
   printf("\n\n");

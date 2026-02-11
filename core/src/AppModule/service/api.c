@@ -26,14 +26,14 @@
 #include "config.h"
 #include "AppModule/service/api.h"
 
-/* ---- Constants ---- */
+/* Constants */
 
 #define API_MAX_CLIENTS   8
 #define READ_BUF_SIZE     4096
 #define WRITE_BUF_INIT    4096
 #define MAX_ARGS          32
 
-/* ---- Per-client connection state ---- */
+/* Per-client connection state */
 
 struct api_client {
   int       fd;
@@ -45,21 +45,21 @@ struct api_client {
   size_t    wcap;
 };
 
-/* ---- Command entry ---- */
+/* Command entry */
 
 typedef struct {
   const char  *name;
   api_cmd_func func;
 } api_cmd_entry;
 
-/* ---- Module state ---- */
+/* Module state */
 
 static int              listen_fd = -1;
 static struct api_client clients[API_MAX_CLIENTS];
 static struct hashmap  *cmd_map = NULL;
 static config_api_user *anon_user = NULL;  /* [api:*] user, may be NULL */
 
-/* ---- Write helpers ---- */
+/* Write helpers */
 
 bool api_write_raw(api_client_t *c, const void *data, size_t len) {
   if (c->fd < 0) return false;
@@ -148,7 +148,7 @@ bool api_write_kv_time(api_client_t *c, const char *key, long t) {
   return api_write_bulk_cstr(c, buf);
 }
 
-/* ---- Client lifecycle ---- */
+/* Client lifecycle */
 
 static void client_init(struct api_client *c) {
   memset(c, 0, sizeof(*c));
@@ -179,7 +179,7 @@ static void client_flush(struct api_client *c) {
   }
 }
 
-/* ---- RESP2 inline (telnet) parser ---- */
+/* RESP2 inline (telnet) parser */
 
 static int parse_inline(const char *line, size_t len, char **args, int max_args) {
   int nargs = 0;
@@ -211,7 +211,7 @@ static int parse_inline(const char *line, size_t len, char **args, int max_args)
   return nargs;
 }
 
-/* ---- RESP2 multibulk parser ---- */
+/* RESP2 multibulk parser */
 
 static int parse_resp_command(struct api_client *c, char **args, int max_args, int *nargs) {
   *nargs = 0;
@@ -264,7 +264,7 @@ static int parse_resp_command(struct api_client *c, char **args, int max_args, i
   return 1;
 }
 
-/* ---- Permission checking ---- */
+/* Permission checking */
 
 /* Check if a command name matches a single permit pattern.
  * Supports: "*" matches everything, "foo.*" matches "foo.anything",
@@ -300,7 +300,7 @@ static bool user_has_permit(config_api_user *user, const char *cmd) {
   return false;
 }
 
-/* ---- Hashmap callbacks ---- */
+/* Hashmap callbacks */
 
 static uint64_t cmd_hash(const void *item, uint64_t seed0, uint64_t seed1) {
   const api_cmd_entry *cmd = item;
@@ -314,7 +314,7 @@ static int cmd_compare(const void *a, const void *b, void *udata) {
   return strcasecmp(ca->name, cb->name);
 }
 
-/* ---- Public: register a command ---- */
+/* Public: register a command */
 
 void api_register_cmd(const char *name, api_cmd_func func) {
   if (!cmd_map)
@@ -323,7 +323,7 @@ void api_register_cmd(const char *name, api_cmd_func func) {
   log_trace("api: registered command '%s'", name);
 }
 
-/* ---- Built-in command handlers ---- */
+/* Built-in command handlers */
 
 static bool cmdAUTH(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
   if (nargs != 3) {
@@ -393,7 +393,7 @@ static bool cmdCOMMAND(api_client_t *c, struct upbx_config *cfg, char **args, in
   return true;
 }
 
-/* ---- Command dispatch ---- */
+/* Command dispatch */
 
 static void init_builtins(void) {
   api_register_cmd("auth",    cmdAUTH);
@@ -438,7 +438,7 @@ static void dispatch_command(struct api_client *c, struct upbx_config *cfg, char
   }
 }
 
-/* ---- TCP listener ---- */
+/* TCP listener */
 
 static int create_listen_socket(const char *listen_addr) {
   char host[256] = "127.0.0.1";
@@ -493,7 +493,7 @@ static int create_listen_socket(const char *listen_addr) {
   return fd;
 }
 
-/* ---- Connection management ---- */
+/* Connection management */
 
 static void accept_connection(void) {
   struct sockaddr_storage addr;
@@ -556,7 +556,7 @@ static void process_client(struct api_client *c, fd_set *read_set, struct upbx_c
   client_flush(c);
 }
 
-/* ---- Public API ---- */
+/* Public API */
 
 void api_start(struct upbx_config *cfg) {
   for (int i = 0; i < API_MAX_CLIENTS; i++)

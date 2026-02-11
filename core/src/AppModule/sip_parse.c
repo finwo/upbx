@@ -233,7 +233,7 @@ int sip_response_contact_expires(const char *buf, size_t len) {
   return 0;
 }
 
-/* --- Request parser (no libosip2) --- */
+/* Request parser (no libosip2) */
 
 /* Return 1 if buf is a SIP request (has method in first line), 0 if response or invalid. */
 int sip_is_request(const char *buf, size_t len) {

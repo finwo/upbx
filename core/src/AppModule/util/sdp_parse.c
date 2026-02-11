@@ -11,7 +11,7 @@
 
 #include "AppModule/util/sdp_parse.h"
 
-/* ---- Internal helpers ---- */
+/* Internal helpers */
 
 /* Advance *p past \r\n or \n. */
 static void skip_eol(const char **p, const char *end) {
@@ -25,7 +25,7 @@ static const char *line_end(const char *p, const char *end) {
   return p;
 }
 
-/* ---- Parse ---- */
+/* Parse */
 
 int sdp_parse_media(const char *body, size_t body_len,
                     sdp_media_t *media, size_t max_media, size_t *n_out) {
@@ -87,7 +87,7 @@ int sdp_parse_media(const char *body, size_t body_len,
   return (*n_out > 0) ? 0 : -1;
 }
 
-/* ---- Rewrite ---- */
+/* Rewrite */
 
 int sdp_rewrite_addr(const char *body, size_t body_len,
                      const char *new_ip, int new_port,

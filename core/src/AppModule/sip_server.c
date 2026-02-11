@@ -1055,7 +1055,7 @@ static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
   PT_BEGIN(pt);
   overflow_last_run = 0;
   for (;;) {
-    /* --- Pending extension handler (runs every iteration) --- */
+    /* Pending extension handler (runs every iteration) */
     for (call_t *c = call_first(); c; ) {
       call_t *next = c->next;
       if (!c->answered && !c->cancelling && c->n_pending_exts > 0) {
@@ -1089,7 +1089,7 @@ static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
       c = next;
     }
 
-    /* --- Overflow timer (runs every ~1s) --- */
+    /* Overflow timer (runs every ~1s) */
     {
       time_t now = time(NULL);
       if (now - overflow_last_run >= 1) {
@@ -1627,7 +1627,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   const char *call_id = call_id_buf;
   log_trace("handle_invite: To=%s From=%s Call-ID=%.32s", to_user[0] ? to_user : "(null)", from_user[0] ? from_user : "(null)", call_id);
 
-  /* --- 1. From a known extension --- */
+  /* 1. From a known extension */
   if (from_ext[0] && get_extension_config_match(cfg, from_ext)) {
     char *ext_num = strdup(from_ext);
     if (!ext_num) {
@@ -1819,7 +1819,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     return;
   }
 
-  /* --- 2. Destination matches a DID (external caller, not from a known extension) --- */
+  /* 2. Destination matches a DID (external caller, not from a known extension) */
   if (to_user[0] && find_trunk_by_did(cfg, to_user)) {
     config_trunk *trunk = find_trunk_by_did(cfg, to_user);
     ext_reg_t **exts = NULL;
@@ -1862,7 +1862,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     return;
   }
 
-  /* --- 2b. Trunk with filter_incoming=0: accept any number matching a registered extension --- */
+  /* 2b. Trunk with filter_incoming=0: accept any number matching a registered extension */
   if (to_user[0]) {
     /* Find a trunk with filter_incoming=0 (the one that allowed this call through). */
     config_trunk *fi_trunk = NULL;
@@ -1929,7 +1929,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     }
   }
 
-  /* --- 3. Fallback: from_user with @, extension prefix match → outgoing --- */
+  /* 3. Fallback: from_user with @, extension prefix match → outgoing */
   if (from_user[0]) {
     const char *at = strchr(from_user, '@');
     size_t ext_len = at ? (size_t)(at - from_user) : strlen(from_user);
@@ -1946,7 +1946,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
     }
   }
 
-  /* --- 4. No match → 404 --- */
+  /* 4. No match → 404 */
   send_reply(ctx, buf, len, 404, 0, 0);
 }
 
@@ -2057,7 +2057,7 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
     }
   }
 
-  /* --- Decide whether to forward this response to the caller --- */
+  /* Decide whether to forward this response to the caller */
   int should_forward = 1;
 
   /* ACK non-2xx final responses back to callee (RFC 3261 §17.1.1.3). */

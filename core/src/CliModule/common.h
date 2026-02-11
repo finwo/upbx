@@ -2,6 +2,7 @@
 #define __CLIMODULE_COMMON_H__
 
 #include <stddef.h>
+#include <stdio.h>
 
 struct climodule_command {
   void *next;
@@ -28,5 +29,13 @@ const char *cli_config_path(void);
  *   $HOME/.config/upbx.conf, $HOME/.upbx.conf, /etc/upbx/upbx.conf, /etc/upbx.conf
  * Returns pointer to a static buffer, or NULL if no config found. */
 const char *cli_resolve_default_config(void);
+
+/* Get terminal width for stdout (TIOCGWINSZ when stdout is a tty). Returns default_width if not a tty or ioctl fails. */
+int cli_get_output_width(int default_width);
+
+/* Word-wrap text to stream. Does not mutate text (works on a copy).
+ * width: total line width.
+ * left_col_width: on first line we assume this many columns are already used (e.g. command name); continuation lines are indented by this many spaces. Use 0 for full-width (e.g. paragraphs). */
+void cli_print_wrapped(FILE *out, const char *text, int width, int left_col_width);
 
 #endif // __CLIMODULE_COMMON_H__

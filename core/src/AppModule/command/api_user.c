@@ -1,10 +1,28 @@
-/*
- * CLI commands for managing API users in the config file.
- * Usage:
- *   upbx [-f config] api-user list
- *   upbx [-f config] api-user add [--permit PATTERN]... <username> <secret>
- *   upbx [-f config] api-user remove|rm <username>
- */
+/// <!-- path: src/AppModule/command/api_user.c -->
+/// # API-USER
+/// **api-user** is the command that manages API users in the config file. It has subcommands: **list**, **add**, and **remove** (or **rm**).
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **api-user** **list**  
+/// **upbx** [global options] **api-user** **add** [`--permit` PATTERN]... &lt;username&gt; &lt;secret&gt;  
+/// **upbx** [global options] **api-user** **remove**|**rm** &lt;username&gt;
+///
+/// **Description**
+///
+/// Each user is an **[api:username]** section with **secret** and repeatable **permit** patterns. The API server (enabled by **[api]** listen) speaks RESP2; users authenticate with **auth username password**. Permits control which commands the user can run (e.g. **\*** for all, **metrics.\*** for metrics commands). Use global `-f` to choose the config file.
+///
+/// **Subcommands**
+///
+/// - **list**  
+///   List all API users. Output: USERNAME and PERMITS (comma-separated). No arguments.
+///
+/// - **add** [`--permit` PATTERN]... &lt;username&gt; &lt;secret&gt;  
+///   Add a new API user. Appends **[api:username]** with **secret** and one **permit** line per `--permit` PATTERN. **username** and **secret** are required (positional). `--permit` can be repeated (e.g. `--permit "metrics.*"` `--permit "ping"`). Fails if the username already exists.
+///
+/// - **remove**, **rm** &lt;username&gt;  
+///   Remove the API user. Deletes the **[api:username]** section. **username** is required.
+///
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

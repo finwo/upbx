@@ -19,13 +19,13 @@
 #include "AppModule/registration.h"
 #include "AppModule/trunk_reg.h"
 
-/* ---- EMA decay constants: exp(-1/N) for N seconds in the window ---- */
+/* EMA decay constants: exp(-1/N) for N seconds in the window */
 
 #define EMA_1   0.9833333333  /* exp(-1/60)  */
 #define EMA_5   0.9966666667  /* exp(-1/300) */
 #define EMA_15  0.9988888889  /* exp(-1/900) */
 
-/* ---- Module state ---- */
+/* Module state */
 
 static int    active_calls = 0;
 static double load_1  = 0.0;
@@ -34,7 +34,7 @@ static double load_15 = 0.0;
 static time_t last_tick = 0;
 static time_t last_reconcile = 0;
 
-/* ---- Helpers ---- */
+/* Helpers */
 
 static size_t count_calls(void) {
   size_t n = 0;
@@ -90,7 +90,7 @@ static bool write_trunk_map(api_client_t *c, config_trunk *t) {
   return true;
 }
 
-/* ---- Command handlers ---- */
+/* Command handlers */
 
 static bool cmd_metrics_keys(api_client_t *c, struct upbx_config *cfg, char **args, int nargs) {
   (void)cfg; (void)args; (void)nargs;
@@ -194,7 +194,7 @@ static bool cmd_metrics_get(api_client_t *c, struct upbx_config *cfg, char **arg
   return api_write_nil(c);
 }
 
-/* ---- Public API ---- */
+/* Public API */
 
 void metrics_init(struct upbx_config *cfg) {
   (void)cfg;

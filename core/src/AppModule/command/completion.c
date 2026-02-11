@@ -1,16 +1,28 @@
-/*
- * Shell completion helper.
- * Usage:
- *   upbx completion bash          -- output bash completion script
- *   upbx completion zsh           -- output zsh completion script
- *   upbx completion _extensions   -- list extension numbers (for completion)
- *   upbx completion _trunks       -- list trunk names (for completion)
- *   upbx completion _api_users    -- list API usernames (for completion)
- *
- * Install:
- *   eval "$(upbx completion bash)"
- *   eval "$(upbx completion zsh)"
- */
+/// <!-- path: src/AppModule/command/completion.c -->
+/// # COMPLETION
+/// **completion** is the command that outputs shell completion scripts or internal lists used by those scripts. It has subcommands: **bash**, **zsh**, and the internal **\_extensions**, **\_trunks**, **\_api_users**.
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **completion** **bash**  
+/// **upbx** [global options] **completion** **zsh**  
+/// **upbx** [global options] **completion** **_extensions**|**_trunks**|**_api_users**
+///
+/// **Description**
+///
+/// Output is context-aware: after `-f` the script completes file paths; for **extension remove**, **trunk remove**, **api-user remove** it offers extension numbers, trunk names, or API usernames from the current config (respecting `-f` if present). Use global `-f` so the script knows which config to read for those lists.
+///
+/// **Subcommands**
+///
+/// - **bash**  
+///   Emit a bash completion script. Install with: **eval "$(upbx completion bash)"** (or **eval "$(./upbx completion bash)"**). Completes: global options and values (`-f` path, `-v` level, `--log` path), command names, and command-specific arguments (e.g. extension numbers for **extension remove** &lt;number&gt;).
+///
+/// - **zsh**  
+///   Emit a zsh completion script. Install with: **eval "$(upbx completion zsh)"**. Same context-aware behaviour as bash.
+///
+/// - **_extensions**, **_trunks**, **_api_users**  
+///   Internal: output one extension number, trunk name, or API username per line (from config). Used by the completion script; not intended for direct use.
+///
 #include <stdio.h>
 #include <string.h>
 

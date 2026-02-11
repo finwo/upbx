@@ -80,13 +80,13 @@ typedef struct call {
   int           overflow_done;
 } call_t;
 
-/* ---- Pre-remove callback (for plugin notifications) ---- */
+/* Pre-remove callback (for plugin notifications) */
 
 /* Called before a call is removed from the list. Set once at startup. */
 typedef void (*call_pre_remove_cb)(call_t *call);
 void call_set_pre_remove_callback(call_pre_remove_cb cb);
 
-/* ---- Lifecycle ---- */
+/* Lifecycle */
 
 /* Allocate a new call, set call_id and created_at. Returns NULL on failure. */
 call_t *call_create(const char *call_id);
@@ -100,14 +100,14 @@ void call_remove(call_t *call);
 /* Return the head of the call list (for iteration). */
 call_t *call_first(void);
 
-/* ---- RTP port allocation ---- */
+/* RTP port allocation */
 
 /* Bind an even UDP port from the configured range.
  * On success, sets *sock and *port. Returns 0 on success, -1 on failure. */
 int call_rtp_alloc_port(struct in_addr local_ip, int port_low, int port_high,
                         int *sock, int *port);
 
-/* ---- select() integration ---- */
+/* select() integration */
 
 /* Add all active RTP sockets to the fd_set for select(). */
 void call_fill_rtp_fds(fd_set *read_set, int *maxfd);

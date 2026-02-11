@@ -1,10 +1,28 @@
-/*
- * CLI commands for managing trunks in the config file.
- * Usage:
- *   upbx [-f config] trunk list
- *   upbx [-f config] trunk add [--host H --username U --password P --did D --cid C] <trunkname>
- *   upbx [-f config] trunk remove|rm <trunkname>
- */
+/// <!-- path: src/AppModule/command/trunk.c -->
+/// # TRUNK
+/// **trunk** is the command that manages SIP trunks in the config file. It has subcommands: **list**, **add**, and **remove** (or **rm**).
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **trunk** **list**  
+/// **upbx** [global options] **trunk** **add** [`--host` H] [`--username` U] [`--password` P] [`--did` D] [`--cid` C] &lt;name&gt;  
+/// **upbx** [global options] **trunk** **remove**|**rm** &lt;name&gt;
+///
+/// **Description**
+///
+/// Each trunk is a **[trunk:name]** section used for registration and call routing (DIDs, locality groups, outgoing caller ID). Use global `-f` to choose the config file.
+///
+/// **Subcommands**
+///
+/// - **list**  
+///   List all configured trunks. Output: NAME, HOST (with port if not 5060), USERNAME, DIDs (comma-separated). No arguments.
+///
+/// - **add** [`--host` H] [`--username` U] [`--password` P] [`--did` D] [`--cid` C] &lt;name&gt;  
+///   Add a new trunk. Appends a **[trunk:name]** section. **name** is required (positional). `--host`, `--username`, and `--password` are required (upstream SIP server and credentials). `--did` and `--cid` are optional (incoming DID(s) and outgoing caller ID). Fails if a trunk with that name already exists. Further options (port, cid_name, pattern, overflow, group, filter_incoming, etc.) can be added by editing the config after creation.
+///
+/// - **remove**, **rm** &lt;name&gt;  
+///   Remove the trunk with the given name. Deletes the **[trunk:name]** section. **name** is required.
+///
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

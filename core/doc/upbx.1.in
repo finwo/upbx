@@ -1,0 +1,15 @@
+.TH UPBX 1 "$VERSION" "upbx" "User Commands"
+.SH NAME
+upbx \- standalone SIP PBX daemon (extensions, trunks, call routing)
+.SH SYNOPSIS
+.B upbx
+[\fIglobal options\fR] \fIcommand\fR [\fIoptions\fR]
+.br
+.B upbx
+.B list-commands
+.br
+.B upbx
+.B \-\-license
+__COMMANDS_MAN__
+.SH LICENSE
+__LICENSE_MAN__

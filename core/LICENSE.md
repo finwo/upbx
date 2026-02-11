@@ -1,9 +1,11 @@
 Copyright (c) 2026 finwo
 
+<!-- paragraph -->
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to use, copy,
 modify, and distribute the Software, subject to the following conditions:
 
+<!-- list:start -->
  1. Redistributions of source code must retain the above copyright notice, this
     list of conditions, and the following disclaimer.
 
@@ -23,9 +25,12 @@ modify, and distribute the Software, subject to the following conditions:
  5. Modifications to copies of the Software must carry prominent notices stating
     that changes were made, the nature of the modifications, and the date of the
     modifications.
+<!-- list:end -->
 
+<!-- paragraph -->
 Any violation of these conditions terminates the permissions granted herein.
 
+<!-- paragraph -->
 THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
 FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT

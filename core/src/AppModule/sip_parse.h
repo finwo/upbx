@@ -29,7 +29,7 @@ int sip_parse_www_authenticate(const char *buf, size_t len, char **nonce_out, ch
 /* Get expires from Contact header (expires= param) or Expires header. Returns seconds or 0 if not found. */
 int sip_response_contact_expires(const char *buf, size_t len);
 
-/* --- Request parser and builder (no libosip2) --- */
+/* Request parser and builder (no libosip2) */
 
 int sip_is_request(const char *buf, size_t len);
 int sip_request_method(const char *buf, size_t len, const char **method_out, size_t *method_len_out);
@@ -91,7 +91,7 @@ char *sip_build_request_parts(const char *method, const char *request_uri,
 
 int sip_request_get_body(const char *buf, size_t len, const char **body_out, size_t *body_len_out);
 
-/* ---- Packet rewrite helpers ----
+/* Packet rewrite helpers
  * Each copies buf[0..len-1] to out[0..out_cap-1] with one modification.
  * Returns new length, or -1 on error. Composable: chain output → input. */
 

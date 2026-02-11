@@ -78,7 +78,24 @@ override CPPFLAGS+=$(INCLUDES)
 override CPPFLAGS+=$(CFLAGS)
 
 .PHONY: default
-default: $(BIN)
+default: $(BIN) $(BIN).1
+
+# Stddoc: extract /// documentation from source to markdown for manpage
+STDDOC ?= stddoc
+doc/cli_doc.md: $(SRC)
+	@mkdir -p doc
+	cat $(SRC) | $(STDDOC) > doc/cli_doc.md
+
+# Manpage: template + stddoc fragment (markdown -> man) + envsubst for VERSION
+doc/cli_doc.man: doc/cli_doc.md
+	pandoc doc/cli_doc.md -f markdown -t man -o doc/cli_doc.man
+
+doc/license.man: LICENSE.md
+	@mkdir -p doc
+	pandoc LICENSE.md -f markdown -t man --standalone=false -o doc/license.man
+
+$(BIN).1: doc/upbx.1.in doc/cli_doc.man doc/license.man
+	VERSION=$(VERSION) envsubst '$$VERSION' < doc/upbx.1.in | sed '/__COMMANDS_MAN__/r doc/cli_doc.man' | sed '/__COMMANDS_MAN__/d' | sed '/__LICENSE_MAN__/r doc/license.man' | sed '/__LICENSE_MAN__/d' > $(BIN).1
 
 # .cc.o:
 # 	$(CPP) $< $(CPPFLAGS) -c -o $@
@@ -114,7 +131,8 @@ test: $(TEST_BINS)
 
 .PHONY: clean
 clean:
-	rm -rf $(BIN) $(TEST_BINS)
+	rm -rf $(BIN) $(BIN).1 $(TEST_BINS)
 	rm -rf $(OBJ)
 	rm -rf $(patsubst %,src/test/%.o,$(TEST_BINS:test_%=test_%))
 	rm -rf src/test/*.o
+	rm -rf doc/cli_doc.md doc/cli_doc.man doc/license.man

@@ -1,10 +1,28 @@
-/*
- * CLI commands for managing extensions in the config file.
- * Usage:
- *   upbx [-f config] extension list
- *   upbx [-f config] extension add [--name "Reception"] <number> <secret>
- *   upbx [-f config] extension remove|rm <number>
- */
+/// <!-- path: src/AppModule/command/extension.c -->
+/// # EXTENSION
+/// **extension** is the command that manages SIP extensions in the config file. It has subcommands: **list**, **add**, and **remove** (or **rm**).
+///
+/// **Synopsis**
+///
+/// **upbx** [global options] **extension** **list**  
+/// **upbx** [global options] **extension** **add** [`--name` NAME] &lt;number&gt; &lt;secret&gt;  
+/// **upbx** [global options] **extension** **remove**|**rm** &lt;number&gt;
+///
+/// **Description**
+///
+/// Each extension is a **[ext:number]** section with **secret** and optional **name**. Extensions register via SIP REGISTER; routing (locality, DIDs, short-dial) is determined by **[upbx]** and **[trunk:...]** settings. Use global `-f` to choose the config file; if omitted, default locations are searched.
+///
+/// **Subcommands**
+///
+/// - **list**  
+///   List all configured extensions. Output: NUMBER and NAME columns. No arguments.
+///
+/// - **add** [`--name` NAME] &lt;number&gt; &lt;secret&gt;  
+///   Add a new extension. Appends a new **[ext:number]** section to the config. **number** and **secret** are required positional arguments. `--name` NAME sets the optional display name (e.g. "Reception"). Fails if the extension number already exists.
+///
+/// - **remove**, **rm** &lt;number&gt;  
+///   Remove the extension with the given number. Deletes the **[ext:number]** section from the config file. **number** is required.
+///
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
