@@ -22,8 +22,8 @@ void plugin_sync(void);
  * Returns 0 on success, -1 on transport error. Response is consumed/discarded. */
 int plugin_invoke(const char *plugin_name, const char *method, int argc, const resp_object *const *argv);
 
-/* Check if plugin has registered an event (e.g. "extension.register", "call.dialout"). */
-int plugin_has_event(const char *plugin_name, const char *event_name);
+/* Check if plugin supports the given method (case-insensitive; e.g. "extension.register", "config.set"). */
+int plugin_has_method(const char *plugin_name, const char *method_name);
 
 /* Notify all plugins that have this event. Sends RESP array (event_name, arg0, arg1, ...).
  * Each plugin's response is read and discarded. */

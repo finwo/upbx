@@ -92,7 +92,9 @@ void config_free(upbx_config *cfg);
 /* Initialize cfg to defaults (zeros). */
 void config_init(upbx_config *cfg);
 
-/* --- Live config API (re-read file each call; no cache). Caller frees with resp_free. --- */
+/* Live config API (re-read file each call; no cache). Caller frees with resp_free.
+ * Values are unescaped (\\ -> \, \@ -> @). Raw value starting with @ is a reference:
+ * @section or @section.key. Reference specs are used as-is for lookup; no normalization. */
 
 /* Set/get config file path (used by default getters). Set once at startup. */
 void config_set_path(const char *path);

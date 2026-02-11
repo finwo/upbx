@@ -3,6 +3,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdbool.h>
@@ -21,13 +22,12 @@ typedef struct {
   pid_t pid;
   int fd_write;
   int fd_read;
-  char **methods;
+  char **methods;      /* single list of callable names (methods and events) */
   size_t method_count;
-  char **events;
-  size_t event_count;
   int stopping;
   time_t stop_sent_at;
   unsigned long long config_hash;
+  int restart_on_update;
   char *exec;
 } plugin_state_t;
 
@@ -35,8 +35,8 @@ static plugin_state_t *plugins;
 static size_t plugin_cap;
 static size_t plugin_n;
 static const char *discovery_cmd_used;
-static const char **event_prefixes_used;
-static size_t event_prefixes_n;
+static plugmod_after_discovery_fn after_discovery_cb_used;
+static void *after_discovery_user_used;
 
 static void plugin_state_free(plugin_state_t *p) {
   if (!p) return;
@@ -44,8 +44,6 @@ static void plugin_state_free(plugin_state_t *p) {
   free(p->exec);
   for (size_t i = 0; i < p->method_count; i++) free(p->methods[i]);
   free(p->methods);
-  for (size_t i = 0; i < p->event_count; i++) free(p->events[i]);
-  free(p->events);
   if (p->fd_read >= 0) close(p->fd_read);
   if (p->fd_write >= 0) close(p->fd_write);
 }
@@ -86,11 +84,10 @@ static int spawn_plugin(const char *name, const char *exec_path, plugin_state_t 
   out->fd_read = stdout_pipe[0];
   out->methods = NULL;
   out->method_count = 0;
-  out->events = NULL;
-  out->event_count = 0;
   out->stopping = 0;
   out->stop_sent_at = 0;
   out->config_hash = 0;
+  out->restart_on_update = 0;
   out->exec = strdup(exec_path);
   if (set_socket_nonblocking(out->fd_read, 0) != 0 || set_socket_nonblocking(out->fd_write, 0) != 0) {
     plugin_state_free(out);
@@ -114,38 +111,26 @@ static int do_discovery(plugin_state_t *p) {
     if (r) resp_free(r);
     return -1;
   }
-  int is_event;
   for (size_t i = 0; i < r->u.arr.n; i++) {
     resp_object *e = &r->u.arr.elem[i];
     const char *s = (e->type == RESPT_BULK || e->type == RESPT_SIMPLE) ? e->u.s : NULL;
     if (!s) continue;
-    is_event = 0;
-    for (size_t p = 0; p < event_prefixes_n && event_prefixes_used && event_prefixes_used[p]; p++) {
-      size_t plen = strlen(event_prefixes_used[p]);
-      if (plen && strncmp(s, event_prefixes_used[p], plen) == 0) { is_event = 1; break; }
-    }
-    if (is_event) {
-      char **new_ev = realloc(p->events, (p->event_count + 1) * sizeof(char *));
-      if (!new_ev) break;
-      p->events = new_ev;
-      p->events[p->event_count++] = strdup(s);
-    } else {
-      char **new_m = realloc(p->methods, (p->method_count + 1) * sizeof(char *));
-      if (!new_m) break;
-      p->methods = new_m;
-      p->methods[p->method_count++] = strdup(s);
-    }
+    char **new_m = realloc(p->methods, (p->method_count + 1) * sizeof(char *));
+    if (!new_m) break;
+    p->methods = new_m;
+    p->methods[p->method_count++] = strdup(s);
   }
   resp_free(r);
   return 0;
 }
 
 void plugmod_start(const plugmod_config_item *configs, size_t n,
-  const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes) {
+  const char *discovery_cmd,
+  plugmod_after_discovery_fn after_discovery_cb, void *after_discovery_user) {
   log_trace("plugmod_start: %zu plugin configs, discovery=%s", n, discovery_cmd ? discovery_cmd : "(none)");
   discovery_cmd_used = discovery_cmd;
-  event_prefixes_used = event_prefixes;
-  event_prefixes_n = n_event_prefixes;
+  after_discovery_cb_used = after_discovery_cb;
+  after_discovery_user_used = after_discovery_user;
   plugin_n = 0;
   for (size_t i = 0; i < n; i++) {
     if (!configs[i].exec || !configs[i].exec[0]) continue;
@@ -162,12 +147,15 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
     if (spawn_plugin(configs[i].name, configs[i].exec, p) != 0)
       continue;
     p->config_hash = configs[i].config_hash;
+    p->restart_on_update = configs[i].restart_on_update;
     if (discovery_cmd_used && do_discovery(p) != 0) {
       log_error("plugin %s: discovery failed", p->name);
       plugin_state_free(p);
       continue;
     }
-    log_debug("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
+    if (after_discovery_cb_used)
+      after_discovery_cb_used(p->name, after_discovery_user_used);
+    log_debug("plugin %s: %zu methods", p->name, p->method_count);
     plugin_n++;
   }
 }
@@ -201,7 +189,7 @@ void plugmod_tick(void) {
   }
 }
 
-int plugmod_start_plugin(const char *name, const char *exec, unsigned long long config_hash) {
+int plugmod_start_plugin(const char *name, const char *exec, unsigned long long config_hash, int restart_on_update) {
   if (!name || !exec || !exec[0]) return -1;
   if (find_plugin(name) != NULL) return -1; /* already running or stopping */
   if (!discovery_cmd_used) return -1;
@@ -217,22 +205,26 @@ int plugmod_start_plugin(const char *name, const char *exec, unsigned long long 
   p->fd_read = p->fd_write = -1;
   if (spawn_plugin(name, exec, p) != 0) return -1;
   p->config_hash = config_hash;
+  p->restart_on_update = restart_on_update;
   if (do_discovery(p) != 0) {
     log_error("plugin %s: discovery failed", p->name);
     plugin_state_free(p);
     return -1;
   }
-  log_debug("plugin %s: %zu methods, %zu events", p->name, p->method_count, p->event_count);
+  if (after_discovery_cb_used)
+    after_discovery_cb_used(p->name, after_discovery_user_used);
+  log_debug("plugin %s: %zu methods", p->name, p->method_count);
   plugin_n++;
   return 0;
 }
 
 void plugmod_sync(const plugmod_config_item *configs, size_t n,
-  const char *discovery_cmd, const char **event_prefixes, size_t n_event_prefixes) {
+  const char *discovery_cmd,
+  plugmod_after_discovery_fn after_discovery_cb, void *after_discovery_user) {
   plugmod_tick();
   discovery_cmd_used = discovery_cmd;
-  event_prefixes_used = event_prefixes;
-  event_prefixes_n = n_event_prefixes;
+  after_discovery_cb_used = after_discovery_cb;
+  after_discovery_user_used = after_discovery_user;
   for (size_t i = 0; i < plugin_n; i++) {
     plugin_state_t *p = &plugins[i];
     if (p->stopping) continue;
@@ -247,15 +239,25 @@ void plugmod_sync(const plugmod_config_item *configs, size_t n,
       plugmod_stop_plugin(p->name);
       continue;
     }
-    if (c->config_hash != 0 && p->config_hash != c->config_hash) {
+    if (c->restart_on_update != p->restart_on_update) {
       plugmod_stop_plugin(p->name);
       continue;
+    }
+    if (c->config_hash != 0 && p->config_hash != c->config_hash) {
+      if (c->restart_on_update) {
+        plugmod_stop_plugin(p->name);
+        continue;
+      }
+      if (after_discovery_cb_used)
+        after_discovery_cb_used(p->name, after_discovery_user_used);
+      p->config_hash = c->config_hash;
+      p->restart_on_update = c->restart_on_update;
     }
   }
   for (size_t j = 0; j < n; j++) {
     if (!configs[j].exec || !configs[j].exec[0]) continue;
     if (find_plugin(configs[j].name) != NULL) continue;
-    plugmod_start_plugin(configs[j].name, configs[j].exec, configs[j].config_hash);
+    plugmod_start_plugin(configs[j].name, configs[j].exec, configs[j].config_hash, configs[j].restart_on_update);
   }
 }
 
@@ -302,11 +304,11 @@ int plugmod_invoke(const char *plugin_name, const char *method, int argc, const 
   return ret;
 }
 
-int plugmod_has_event(const char *plugin_name, const char *event_name) {
+int plugmod_has_method(const char *plugin_name, const char *method_name) {
   plugin_state_t *p = find_plugin(plugin_name);
   if (!p || p->stopping) return 0;
-  for (size_t i = 0; i < p->event_count; i++)
-    if (strcmp(p->events[i], event_name) == 0)
+  for (size_t i = 0; i < p->method_count; i++)
+    if (strcasecmp(p->methods[i], method_name) == 0)
       return 1;
   return 0;
 }
@@ -315,7 +317,7 @@ void plugmod_notify_event(const char *event_name, int argc, const resp_object *c
   log_debug("plugin event %s (%d args)", event_name, argc);
   for (size_t i = 0; i < plugin_n; i++) {
     if (plugins[i].stopping) continue;
-    if (!plugmod_has_event(plugins[i].name, event_name)) continue;
+    if (!plugmod_has_method(plugins[i].name, event_name)) continue;
     plugmod_invoke(plugins[i].name, event_name, argc, argv);
   }
 }

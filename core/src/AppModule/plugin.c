@@ -11,8 +11,6 @@
 #include "AppModule/plugin.h"
 #include "PluginModule/plugin.h"
 
-static const char *event_prefixes[] = { "extension.", "trunk.", "call." };
-#define N_EVENT_PREFIXES (sizeof(event_prefixes) / sizeof(event_prefixes[0]))
 #define PLUGIN_SECTION_PREFIX "plugin:"
 #define PLUGIN_SECTION_PREFIX_LEN (sizeof(PLUGIN_SECTION_PREFIX) - 1)
 
@@ -29,11 +27,45 @@ static unsigned long long section_hash(resp_object *map) {
   return h;
 }
 
+/* Parse restart_on_update from section map: 0 or 1 only; default 0. */
+static int section_restart_on_update(resp_object *sec) {
+  resp_object *v = resp_map_get(sec, "restart_on_update");
+  if (!v || v->type != RESPT_INT) return 0;
+  return (v->u.i == 1) ? 1 : 0;
+}
+
+static void after_discovery_send_config(const char *plugin_name, void *user) {
+  (void)user;
+  char section_buf[64];
+  size_t plen = strlen(plugin_name);
+  if (plen + PLUGIN_SECTION_PREFIX_LEN >= sizeof(section_buf)) return;
+  memcpy(section_buf, PLUGIN_SECTION_PREFIX, PLUGIN_SECTION_PREFIX_LEN);
+  memcpy(section_buf + PLUGIN_SECTION_PREFIX_LEN, plugin_name, plen + 1);
+  resp_object *map = config_section_get(section_buf);
+  if (!map) return;
+  if (plugmod_has_method(plugin_name, "config.set")) {
+    plugmod_invoke(plugin_name, "config.set", 1, (const resp_object *const *)&map);
+  } else if (plugmod_has_method(plugin_name, "set")) {
+    resp_object *config_key = (resp_object *)malloc(sizeof(resp_object));
+    if (config_key) {
+      config_key->type = RESPT_BULK;
+      config_key->u.s = strdup("config");
+      if (config_key->u.s) {
+        const resp_object *argv[] = { config_key, map };
+        plugmod_invoke(plugin_name, "set", 2, argv);
+        free(config_key->u.s);
+      }
+      free(config_key);
+    }
+  }
+  resp_free(map);
+}
+
 void plugin_sync(void) {
   resp_object *sections = config_sections_list();
   if (!sections || sections->type != RESPT_ARRAY) {
     if (sections) resp_free(sections);
-    plugmod_sync(NULL, 0, "command", event_prefixes, N_EVENT_PREFIXES);
+    plugmod_sync(NULL, 0, "command", NULL, NULL);
     return;
   }
   plugmod_config_item *configs = NULL;
@@ -63,11 +95,12 @@ void plugin_sync(void) {
     configs[n].name = name_copy;
     configs[n].exec = exec_copy;
     configs[n].config_hash = section_hash(sec);
+    configs[n].restart_on_update = section_restart_on_update(sec);
     n++;
     resp_free(sec);
   }
   resp_free(sections);
-  plugmod_sync(configs, n, "command", event_prefixes, N_EVENT_PREFIXES);
+  plugmod_sync(configs, n, "command", after_discovery_send_config, NULL);
   for (size_t j = 0; j < n; j++) {
     free(names[j]);
     free(execs[j]);
@@ -91,9 +124,10 @@ void plugin_start(upbx_config *cfg) {
     configs[n].name = cfg->plugins[i].name;
     configs[n].exec = cfg->plugins[i].exec;
     configs[n].config_hash = 0;
+    configs[n].restart_on_update = 0;
     n++;
   }
-  plugmod_start(configs, n, "command", event_prefixes, N_EVENT_PREFIXES);
+  plugmod_start(configs, n, "command", after_discovery_send_config, NULL);
   log_info("plugins started (%zu loaded)", plugmod_count());
   free(configs);
 }
@@ -106,8 +140,8 @@ int plugin_invoke(const char *plugin_name, const char *method, int argc, const r
   return plugmod_invoke(plugin_name, method, argc, argv);
 }
 
-int plugin_has_event(const char *plugin_name, const char *event_name) {
-  return plugmod_has_event(plugin_name, event_name);
+int plugin_has_method(const char *plugin_name, const char *method_name) {
+  return plugmod_has_method(plugin_name, method_name);
 }
 
 void plugin_notify_event(const char *event_name, int argc, const resp_object *const *argv) {
@@ -132,7 +166,7 @@ void plugin_query_register(const char *extension_num, const char *trunk_name, co
   *out_allow = -1; /* continue */
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "extension.register")) continue;
+    if (!plugmod_has_method(name, "extension.register")) continue;
     resp_object *request_map = build_register_request_map(extension_num, trunk_name, from_user);
     if (!request_map) continue;
     resp_object *r = NULL;
@@ -291,7 +325,7 @@ void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *
   }
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "call.dialout")) continue;
+    if (!plugmod_has_method(name, "call.dialout")) continue;
     resp_object *request_map = build_dialout_request_map(source_ext, current_destination, call_id, current_trunks, n_current);
     if (!request_map) continue;
     resp_object *r = NULL;
@@ -369,7 +403,7 @@ void plugin_query_dialin(const char *trunk_name, const char *did, const char **t
   *out_n = 0;
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
-    if (!plugmod_has_event(name, "call.dialin")) continue;
+    if (!plugmod_has_method(name, "call.dialin")) continue;
     resp_object *request_map = build_dialin_request_map(trunk_name, did, target_extensions, n_targets, call_id);
     if (!request_map) continue;
     resp_object *r = NULL;

@@ -26,6 +26,9 @@ struct resp_object {
 
 void resp_free(resp_object *o);
 
+/* Deep-copy resp_object. Caller must resp_free result. Returns NULL on alloc failure. */
+resp_object *resp_deep_copy(const resp_object *o);
+
 /* Map helper: array as map (even-length: key, value, ...). Returns value element or NULL. Valid until resp freed. */
 resp_object *resp_map_get(const resp_object *o, const char *key);
 

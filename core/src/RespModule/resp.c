@@ -119,6 +119,41 @@ void resp_free(resp_object *o) {
   resp_free_internal(o);
 }
 
+resp_object *resp_deep_copy(const resp_object *o) {
+  if (!o) return NULL;
+  resp_object *c = (resp_object *)calloc(1, sizeof(resp_object));
+  if (!c) return NULL;
+  c->type = o->type;
+  if (o->type == RESPT_SIMPLE || o->type == RESPT_ERROR || o->type == RESPT_BULK) {
+    c->u.s = o->u.s ? strdup(o->u.s) : NULL;
+    if (o->u.s && !c->u.s) { free(c); return NULL; }
+    return c;
+  }
+  if (o->type == RESPT_INT) {
+    c->u.i = o->u.i;
+    return c;
+  }
+  if (o->type == RESPT_ARRAY) {
+    c->u.arr.n = o->u.arr.n;
+    c->u.arr.elem = o->u.arr.n ? (resp_object *)calloc(o->u.arr.n, sizeof(resp_object)) : NULL;
+    if (o->u.arr.n && !c->u.arr.elem) { free(c); return NULL; }
+    for (size_t i = 0; i < o->u.arr.n; i++) {
+      resp_object *sub = resp_deep_copy(&o->u.arr.elem[i]);
+      if (!sub) {
+        for (size_t j = 0; j < i; j++) resp_free_internal(&c->u.arr.elem[j]);
+        free(c->u.arr.elem);
+        free(c);
+        return NULL;
+      }
+      c->u.arr.elem[i] = *sub;
+      free(sub);
+    }
+    return c;
+  }
+  free(c);
+  return NULL;
+}
+
 resp_object *resp_map_get(const resp_object *o, const char *key) {
   if (!o || !key || o->type != RESPT_ARRAY) return NULL;
   size_t n = o->u.arr.n;

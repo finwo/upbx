@@ -9,6 +9,65 @@
 #include "RespModule/resp.h"
 
 #define STRDUP(s) ((s) ? strdup(s) : NULL)
+#define PREFIX_MATCH(sec, pre) (strncmp(sec, pre, sizeof(pre)-1) == 0 && (sec)[sizeof(pre)-1])
+#define SECTION_TAIL(sec, pre) ((sec) + sizeof(pre) - 1)
+
+#define TRIM_SECTION_SIZE 256
+#define TRIM_NAME_SIZE    256
+#define TRIM_VALUE_SIZE  2048
+#define TRIM_BUF          512
+
+#define CONFIG_REF_DEPTH_MAX 8
+#define REPEATABLE_KEY(s) (strcmp(s, "permit") == 0 || strcmp(s, "did") == 0 || strcmp(s, "emergency") == 0)
+
+typedef struct {
+  char **sections;
+  size_t n;
+  size_t cap;
+} sections_ctx_t;
+
+typedef struct {
+  char *key;
+  int is_array;
+  int is_ref;  /* value is resolved resp_object* (single key only) */
+  union {
+    char *single;
+    struct { char **ptr; size_t n; size_t cap; } arr;
+    resp_object *ref;
+  } val;
+} section_entry_t;
+
+typedef struct {
+  const char *target_section;
+  section_entry_t *entries;
+  size_t n;
+  size_t cap;
+  char current_repeatable_key[TRIM_BUF];
+  size_t repeatable_val_cap;
+} section_get_ctx_t;
+
+typedef struct {
+  const char *target_section;
+  const char *target_key;
+  int found;
+  int is_repeatable;
+  char **vals;
+  size_t val_count;
+  size_t val_cap;
+  char *single_val;
+  long long int_val;
+  int want_int;
+} key_get_ctx_t;
+
+static resp_object *config_section_get_path_impl(const char *path, const char *section, unsigned depth);
+
+/* Pair pattern with following replace in [trunk:...] */
+static char *pending_rewrite_pattern;
+/* Last parse error (section/key) when handler returns 0; used for error reporting. */
+static char last_parse_section[TRIM_SECTION_SIZE];
+static char last_parse_key[TRIM_NAME_SIZE];
+/* Live config API */
+static const char *stored_config_path;
 
 /* Copy src into dest, trimming leading/trailing whitespace; dest is null-terminated. Returns dest. */
 static char *trim_copy(char *dest, size_t dest_size, const char *src) {
@@ -91,20 +150,6 @@ static config_extension *find_or_add_extension(upbx_config *cfg, const char *num
   if (!e->number) { cfg->extension_count = old; return NULL; }
   return e;
 }
-
-#define PREFIX_MATCH(sec, pre) (strncmp(sec, pre, sizeof(pre)-1) == 0 && (sec)[sizeof(pre)-1])
-#define SECTION_TAIL(sec, pre) ((sec) + sizeof(pre) - 1)
-
-/* Pair pattern with following replace in [trunk:...] */
-static char *pending_rewrite_pattern;
-
-#define TRIM_SECTION_SIZE 256
-#define TRIM_NAME_SIZE    256
-#define TRIM_VALUE_SIZE  2048
-
-/* Last parse error (section/key) when handler returns 0; used for error reporting. */
-static char last_parse_section[TRIM_SECTION_SIZE];
-static char last_parse_key[TRIM_NAME_SIZE];
 
 static void set_last_parse_error(const char *section, const char *name) {
   if (section) {
@@ -446,9 +491,6 @@ int config_compile_trunk_rewrites(upbx_config *cfg) {
   return 0;
 }
 
-/* --- Live config API --- */
-static const char *stored_config_path;
-
 void config_set_path(const char *path) {
   stored_config_path = path;
 }
@@ -457,15 +499,75 @@ const char *config_get_path(void) {
   return stored_config_path;
 }
 
-#define TRIM_BUF 512
+/* Unescape: \\ -> \, \@ -> @. Caller must free result. Returns NULL on alloc failure. */
+static char *config_unescape(const char *raw) {
+  if (!raw) return NULL;
+  size_t len = 0;
+  for (const char *p = raw; *p; p++) {
+    if (p[0] == '\\' && (p[1] == '\\' || p[1] == '@')) { len++; p++; }
+    else len++;
+  }
+  char *out = (char *)malloc(len + 1);
+  if (!out) return NULL;
+  char *q = out;
+  for (const char *p = raw; *p; p++) {
+    if (p[0] == '\\' && (p[1] == '\\' || p[1] == '@')) { *q++ = p[1]; p++; }
+    else *q++ = *p;
+  }
+  *q = '\0';
+  return out;
+}
+
+/* Split reference spec into section and optional key. Last dot separates section from key. No normalization: section is used as-is for lookup. */
+static void ref_spec_to_section(const char *spec, char *section_out, size_t section_size, const char **key_out) {
+  *key_out = NULL;
+  if (!section_out || section_size == 0) return;
+  section_out[0] = '\0';
+  if (!spec) return;
+  const char *last_dot = strrchr(spec, '.');
+  size_t section_spec_len = strlen(spec);
+  if (last_dot && last_dot > spec) {
+    *key_out = last_dot + 1;
+    section_spec_len = (size_t)(last_dot - spec);
+  }
+  if (section_spec_len >= section_size) section_spec_len = section_size - 1;
+  memcpy(section_out, spec, section_spec_len);
+  section_out[section_spec_len] = '\0';
+}
+
+/* Resolve @spec at given depth. Returns owned resp_object or NULL (omit key, log). path and depth required. */
+static resp_object *config_resolve_ref(const char *path, const char *spec, unsigned depth) {
+  if (!path || !spec || depth > CONFIG_REF_DEPTH_MAX) {
+    if (depth > CONFIG_REF_DEPTH_MAX)
+      log_warn("config: reference depth exceeded (max %d): %.64s", CONFIG_REF_DEPTH_MAX, spec);
+    return NULL;
+  }
+  char *unescaped_spec = config_unescape(spec);
+  if (!unescaped_spec) return NULL;
+  char section_buf[TRIM_SECTION_SIZE];
+  const char *sub_key = NULL;
+  ref_spec_to_section(unescaped_spec, section_buf, sizeof(section_buf), &sub_key);
+  free(unescaped_spec);
+  resp_object *sec = config_section_get_path_impl(path, section_buf, depth + 1);
+  if (!sec) {
+    log_warn("config: unresolved reference @%.64s (section not found)", spec);
+    return NULL;
+  }
+  if (!sub_key) {
+    return sec;
+  }
+  resp_object *val = resp_map_get(sec, sub_key);
+  if (!val) {
+    resp_free(sec);
+    log_warn("config: unresolved reference @%.64s (key not found)", spec);
+    return NULL;
+  }
+  resp_object *copy = resp_deep_copy(val);
+  resp_free(sec);
+  return copy;
+}
 
 /* Collect unique section names in order of first appearance. */
-typedef struct {
-  char **sections;
-  size_t n;
-  size_t cap;
-} sections_ctx_t;
-
 static int sections_handler(void *user, const char *section, const char *name, const char *value, int lineno) {
   (void)name;
   (void)value;
@@ -520,32 +622,17 @@ resp_object *config_sections_list_path(const char *path) {
   return o;
 }
 
-/* Section map: key/value pairs; repeatable keys (permit, did, emergency) → value = ARRAY of strings. */
-#define REPEATABLE_KEY(s) (strcmp(s, "permit") == 0 || strcmp(s, "did") == 0 || strcmp(s, "emergency") == 0)
-typedef struct {
-  char *key;
-  int is_array;
-  union {
-    char *single;
-    struct { char **ptr; size_t n; size_t cap; } arr;
-  } val;
-} section_entry_t;
-
-typedef struct {
-  const char *target_section;
-  section_entry_t *entries;
-  size_t n;
-  size_t cap;
-  char current_repeatable_key[TRIM_BUF];
-  size_t repeatable_val_cap;
-} section_get_ctx_t;
-
+/* Section map: key/value pairs; repeatable keys (permit, did, emergency) -> value = ARRAY of strings. */
 static void section_get_ctx_free(section_get_ctx_t *ctx) {
   for (size_t i = 0; i < ctx->n; i++) {
     free(ctx->entries[i].key);
-    if (ctx->entries[i].is_array) {
-      for (size_t j = 0; j < ctx->entries[i].val.arr.n; j++) free(ctx->entries[i].val.arr.ptr[j]);
-      free(ctx->entries[i].val.arr.ptr);
+    if (ctx->entries[i].is_ref)
+      resp_free(ctx->entries[i].val.ref);
+    else if (ctx->entries[i].is_array) {
+      if (ctx->entries[i].val.arr.ptr) {
+        for (size_t j = 0; j < ctx->entries[i].val.arr.n; j++) free(ctx->entries[i].val.arr.ptr[j]);
+        free(ctx->entries[i].val.arr.ptr);
+      }
     } else {
       free(ctx->entries[i].val.single);
     }
@@ -587,6 +674,7 @@ static int section_get_handler(void *user, const char *section, const char *name
       }
       ctx->entries[ctx->n].key = strdup(kbuf);
       ctx->entries[ctx->n].is_array = 1;
+      ctx->entries[ctx->n].is_ref = 0;
       ctx->entries[ctx->n].val.arr.ptr = (char **)malloc(4 * sizeof(char *));
       ctx->entries[ctx->n].val.arr.cap = 4;
       ctx->entries[ctx->n].val.arr.n = 0;
@@ -620,13 +708,95 @@ static int section_get_handler(void *user, const char *section, const char *name
   ctx->current_repeatable_key[0] = '\0';
   ctx->entries[ctx->n].key = strdup(kbuf);
   ctx->entries[ctx->n].is_array = 0;
+  ctx->entries[ctx->n].is_ref = 0;
   ctx->entries[ctx->n].val.single = strdup(vbuf);
   if (!ctx->entries[ctx->n].key || !ctx->entries[ctx->n].val.single) return 0;
   ctx->n++;
   return 1;
 }
 
-resp_object *config_section_get_path(const char *path, const char *section) {
+/* Post-process raw entries: unescape, resolve @ references. path and depth for resolution. */
+static int section_entries_apply_unescape_and_refs(section_get_ctx_t *ctx, const char *path, unsigned depth) {
+  for (size_t i = 0; i < ctx->n; i++) {
+    section_entry_t *e = &ctx->entries[i];
+    if (e->is_array) {
+      if (!e->val.arr.ptr)
+        continue;
+      for (size_t j = 0; j < e->val.arr.n; j++) {
+        char *raw = e->val.arr.ptr[j];
+        if (!raw) continue;
+        if (raw[0] == '@') {
+          resp_object *resolved = config_resolve_ref(path, raw + 1, depth);
+          free(raw);
+          if (!resolved) {
+            e->val.arr.ptr[j] = NULL;
+            continue;
+          }
+          if (resolved->type == RESPT_BULK || resolved->type == RESPT_SIMPLE) {
+            e->val.arr.ptr[j] = resolved->u.s ? strdup(resolved->u.s) : strdup("");
+            resp_free(resolved);
+          } else if (resolved->type == RESPT_ARRAY) {
+            size_t add = resolved->u.arr.n;
+            if (add == 0) {
+              free(e->val.arr.ptr[j]);
+              e->val.arr.ptr[j] = NULL;
+              resp_free(resolved);
+            } else {
+              free(e->val.arr.ptr[j]);
+              size_t need = e->val.arr.n + add - 1;
+              while (e->val.arr.cap < need) {
+                size_t new_cap = e->val.arr.cap ? e->val.arr.cap * 2 : 4;
+                char **p = (char **)realloc(e->val.arr.ptr, new_cap * sizeof(char *));
+                if (!p) { resp_free(resolved); continue; }
+                e->val.arr.ptr = p;
+                e->val.arr.cap = new_cap;
+              }
+              memmove(&e->val.arr.ptr[j + add], &e->val.arr.ptr[j + 1], (e->val.arr.n - 1 - j) * sizeof(char *));
+              for (size_t a = 0; a < add; a++) {
+                resp_object *elem = &resolved->u.arr.elem[a];
+                e->val.arr.ptr[j + a] = (elem->type == RESPT_BULK || elem->type == RESPT_SIMPLE) && elem->u.s
+                  ? strdup(elem->u.s) : strdup("");
+              }
+              e->val.arr.n += add - 1;
+              resp_free(resolved);
+            }
+          } else {
+            resp_free(resolved);
+            e->val.arr.ptr[j] = NULL;
+          }
+        } else {
+          char *u = config_unescape(raw);
+          free(raw);
+          e->val.arr.ptr[j] = u ? u : strdup("");
+        }
+      }
+      continue;
+    }
+    if (e->is_ref) continue;
+    char *raw = e->val.single;
+    if (!raw) continue;
+    if (raw[0] == '@') {
+      resp_object *resolved = config_resolve_ref(path, raw + 1, depth);
+      free(raw);
+      e->val.single = NULL;
+      if (!resolved) {
+        free(e->key);
+        e->key = NULL;
+        continue;
+      }
+      e->is_ref = 1;
+      e->val.ref = resolved;
+    } else {
+      char *u = config_unescape(raw);
+      free(raw);
+      e->val.single = u ? u : strdup("");
+    }
+  }
+  return 1;
+}
+
+/* Internal: get section map with reference resolution at given depth. */
+static resp_object *config_section_get_path_impl(const char *path, const char *section, unsigned depth) {
   if (!path || !section) return NULL;
   section_get_ctx_t ctx = { section, NULL, 0, 0, "", 0 };
   int r = ini_parse(path, section_get_handler, &ctx);
@@ -634,61 +804,78 @@ resp_object *config_section_get_path(const char *path, const char *section) {
     section_get_ctx_free(&ctx);
     return NULL;
   }
+  section_entries_apply_unescape_and_refs(&ctx, path, depth);
+  size_t valid = 0;
+  for (size_t i = 0; i < ctx.n; i++)
+    if (ctx.entries[i].key) valid++;
   resp_object *o = (resp_object *)calloc(1, sizeof(resp_object));
   if (!o) { section_get_ctx_free(&ctx); return NULL; }
   o->type = RESPT_ARRAY;
-  o->u.arr.n = ctx.n * 2;
+  o->u.arr.n = valid * 2;
   o->u.arr.elem = (resp_object *)calloc(o->u.arr.n, sizeof(resp_object));
-  if (!o->u.arr.elem) {
+  if (!o->u.arr.elem && valid) {
     free(o);
     section_get_ctx_free(&ctx);
     return NULL;
   }
-  for (size_t i = 0, j = 0; i < ctx.n; i++, j += 2) {
+  for (size_t i = 0, j = 0; i < ctx.n; i++) {
+    if (!ctx.entries[i].key) continue;
     o->u.arr.elem[j].type = RESPT_BULK;
-    o->u.arr.elem[j].u.s = strdup(ctx.entries[i].key);
-    if (ctx.entries[i].is_array) {
-      o->u.arr.elem[j + 1].type = RESPT_ARRAY;
-      o->u.arr.elem[j + 1].u.arr.n = ctx.entries[i].val.arr.n;
-      o->u.arr.elem[j + 1].u.arr.elem = (resp_object *)calloc(ctx.entries[i].val.arr.n, sizeof(resp_object));
-      if (!o->u.arr.elem[j + 1].u.arr.elem) {
-        while (j > 0) { j -= 2; free(o->u.arr.elem[j].u.s); if (o->u.arr.elem[j+1].type == RESPT_ARRAY) { for (size_t k = 0; k < o->u.arr.elem[j+1].u.arr.n; k++) free(o->u.arr.elem[j+1].u.arr.elem[k].u.s); free(o->u.arr.elem[j+1].u.arr.elem); } }
+    o->u.arr.elem[j].u.s = ctx.entries[i].key;
+    ctx.entries[i].key = NULL;
+    if (ctx.entries[i].is_ref) {
+      resp_object *copy = resp_deep_copy(ctx.entries[i].val.ref);
+      if (!copy) {
+        while (j > 0) { j -= 2; free(o->u.arr.elem[j].u.s); resp_free(&o->u.arr.elem[j+1]); }
         free(o->u.arr.elem);
         free(o);
         section_get_ctx_free(&ctx);
         return NULL;
       }
-      for (size_t k = 0; k < ctx.entries[i].val.arr.n; k++) {
-        o->u.arr.elem[j + 1].u.arr.elem[k].type = RESPT_BULK;
-        o->u.arr.elem[j + 1].u.arr.elem[k].u.s = ctx.entries[i].val.arr.ptr[k];
+      o->u.arr.elem[j + 1] = *copy;
+      free(copy);
+      j += 2;
+      continue;
+    }
+    if (ctx.entries[i].is_array) {
+      size_t n = 0;
+      for (size_t k = 0; k < ctx.entries[i].val.arr.n; k++)
+        if (ctx.entries[i].val.arr.ptr[k]) n++;
+      o->u.arr.elem[j + 1].type = RESPT_ARRAY;
+      o->u.arr.elem[j + 1].u.arr.n = n;
+      o->u.arr.elem[j + 1].u.arr.elem = n ? (resp_object *)calloc(n, sizeof(resp_object)) : NULL;
+      if (n && !o->u.arr.elem[j + 1].u.arr.elem) {
+        while (j > 0) { j -= 2; free(o->u.arr.elem[j].u.s); resp_free(&o->u.arr.elem[j+1]); }
+        free(o->u.arr.elem);
+        free(o);
+        section_get_ctx_free(&ctx);
+        return NULL;
+      }
+      for (size_t k = 0, kk = 0; k < ctx.entries[i].val.arr.n; k++) {
+        if (!ctx.entries[i].val.arr.ptr[k]) continue;
+        o->u.arr.elem[j + 1].u.arr.elem[kk].type = RESPT_BULK;
+        o->u.arr.elem[j + 1].u.arr.elem[kk].u.s = ctx.entries[i].val.arr.ptr[k];
+        ctx.entries[i].val.arr.ptr[k] = NULL;
+        kk++;
       }
       free(ctx.entries[i].val.arr.ptr);
       ctx.entries[i].val.arr.ptr = NULL;
     } else {
       o->u.arr.elem[j + 1].type = RESPT_BULK;
       o->u.arr.elem[j + 1].u.s = ctx.entries[i].val.single;
+      ctx.entries[i].val.single = NULL;
     }
-    free(ctx.entries[i].key);
-    ctx.entries[i].key = NULL;
+    j += 2;
   }
-  free(ctx.entries);
+  section_get_ctx_free(&ctx);
   return o;
 }
 
-/* Key get: return single value (string/int) or ARRAY for repeatable key. */
-typedef struct {
-  const char *target_section;
-  const char *target_key;
-  int found;
-  int is_repeatable;
-  char **vals;
-  size_t val_count;
-  size_t val_cap;
-  char *single_val;
-  long long int_val;
-  int want_int;
-} key_get_ctx_t;
+resp_object *config_section_get_path(const char *path, const char *section) {
+  return config_section_get_path_impl(path, section, 0);
+}
 
+/* Key get: return single value (string/int) or ARRAY for repeatable key. */
 static int key_get_handler(void *user, const char *section, const char *name, const char *value, int lineno) {
   (void)lineno;
   key_get_ctx_t *ctx = (key_get_ctx_t *)user;
@@ -738,6 +925,24 @@ resp_object *config_key_get_path(const char *path, const char *section, const ch
     free(ctx.vals);
     free(ctx.single_val);
     return NULL;
+  }
+  if (ctx.is_repeatable) {
+    for (size_t i = 0; i < ctx.val_count; i++) {
+      char *raw = ctx.vals[i];
+      char *u = config_unescape(raw);
+      free(raw);
+      ctx.vals[i] = u ? u : strdup("");
+    }
+  } else if (!ctx.want_int && ctx.single_val && ctx.single_val[0] == '@') {
+    resp_object *resolved = config_resolve_ref(path, ctx.single_val + 1, 0);
+    free(ctx.single_val);
+    ctx.single_val = NULL;
+    if (!resolved) return NULL;
+    return resolved;
+  } else if (!ctx.want_int && ctx.single_val) {
+    char *u = config_unescape(ctx.single_val);
+    free(ctx.single_val);
+    ctx.single_val = u ? u : strdup("");
   }
   resp_object *o = (resp_object *)calloc(1, sizeof(resp_object));
   if (!o) {

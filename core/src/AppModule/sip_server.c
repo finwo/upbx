@@ -414,7 +414,7 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   size_t i;
 
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "extension.list")) break;
+    if (plugin_has_method(plugin_name_at(i), "extension.list")) break;
   }
   if (i < plugin_count()) {
     resp_object *map = build_extension_list_map(cfg);
@@ -425,7 +425,7 @@ static void notify_extension_and_trunk_lists(upbx_config *cfg) {
   }
 
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "trunk.list")) break;
+    if (plugin_has_method(plugin_name_at(i), "trunk.list")) break;
   }
   if (i < plugin_count()) {
     resp_object *map = build_trunk_list_map(cfg);
@@ -490,7 +490,7 @@ static void notify_call_answer(const char *direction, const char *call_id, const
   size_t i;
   if (plugin_count() == 0) return;
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "call.answer")) break;
+    if (plugin_has_method(plugin_name_at(i), "call.answer")) break;
   }
   if (i >= plugin_count()) return;
   log_debug("call.answer: notifying plugins, call=%.32s %s -> %s (%s)", call_id ? call_id : "", source ? source : "", destination ? destination : "", direction ? direction : "");
@@ -505,7 +505,7 @@ static void notify_call_hangup(const char *call_id, const char *source, const ch
   size_t i;
   if (plugin_count() == 0) return;
   for (i = 0; i < plugin_count(); i++) {
-    if (plugin_has_event(plugin_name_at(i), "call.hangup")) break;
+    if (plugin_has_method(plugin_name_at(i), "call.hangup")) break;
   }
   if (i >= plugin_count()) return;
   log_debug("call.hangup: notifying plugins, call=%.32s %s -> %s (%ds)", call_id ? call_id : "", source ? source : "", destination ? destination : "", duration_sec);

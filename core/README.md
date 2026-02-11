@@ -207,6 +207,15 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | Option | Description |
 |--------|-------------|
 | `exec` | Command to run (via `sh -c`). Process communicates over stdio using a RESP-style protocol; discovery via `command`. See [Plugin events](#plugin-events) for available events. |
+| `restart_on_update` | **0** (default): when this section's config changes, restart the plugin only if `exec` changed; otherwise resend the config map to the running process (if the plugin supports **config.set** or **set**). **1**: on any config change, always restart the plugin. If `restart_on_update` itself is changed in config, the plugin is always restarted so the new policy applies. Integer **0** or **1** only; missing or invalid = 0. |
+
+**Plugin config sharing.** After discovery (and on each start/restart), the daemon sends the plugin's full `[plugin:name]` section as a single RESP map if the plugin supports **config.set** or **set**. Prefer **config.set** &lt;map&gt; when the plugin advertises it; otherwise **set config** &lt;map&gt;. When config changes, behaviour is controlled by **restart_on_update** (see above). If the plugin does not support config.set/set, config is not sent; "resend without restart" is a no-op for such plugins.
+
+### Config values: escaping and @ references
+
+All config values (every section) support escape sequences: `\\` → `\`, `\@` → `@`. If the **raw** value (after trim) starts with `@`, it is a **reference**: `@section_spec` or `@section_spec.key` (e.g. `@api:metrics_user`, `@trunk:example.did`). The part after `@` is unescaped and resolved; reference specs are used as-is for lookup (no normalization). Any section type; repeatable keys remain arrays. Resolution has a depth limit of 8; unresolved references or depth exceeded cause the key to be treated as missing (and a warning is logged). If a value is expected as a string (e.g. by `resp_map_get_string`) but the resolved value is a map or array, it is treated as missing.
+
+**Reference vs literal:** Raw value starts with `@` → reference (unescape the part after `@`, then resolve). Otherwise → literal (unescape and use). Example: `\@api:foo` is the literal string `@api:foo`; `@api:foo` is the resolved reference.
 
 ### `[trunk:name]`
 
