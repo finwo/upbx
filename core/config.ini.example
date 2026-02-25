@@ -12,6 +12,7 @@ daemonize = 0
 [trunk:mycarrier]
 host = sip.example.com
 port = 5060
+transport = udp
 username = myuser
 password = mypass
 did = 15559876543
@@ -27,6 +28,7 @@ cid = 15559876543
 # overflow_target =
 # user_agent = upbx/0.1.0
 # group = 1234
+# filter_incoming = 0
 
 [ext:100]
 # name = Front desk

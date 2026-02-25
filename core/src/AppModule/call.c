@@ -17,6 +17,7 @@
 
 #include "common/socket_util.h"
 #include "AppModule/call.h"
+#include "AppModule/rtpproxy.h"
 #include "rxi/log.h"
 
 #define RTP_BUF_SIZE 1520
@@ -56,6 +57,7 @@ call_t *call_create(const char *call_id) {
     snprintf(c->call_id, sizeof(c->call_id), "%s", call_id);
   c->created_at    = time(NULL);
   c->rtp_active_at = c->created_at;
+  c->ext_sdp_is_tcp = -1;  /* Not specified by default */
   /* Link into list. */
   c->next   = call_list;
   call_list = c;
@@ -233,5 +235,23 @@ void call_age_idle(int timeout_sec) {
       call_remove(c);
     }
     c = next;
+  }
+}
+
+void call_set_transport(call_t *call, int side_a, const char *transport) {
+  if (!call || !transport) return;
+  char *dest = side_a ? call->transport_a : call->transport_b;
+  strncpy(dest, transport, sizeof(call->transport_a) - 1);
+  dest[sizeof(call->transport_a) - 1] = '\0';
+}
+
+int call_connect_tcp_rtp(call_t *call, int side_a, const char *remote_ip, int remote_port) {
+  if (!call) return -1;
+  if (side_a) {
+    call->rtp_tcp_conn_a = rtpproxy_connect_tcp(remote_ip, remote_port);
+    return call->rtp_tcp_conn_a;
+  } else {
+    call->rtp_tcp_conn_b = rtpproxy_connect_tcp(remote_ip, remote_port);
+    return call->rtp_tcp_conn_b;
   }
 }

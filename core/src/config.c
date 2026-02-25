@@ -8,7 +8,7 @@
 #include "config.h"
 #include "RespModule/resp.h"
 
-#define STRDUP(s) ((s) ? strdup(s) : NULL)
+#define STRDUP(s) ((s) != NULL ? strdup(s) : NULL)
 #define PREFIX_MATCH(sec, pre) (strncmp(sec, pre, sizeof(pre)-1) == 0 && (sec)[sizeof(pre)-1])
 #define SECTION_TAIL(sec, pre) ((sec) + sizeof(pre) - 1)
 
@@ -301,6 +301,15 @@ static int handler(void *user, const char *section, const char *name, const char
     }
     if (strcmp(key, "filter_incoming") == 0) {
       t->filter_incoming = (atoi(val) != 0) ? 1 : 0;
+      return 1;
+    }
+    if (strcmp(key, "transport") == 0) {
+      if (strcasecmp(val, "tcp") == 0) {
+        strncpy(t->transport, "tcp", sizeof(t->transport) - 1);
+      } else {
+        strncpy(t->transport, "udp", sizeof(t->transport) - 1);
+      }
+      t->transport[sizeof(t->transport) - 1] = '\0';
       return 1;
     }
     log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
@@ -681,6 +690,7 @@ static int section_get_handler(void *user, const char *section, const char *name
       if (!ctx->entries[ctx->n].key || !ctx->entries[ctx->n].val.arr.ptr) return 0;
       ctx->entries[ctx->n].val.arr.ptr[ctx->entries[ctx->n].val.arr.n++] = strdup(vbuf);
       strncpy(ctx->current_repeatable_key, kbuf, sizeof(ctx->current_repeatable_key) - 1);
+      ctx->current_repeatable_key[sizeof(ctx->current_repeatable_key) - 1] = '\0';
       ctx->n++;
     } else {
       for (size_t i = 0; i < ctx->n; i++)

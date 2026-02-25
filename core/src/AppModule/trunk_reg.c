@@ -167,7 +167,7 @@ static size_t build_register(const char *host, const char *port, const char *use
 }
 
 static int start_registration(const char *trunk_name, const char *host, const char *port,
-    const char *user, const char *password, const char *user_agent, trunk_state_t *state) {
+    const char *user, const char *password, const char *user_agent, const char *transport, trunk_state_t *state) {
   const char *p = (port && port[0]) ? port : "5060";
   struct addrinfo hints, *res = NULL, *ai;
   int fd = -1;
@@ -175,13 +175,15 @@ static int start_registration(const char *trunk_name, const char *host, const ch
   size_t req_len;
   int with_auth = (state->auth_nonce && state->auth_realm) ? 1 : 0;
 
+  int is_tcp = (transport && strcasecmp(transport, "tcp") == 0);
+
   resp_object *listen_obj = config_key_get("upbx", "listen");
   const char *listen = (listen_obj && (listen_obj->type == RESPT_BULK || listen_obj->type == RESPT_SIMPLE) && listen_obj->u.s) ? listen_obj->u.s : "0.0.0.0:5060";
   if (listen_obj) resp_free(listen_obj);
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_socktype = is_tcp ? SOCK_STREAM : SOCK_DGRAM;
   if (getaddrinfo(host, p, &hints, &res) != 0 || !res) {
     log_warn("trunk %s: resolve %s:%s failed", trunk_name, host, p);
     return -1;
@@ -407,11 +409,12 @@ PT_THREAD(trunk_reg_pt(struct pt *pt)) {
       const char *user = resp_map_get_string(sec, "username");
       const char *password = resp_map_get_string(sec, "password");
       const char *user_agent = resp_map_get_string(sec, "user_agent");
+      const char *transport = resp_map_get_string(sec, "transport");
       if (!host || !host[0]) {
         resp_free(sec);
         continue;
       }
-      start_registration(ent->name, host, port ? port : "5060", user, password, user_agent, &ent->state);
+      start_registration(ent->name, host, port ? port : "5060", user, password, user_agent, transport, &ent->state);
       resp_free(sec);
     }
 

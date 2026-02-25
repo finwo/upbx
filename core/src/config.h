@@ -35,6 +35,7 @@ typedef struct {
   char *user_agent;       /* Custom User-Agent for trunk registration */
   char *group_prefix;     /* Group prefix for locality-based trunk assignment (e.g. "1234" for locality 3) */
   int filter_incoming;    /* 0 (default) = accept any matching extension; 1 = only accept calls to registered DIDs */
+  char transport[8];      /* "udp" or "tcp", case-insensitive, default "udp" */
 } config_trunk;
 
 typedef struct {

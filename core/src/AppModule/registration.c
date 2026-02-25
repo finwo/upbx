@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/select.h>
 
 #include "rxi/log.h"
 #include "common/pt.h"
@@ -39,7 +40,7 @@ int  registration_is_notify_pending(void)    { return reg_list_notify_pending; }
 
 void registration_update(char *number, char *uri_user, const char *trunk_name,
     char *contact, const char *learned_host, const char *learned_port,
-    char *plugin_data) {
+    char *plugin_data, const char *transport) {
   log_trace("%s: number=%s", __func__, number ? number : "(null)");
 
   registration_set_ready();
@@ -66,6 +67,13 @@ void registration_update(char *number, char *uri_user, const char *trunk_name,
       } else {
         reg_list[i].learned_host[0] = '\0';
       }
+      if (transport && strcasecmp(transport, "tcp") == 0) {
+        memcpy(reg_list[i].transport, "tcp", 3);
+      } else {
+        memcpy(reg_list[i].transport, "udp", 3);
+      }
+      reg_list[i].transport[3] = '\0';
+      reg_list[i].tcp_sock = 0;  /* Reset TCP socket on re-registration */
       /* number was already owned by the old entry; free the duplicate passed in */
       free(number);
       registration_set_notify_pending();
@@ -101,6 +109,13 @@ void registration_update(char *number, char *uri_user, const char *trunk_name,
   }
   reg_list[reg_count].plugin_data = plugin_data;
   reg_list[reg_count].expires = time(NULL) + DEFAULT_EXPIRES;
+  if (transport && strcasecmp(transport, "tcp") == 0) {
+    memcpy(reg_list[reg_count].transport, "tcp", 3);
+  } else {
+    memcpy(reg_list[reg_count].transport, "udp", 3);
+  }
+  reg_list[reg_count].transport[3] = '\0';
+  reg_list[reg_count].tcp_sock = 0;
   reg_count++;
 
   registration_set_notify_pending();
@@ -172,6 +187,29 @@ int registration_get_advertise_addr(char *host_out, size_t host_size, char *port
   else if (port_size > 0)
     memcpy(port_out, "5060", 5 < port_size ? 5 : port_size);
   return 1;
+}
+
+void registration_set_tcp_sock(ext_reg_t *reg, int sock) {
+  if (reg) reg->tcp_sock = sock;
+}
+
+int registration_get_tcp_sock(const ext_reg_t *reg) {
+  if (!reg || strcmp(reg->transport, "tcp") != 0) return -1;
+  return reg->tcp_sock;
+}
+
+int registration_fill_tcp_fds(fd_set *read_set, int *maxfd) {
+  int count = 0;
+  time_t now = time(NULL);
+  for (size_t i = 0; i < reg_count; i++) {
+    if (reg_list[i].expires <= now) continue;
+    if (reg_list[i].tcp_sock > 0) {
+      FD_SET(reg_list[i].tcp_sock, read_set);
+      if (reg_list[i].tcp_sock > *maxfd) *maxfd = reg_list[i].tcp_sock;
+      count++;
+    }
+  }
+  return count;
 }
 
 /* Expiry removal protothread: wait 60s, then remove expired entries, repeat. */

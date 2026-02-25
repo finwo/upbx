@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <time.h>
+#include <sys/types.h>
 #include "common/pt.h"
 
 typedef struct {
@@ -19,6 +20,8 @@ typedef struct {
   char learned_host[256];
   char learned_port[32];
   char *plugin_data;  /* Optional custom data from plugin ALLOW */
+  char transport[4];  /* "udp" or "tcp", default "udp" */
+  int tcp_sock;       /* TCP socket for persistent connection (valid only if transport is "tcp") */
   time_t expires;
 } ext_reg_t;
 
@@ -30,10 +33,11 @@ void registration_clear_notify_pending(void);
 int  registration_is_notify_pending(void);
 
 /* Add or update a registration. Takes ownership of all string arguments (caller must not free).
- * learned_host and learned_port are copied (not transferred). */
+ * learned_host and learned_port are copied (not transferred).
+ * transport is "udp" or "tcp", can be NULL (defaults to "udp"). */
 void registration_update(char *number, char *uri_user, const char *trunk_name,
     char *contact, const char *learned_host, const char *learned_port,
-    char *plugin_data);
+    char *plugin_data, const char *transport);
 
 /* Find one registration by trunk and number. Returns NULL if not found or expired. */
 ext_reg_t *registration_get_by_number(const char *trunk_name, const char *number);
@@ -48,6 +52,22 @@ const char *registration_get_trunk_for_ext(const char *ext_number);
 /* Learned advertise address (from Request-URI of REGISTER). */
 void registration_set_advertise_addr(const char *host, const char *port);
 int  registration_get_advertise_addr(char *host_out, size_t host_size, char *port_out, size_t port_size);
+
+/* Get transport for a registration (returns "udp" or "tcp", default "udp"). */
+static inline const char *registration_get_transport(const ext_reg_t *reg) {
+  if (!reg || !reg->transport[0]) return "udp";
+  return reg->transport;
+}
+
+/* Set TCP socket for a registration (e.g. after receiving REGISTER over TCP). */
+void registration_set_tcp_sock(ext_reg_t *reg, int sock);
+
+/* Get TCP socket for a registration. Returns -1 if not a TCP registration. */
+int registration_get_tcp_sock(const ext_reg_t *reg);
+
+/* Fill TCP sockets from all active registrations into fd_set and update maxfd.
+ * Returns count of TCP sockets added. */
+int registration_fill_tcp_fds(fd_set *read_set, int *maxfd);
 
 /* Protothread: every 60s removes expired entries from the registration list. Run each daemon iteration. */
 PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp));

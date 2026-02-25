@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <errno.h>
 #include <time.h>
 #include <regex.h>
 #include <sys/select.h>
@@ -32,6 +33,7 @@
 #include "AppModule/util/sdp_parse.h"
 #include "AppModule/call.h"
 #include "AppModule/registration.h"
+#include "AppModule/rtpproxy.h"
 #include "AppModule/service/api.h"
 #include "AppModule/service/metrics.h"
 
@@ -298,11 +300,12 @@ static void apply_trunk_rewrites(config_trunk *trunk, const char *input, char *o
   log_trace("apply_trunk_rewrites: trunk=%s input=%s", trunk ? trunk->name : "(null)", input ? input : "");
   char work[256];
   if (!trunk || !trunk->rewrite_regex || trunk->rewrite_count == 0 || !output || out_size == 0) {
-    if (output && out_size) { strncpy(output, input ? input : "", out_size - 1); output[out_size - 1] = '\0'; }
+    if (output && out_size) {
+      snprintf(output, out_size, "%s", input ? input : "");
+    }
     return;
   }
-  strncpy(work, input ? input : "", sizeof(work) - 1);
-  work[sizeof(work) - 1] = '\0';
+  snprintf(work, sizeof(work), "%s", input ? input : "");
   regex_t *re = (regex_t *)trunk->rewrite_regex;
   for (size_t i = 0; i < trunk->rewrite_count; i++) {
     regmatch_t *pmatch = regex_rmatch(work, (int)sizeof(work), &re[i]);
@@ -616,6 +619,7 @@ typedef struct {
   int sockfd;
   struct sockaddr_storage peer;
   socklen_t peerlen;
+  int is_tcp;  /* 0 = UDP, 1 = TCP */
 } sip_send_ctx;
 
 static const char *reason_phrase(int code);
@@ -827,7 +831,16 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   else
     log_info("REGISTER: extension %s registered (no trunk)", extension_num);
   char *contact_val = get_contact_value(req_buf, req_len);
-  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL);
+  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL, ctx->is_tcp ? "tcp" : "udp");
+  /* Store TCP socket on registration if this is a TCP connection.
+   * Use NULL trunk_name to find any registration with this number (handles transport switch). */
+  if (ctx->is_tcp && ctx->sockfd > 0) {
+    ext_reg_t *reg = registration_get_by_number(NULL, extension_num);
+    if (reg) {
+      reg->tcp_sock = ctx->sockfd;
+      log_trace("REGISTER: stored TCP socket %d for extension %s", ctx->sockfd, extension_num);
+    }
+  }
   raw_uri_user = NULL;
   resp_free(ext_section);
   send_reply(ctx, req_buf, req_len, 200, 1, 0);
@@ -1079,6 +1092,17 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
+  /* Determine transport to use when sending INVITE to this extension:
+   * ALWAYS use extension's registered transport - never use any transport from the original call.
+   * Default to UDP if extension registered with UDP or unknown. */
+  int use_tcp = 0;
+  if (ext->transport[0] && strcasecmp(ext->transport, "tcp") == 0) {
+    /* Extension registered with TCP */
+    use_tcp = 1;
+  }
+  if (use_tcp) {
+    hints.ai_socktype = SOCK_STREAM;
+  }
   if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
     log_warn("INVITE fork: skip %s, getaddrinfo failed for %s:%s", ext->number ? ext->number : "?", host, port);
     return -1;
@@ -1165,7 +1189,7 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
     if (call->rtp_port_b > 0 &&
         sip_request_get_body(tmp3, (size_t)cur_len, &cur_body, &cur_body_len) && cur_body_len > 0) {
       char new_sdp[4096];
-      int sdp_len = sdp_rewrite_addr(cur_body, cur_body_len, via_host, call->rtp_port_b, new_sdp, sizeof(new_sdp));
+      int sdp_len = sdp_rewrite_addr_with_transport(cur_body, cur_body_len, via_host, call->rtp_port_b, use_tcp, new_sdp, sizeof(new_sdp));
       if (sdp_len > 0) {
         int new_len = sip_rewrite_body(tmp3, (size_t)cur_len, new_sdp, (size_t)sdp_len, tmp1, sizeof(tmp1));
         if (new_len >= 0) { memcpy(tmp3, tmp1, (size_t)new_len); cur_len = new_len; }
@@ -1175,6 +1199,20 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
 
   log_debug("INVITE fork: sending to %s at %s:%s call=%.32s", ext->number ? ext->number : "?", host, port, call->call_id);
   log_hexdump_trace(tmp3, (size_t)cur_len);
+
+  /* Set transport for extension side (side B) */
+  call_set_transport(call, 0, use_tcp ? "tcp" : "udp");
+
+  /* If TCP, allocate TCP RTP port for the extension side */
+  if (use_tcp) {
+    struct in_addr bind_any;
+    bind_any.s_addr = INADDR_ANY;
+    if (rtpproxy_alloc_tcp_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
+                                &call->rtp_sock_b_tcp, &call->rtp_port_b) != 0) {
+      log_warn("RTP: failed to allocate TCP port for extension side");
+    }
+  }
+
   udp_send_to(sockfd, res->ai_addr, res->ai_addrlen, tmp3, (size_t)cur_len);
 
   /* Record fork. */
@@ -1218,6 +1256,13 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
   call->a.sip_len = ctx->peerlen;
   call->a.id = source_str ? strdup(source_str) : NULL;
 
+  /* Set transport for caller side (side A) - from trunk config */
+  if (trunk) {
+    call_set_transport(call, 1, trunk->transport[0] ? trunk->transport : "udp");
+  } else {
+    call_set_transport(call, 1, ctx->is_tcp ? "tcp" : "udp");
+  }
+
   /* Store original INVITE for fork sending and ACK/BYE forwarding. */
   call->original_invite = malloc(req_len + 1);
   if (call->original_invite) {
@@ -1251,6 +1296,12 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
     inet_aton(sdp_media[0].ip, &call->rtp_remote_a.sin_addr);
     call->rtp_remote_a.sin_family = AF_INET;
     call->rtp_remote_a.sin_port   = htons((uint16_t)sdp_media[0].port);
+    /* Track caller's SDP transport: trunk for dialin, extension for dialout/ext-to-ext */
+    if (call->trunk_name && call->trunk_name[0]) {
+      call->trunk_sdp_is_tcp = sdp_media[0].is_tcp;  /* trunk's SDP */
+    } else {
+      call->ext_sdp_is_tcp = sdp_media[0].is_tcp;    /* extension's SDP */
+    }
   }
 
   /* Allocate RTP port pair: one facing caller (A), one facing callee (B). */
@@ -1412,7 +1463,9 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
+  /* Use trunk's configured transport */
+  int trunk_tcp = (trunk->transport[0] && strcasecmp(trunk->transport, "tcp") == 0);
+  hints.ai_socktype = trunk_tcp ? SOCK_STREAM : SOCK_DGRAM;
   if (getaddrinfo(trunk->host, port, &hints, &res) != 0 || !res) {
     free(rewritten_buf);
     send_reply(ctx, buf, len, 503, 0, 0);
@@ -1446,6 +1499,12 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
       call->caller_via = via_buf[0] ? strdup(via_buf) : NULL; }
     call->overflow_done = 1; /* no overflow for outgoing */
 
+    /* Set transport for caller side (side A) - from their registration */
+    {
+      const char *caller_transport = registration_get_transport(reg);
+      call_set_transport(call, 1, caller_transport);
+    }
+
     /* Allocate RTP relay ports. */
     struct in_addr bind_any;
     bind_any.s_addr = INADDR_ANY;
@@ -1453,6 +1512,9 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
                         &call->rtp_sock_a, &call->rtp_port_a);
     call_rtp_alloc_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
                         &call->rtp_sock_b, &call->rtp_port_b);
+
+    /* Set transport for trunk side (side B) */
+    call_set_transport(call, 0, trunk_tcp ? "tcp" : "udp");
 
     /* Parse caller SDP for party A RTP address. */
     const char *body;
@@ -1504,7 +1566,7 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
         size_t sbl;
         if (sip_request_get_body(t1, (size_t)cur_len, &sb, &sbl) && sbl > 0) {
           char new_sdp[4096];
-          int sdp_len = sdp_rewrite_addr(sb, sbl, via_host, call->rtp_port_b, new_sdp, sizeof(new_sdp));
+          int sdp_len = sdp_rewrite_addr_with_transport(sb, sbl, via_host, call->rtp_port_b, trunk_tcp, new_sdp, sizeof(new_sdp));
           if (sdp_len > 0) {
             int new_len = sip_rewrite_body(t1, (size_t)cur_len, new_sdp, (size_t)sdp_len, t2, sizeof(t2));
             if (new_len > 0) { memcpy(t1, t2, (size_t)new_len); cur_len = new_len; }
@@ -1596,7 +1658,7 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
 
     /* 1-pre2. Short-dialing expansion: when locality > 0 and dialed number has exactly 'locality' digits,
      * prepend caller's group prefix to form a full number. */
-    char expanded_to_ext[128];
+    char expanded_to_ext[256];
     expanded_to_ext[0] = '\0';
     if (cfg->locality > 0 && to_ext[0] && (int)strlen(to_ext) == cfg->locality) {
       config_trunk *caller_trunk = resolve_trunk_for_extension(cfg, from_ext);
@@ -1991,12 +2053,13 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
                  sdp_media[0].ip, sdp_media[0].port);
       }
 
-      /* Rewrite SDP: advertise our caller-facing port (rtp_port_a). */
+      /* Rewrite SDP: advertise our caller-facing port (rtp_port_a) with caller's transport. */
       char via_host[256], via_port[32];
       if (call->rtp_port_a > 0 &&
           get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
         char new_sdp[4096];
-        int sdp_len = sdp_rewrite_addr(resp_body, resp_body_len, via_host, call->rtp_port_a, new_sdp, sizeof(new_sdp));
+        int use_tcp = (call->transport_a[0] && strcmp(call->transport_a, "tcp") == 0);
+        int sdp_len = sdp_rewrite_addr_with_transport(resp_body, resp_body_len, via_host, call->rtp_port_a, use_tcp, new_sdp, sizeof(new_sdp));
         if (sdp_len > 0) {
           int new_len = sip_rewrite_body(tmp1, (size_t)cur_len, new_sdp, (size_t)sdp_len, tmp2, sizeof(tmp2));
           if (new_len > 0) {
@@ -2139,6 +2202,7 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
   ctx.sockfd = sockfd;
   memcpy(&ctx.peer, &msg->peer, sizeof(ctx.peer));
   ctx.peerlen = msg->peerlen;
+  ctx.is_tcp = 0;
 
   if (!looks_like_sip(buf, len)) {
     free(msg);
@@ -2380,6 +2444,45 @@ static int udp_bind(const char *listen_addr) {
   return fd;
 }
 
+/* Create and bind TCP listening socket; return fd or -1. */
+static int tcp_bind(const char *listen_addr) {
+  char host[256], port[32];
+  struct addrinfo hints, *res = NULL, *ai;
+  int fd = -1;
+  int ret;
+
+  if (parse_listen_addr(listen_addr, host, sizeof(host), port, sizeof(port)) != 0)
+    return -1;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+  ret = getaddrinfo(host[0] ? host : NULL, port, &hints, &res);
+  if (ret != 0 || !res) {
+    return -1;
+  }
+  for (ai = res; ai; ai = ai->ai_next) {
+    fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0) continue;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+      if (listen(fd, 5) == 0) {
+        break;
+      }
+    }
+    close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) return -1;
+  if (set_socket_nonblocking(fd, 1) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 /* Main loop: select on SIP + RTP + trunk fds, dispatch, run protothreads. */
 void daemon_root(int argc, void *argv[]) {
   upbx_config *cfg = (upbx_config *)argv[0];
@@ -2393,6 +2496,14 @@ void daemon_root(int argc, void *argv[]) {
     return;
   }
   log_info("SIP listening on UDP %s", listen_addr);
+
+  /* Also listen on TCP for SIP (same address as UDP) */
+  int tcp_sockfd = tcp_bind(listen_addr);
+  if (tcp_sockfd < 0) {
+    log_warn("daemon_root: TCP bind %s failed, TCP disabled", listen_addr);
+  } else {
+    log_info("SIP listening on TCP %s", listen_addr);
+  }
 
   /* Register callback so all call removals (including timeout aging) fire call.hangup. */
   call_set_pre_remove_callback(call_pre_remove_handler);
@@ -2430,9 +2541,14 @@ void daemon_root(int argc, void *argv[]) {
     FD_ZERO(&r);
     FD_SET(sockfd, &r);
     int maxfd = sockfd;
+    if (tcp_sockfd >= 0) {
+      FD_SET(tcp_sockfd, &r);
+      if (tcp_sockfd > maxfd) maxfd = tcp_sockfd;
+    }
     call_fill_rtp_fds(&r, &maxfd);
     trunk_reg_fill_fds(&r, &maxfd);
     api_fill_fds(&r, &maxfd);
+    registration_fill_tcp_fds(&r, &maxfd);
 
     struct timeval tv = { 0, 50000 }; /* 50ms */
     int n = select(maxfd + 1, &r, NULL, NULL, &tv);
@@ -2465,6 +2581,171 @@ void daemon_root(int argc, void *argv[]) {
             notify_extension_and_trunk_lists(cfg);
           }
         }
+      }
+      /* Handle incoming TCP connections */
+      if (tcp_sockfd >= 0 && FD_ISSET(tcp_sockfd, &r)) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(tcp_sockfd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd >= 0) {
+          ssize_t nr = recv(client_fd, buf, sizeof(buf) - 1, 0);
+          if (nr > 0) {
+            buf[nr] = '\0';
+            char peer_str[64];
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+            snprintf(peer_str, sizeof(peer_str), "%s:%u", ip, (unsigned)ntohs(client_addr.sin_port));
+            log_trace("SIP TCP from %s (%zd bytes)", peer_str, (size_t)nr);
+            /* Create a context for TCP */
+            sip_send_ctx ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.sockfd = client_fd;
+            memset(&ctx.peer, 0, sizeof(ctx.peer));
+            memcpy(&ctx.peer, &client_addr, sizeof(client_addr));
+            ctx.peerlen = client_len;
+            ctx.is_tcp = 1;
+            /* Handle as SIP message */
+            if (looks_like_sip(buf, (size_t)nr)) {
+              /* Process the TCP message similarly to handle_udp_msg but with is_tcp=1 */
+              if (sip_is_request(buf, (size_t)nr)) {
+                const char *method = NULL;
+                size_t method_len = 0;
+                if (sip_request_method(buf, (size_t)nr, &method, &method_len)) {
+                  if (method_len == 8 && strncasecmp(method, "REGISTER", 8) == 0) {
+                    handle_register(buf, (size_t)nr, cfg, &ctx);
+                  } else if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
+                    handle_invite(cfg, buf, (size_t)nr, &ctx);
+                  } else if (method_len == 3 && strncasecmp(method, "ACK", 3) == 0) {
+                    /* ACK: for 2xx → forward to callee; for non-2xx → absorb (we already sent our own ACK). */
+                    char cid[CALL_ID_MAX];
+                    cid[0] = '\0';
+                    sip_header_copy(buf, (size_t)nr, "Call-ID", cid, sizeof(cid));
+                    call_t *c = call_find(cid);
+                    if (c && c->answered && c->b.sip_len > 0) {
+                      char via_host[256], via_port[32];
+                      if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
+                        char t1[SIP_READ_BUF_SIZE], t2[SIP_READ_BUF_SIZE];
+                        memcpy(t1, buf, (size_t)nr);
+                        int clen = (int)nr;
+                        char req_uri[256];
+                        if (fork_uri_from_addr(&c->b.sip_addr, c->b.id, req_uri, sizeof(req_uri)) == 0) {
+                          int rw = sip_rewrite_request_uri(t1, (size_t)clen, req_uri, t2, sizeof(t2));
+                          if (rw > 0) { memcpy(t1, t2, (size_t)rw); clen = rw; }
+                        }
+                        char via_val[256];
+                        sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
+                        int plen = sip_prepend_via(t1, (size_t)clen, via_val, t2, sizeof(t2));
+                        if (plen > 0) {
+                          log_debug("SIP TCP: forwarding ACK to callee for call %.32s", cid);
+                          send(client_fd, t2, (size_t)plen, 0);
+                        }
+                      }
+                    }
+                  } else if (method_len == 3 && strncasecmp(method, "BYE", 3) == 0) {
+                    /* BYE: forward to other party, respond 200 OK, clean up call. */
+                    char cid[CALL_ID_MAX];
+                    cid[0] = '\0';
+                    sip_header_copy(buf, (size_t)nr, "Call-ID", cid, sizeof(cid));
+                    call_t *c = call_find(cid);
+                    if (c) {
+                      int from_a = sockaddr_match(&ctx.peer, ctx.peerlen,
+                                                  (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+                      struct sockaddr_storage *fwd_addr;
+                      socklen_t fwd_len;
+                      if (from_a && c->b.sip_len > 0) {
+                        fwd_addr = &c->b.sip_addr;
+                        fwd_len  = c->b.sip_len;
+                      } else if (c->a.sip_len > 0) {
+                        fwd_addr = &c->a.sip_addr;
+                        fwd_len  = c->a.sip_len;
+                      } else {
+                        fwd_addr = NULL;
+                        fwd_len  = 0;
+                      }
+                      if (fwd_addr && fwd_len > 0) {
+                        char via_host[256], via_port[32];
+                        if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
+                          char via_val[256];
+                          sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
+                          char t1[SIP_READ_BUF_SIZE];
+                          int clen = sip_prepend_via(buf, (size_t)nr, via_val, t1, sizeof(t1));
+                          if (clen > 0) {
+                            log_debug("SIP TCP: forwarding BYE for call %.32s", cid);
+                            /* Forward via original transport if possible */
+                          }
+                        }
+                      }
+                      send_reply(&ctx, buf, (size_t)nr, 200, 0, 0);
+                      call_remove(c);
+                    } else {
+                      send_reply(&ctx, buf, (size_t)nr, 481, 0, 0);
+                    }
+                  } else if (method_len == 6 && strncasecmp(method, "CANCEL", 6) == 0) {
+                    /* CANCEL: reply 200, clean up. */
+                    char cid[CALL_ID_MAX];
+                    cid[0] = '\0';
+                    sip_header_copy(buf, (size_t)nr, "Call-ID", cid, sizeof(cid));
+                    call_t *c = call_find(cid);
+                    send_reply(&ctx, buf, (size_t)nr, 200, 0, 0);
+                    if (c && !c->answered) {
+                      clear_pending_exts(c);
+                      c->cancelling = 1;
+                    }
+                  }
+                }
+              } else {
+                handle_sip_response(cfg, buf, (size_t)nr, &ctx);
+              }
+            }
+            if (registration_is_notify_pending()) {
+              registration_clear_notify_pending();
+              notify_extension_and_trunk_lists(cfg);
+            }
+          }
+          close(client_fd);
+        }
+      }
+      /* Handle TCP data from registered extensions with persistent connections */
+      {
+        ext_reg_t **tcp_regs = NULL;
+        size_t n_tcp_regs = registration_get_regs(NULL, NULL, &tcp_regs);
+        for (size_t i = 0; i < n_tcp_regs; i++) {
+          ext_reg_t *reg = tcp_regs[i];
+          if (reg->tcp_sock > 0 && FD_ISSET(reg->tcp_sock, &r)) {
+            ssize_t nr = recv(reg->tcp_sock, buf, sizeof(buf) - 1, 0);
+            if (nr > 0) {
+              buf[nr] = '\0';
+              log_trace("SIP TCP from registered ext %s (%zd bytes)", reg->number, (size_t)nr);
+              sip_send_ctx ctx;
+              memset(&ctx, 0, sizeof(ctx));
+              ctx.sockfd = reg->tcp_sock;
+              ctx.is_tcp = 1;
+              if (looks_like_sip(buf, (size_t)nr) && sip_is_request(buf, (size_t)nr)) {
+                const char *method = NULL;
+                size_t method_len = 0;
+                if (sip_request_method(buf, (size_t)nr, &method, &method_len)) {
+                  if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
+                    handle_invite(cfg, buf, (size_t)nr, &ctx);
+                  } else if (method_len == 3 && strncasecmp(method, "BYE", 3) == 0) {
+                    char cid[CALL_ID_MAX];
+                    cid[0] = '\0';
+                    sip_header_copy(buf, (size_t)nr, "Call-ID", cid, sizeof(cid));
+                    call_t *c = call_find(cid);
+                    if (c) {
+                      send_reply(&ctx, buf, (size_t)nr, 200, 0, 0);
+                      call_remove(c);
+                    }
+                  }
+                }
+              }
+            } else if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+              log_trace("TCP connection closed for ext %s", reg->number);
+              close(reg->tcp_sock);
+              reg->tcp_sock = 0;
+            }
+          }
+        }
+        if (tcp_regs) free(tcp_regs);
       }
       call_relay_rtp(&r);
       trunk_reg_poll(&r);

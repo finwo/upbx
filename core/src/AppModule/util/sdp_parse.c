@@ -63,6 +63,14 @@ int sdp_parse_media(const char *body, size_t body_len,
       while (q < le && *q == ' ') q++;    /* skip space */
       if (q < le) m->port = atoi(q);
 
+      /* Detect transport: check for RTP/AVP/TCP (TCP) vs RTP/AVP (UDP) */
+      const char *proto_start = q;
+      while (q < le && *q != ' ' && *q != '\r' && *q != '\n') q++;
+      size_t proto_len = (size_t)(q - proto_start);
+      if (proto_len >= 11 && strncmp(proto_start + proto_len - 3, "TCP", 3) == 0) {
+        m->is_tcp = 1;
+      }
+
       (*n_out)++;
 
       /* Scan following lines for media-level c= (overrides session-level). */
@@ -138,6 +146,98 @@ int sdp_rewrite_addr(const char *body, size_t body_len,
         /* Malformed m= line (no space); copy verbatim. */
         APPEND(ls, ll);
       }
+    }
+    /* All other lines: copy verbatim. */
+    else {
+      APPEND(ls, ll);
+    }
+
+    /* Copy the line ending (preserve \r\n or \n). */
+    p = le;
+    if (p < end && *p == '\r') { APPEND(p, 1); p++; }
+    if (p < end && *p == '\n') { APPEND(p, 1); p++; }
+  }
+  #undef APPEND
+  return (int)used;
+}
+
+/* Rewrite SDP with transport (TCP/UDP) */
+
+int sdp_rewrite_addr_with_transport(const char *body, size_t body_len,
+                                    const char *new_ip, int new_port, int use_tcp,
+                                    char *out, size_t out_cap) {
+  const char *p = body, *end = body + body_len;
+  size_t used = 0;
+  int port_rewritten = 0;
+  int setup_added = 0;
+
+  #define APPEND(src, n) do { \
+    if (used + (n) > out_cap) return -1; \
+    memcpy(out + used, (src), (n)); \
+    used += (n); \
+  } while (0)
+
+  while (p < end) {
+    const char *ls = p;
+    const char *le = line_end(p, end);
+    size_t ll = (size_t)(le - ls);
+
+    /* Rewrite c=IN IP4 <addr> lines. */
+    if (ll >= 12 && ls[0] == 'c' && ls[1] == '=' &&
+        strncmp(ls, "c=IN IP4 ", 9) == 0) {
+      int n = snprintf(out + used, out_cap - used, "c=IN IP4 %s", new_ip);
+      if (n < 0 || used + (size_t)n >= out_cap) return -1;
+      used += (size_t)n;
+    }
+    /* Rewrite port and transport on the first m= line */
+    else if (!port_rewritten && ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
+      const char *q = ls + 2;
+      while (q < le && *q != ' ') q++;  /* skip media type */
+      if (q < le) {
+        q++;  /* skip space after type */
+        /* Copy "m=<type> " prefix verbatim. */
+        size_t prefix = (size_t)(q - ls);
+        APPEND(ls, prefix);
+        /* Skip old port digits. */
+        while (q < le && *q >= '0' && *q <= '9') q++;
+        /* Write new port. */
+        int n = snprintf(out + used, out_cap - used, "%d", new_port);
+        if (n < 0 || used + (size_t)n >= out_cap) return -1;
+        used += (size_t)n;
+        /* Append rest of m= line */
+        size_t rest = (size_t)(le - q);
+        /* If TCP requested, change "RTP/AVP" to "RTP/AVP/TCP" */
+        if (use_tcp && rest >= 7 && strncmp(q, "RTP/AVP", 7) == 0) {
+          APPEND(" RTP/AVP/TCP", 11);
+          rest = (size_t)(le - q - 7);
+          q += 7;
+        }
+        APPEND(q, rest);
+        port_rewritten = 1;
+      } else {
+        APPEND(ls, ll);
+      }
+    }
+    /* Add a=setup:active after m= line when using TCP */
+    else if (use_tcp && !setup_added && ll >= 2 && ls[0] == 'm' && ls[1] != '=') {
+      /* Copy current line first */
+      APPEND(ls, ll);
+      p = le;
+      if (p < end && *p == '\r') { APPEND(p, 1); p++; }
+      if (p < end && *p == '\n') { APPEND(p, 1); p++; }
+      /* Check if next line starts with 'a=' */
+      const char *next = p;
+      while (next < end && (*next == ' ' || *next == '\t' || *next == '\r' || *next == '\n')) {
+        if (*next == '\r' || *next == '\n') break;
+        next++;
+      }
+      if (next < end && *next != 'a') {
+        /* Add a=setup:active */
+        APPEND("a=setup:active\r\n", 16);
+        setup_added = 1;
+        continue;
+      }
+      continue;
     }
     /* All other lines: copy verbatim. */
     else {

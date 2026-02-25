@@ -12,10 +12,11 @@
 
 #define SDP_MAX_MEDIA 8
 
-/* Parsed media entry: IP address and port extracted from one m= section. */
+/* Parsed media entry: IP address, port, and transport extracted from one m= section. */
 typedef struct {
   char   ip[64];   /* from c= line (session-level or media-level) */
   int    port;     /* from m= line */
+  int    is_tcp;   /* 1 if RTP/AVP/TCP, 0 if RTP/AVP */
 } sdp_media_t;
 
 /* Parse SDP body; extract IP and port for each media stream.
@@ -31,5 +32,11 @@ int sdp_parse_media(const char *body, size_t body_len,
 int sdp_rewrite_addr(const char *body, size_t body_len,
                      const char *new_ip, int new_port,
                      char *out, size_t out_cap);
+
+/* Rewrite SDP body with transport (TCP/UDP). Adds RTP/AVP/TCP and a=setup:active for TCP.
+ * use_tcp: 1 = use TCP, 0 = use UDP */
+int sdp_rewrite_addr_with_transport(const char *body, size_t body_len,
+                                    const char *new_ip, int new_port, int use_tcp,
+                                    char *out, size_t out_cap);
 
 #endif

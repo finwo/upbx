@@ -55,6 +55,13 @@ typedef struct call {
   int                rtp_port_b;      /* local even port for party B      */
   struct sockaddr_in rtp_remote_b;    /* where party B expects RTP        */
 
+  int                rtp_sock_a_tcp;  /* TCP socket for party A (if TCP used) */
+  int                rtp_sock_b_tcp;  /* TCP socket for party B (if TCP used) */
+  int                rtp_tcp_conn_a;  /* Outbound TCP connection to party A */
+  int                rtp_tcp_conn_b;  /* Outbound TCP connection to party B */
+  char               transport_a[4];   /* "udp" or "tcp" for party A */
+  char               transport_b[4];   /* "udp" or "tcp" for party B */
+
   /* SIP state */
   int           sockfd;               /* UDP socket used for SIP sending  */
   int           answered;
@@ -72,6 +79,8 @@ typedef struct call {
 
   /* Routing / plugin metadata */
   char         *trunk_name;           /* trunk name (NULL for ext-to-ext) */
+  int           trunk_sdp_is_tcp;     /* transport from trunk's SDP (1=TCP, 0=UDP) */
+  int           ext_sdp_is_tcp;       /* transport from extension's SDP (1=TCP, 0=UDP, -1=not specified) */
   char         *source_str;           /* caller id (for plugins)          */
   char         *dest_str;             /* callee id (for plugins)          */
   char         *direction;            /* "dialin" or "dialout" (for CALL.ANSWER/HANGUP events) */
@@ -115,5 +124,11 @@ void call_relay_rtp(fd_set *read_set);
 
 /* Remove calls with no RTP activity for more than timeout_sec. */
 void call_age_idle(int timeout_sec);
+
+/* Set transport for a party (call_t, side 'a' or 'b') */
+void call_set_transport(call_t *call, int side_a, const char *transport);
+
+/* Connect outbound TCP RTP to remote (for trunks using TCP) */
+int call_connect_tcp_rtp(call_t *call, int side_a, const char *remote_ip, int remote_port);
 
 #endif
