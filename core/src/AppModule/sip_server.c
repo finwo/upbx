@@ -628,7 +628,11 @@ static const char *reason_phrase(int code);
 
 static void send_response_buf(sip_send_ctx *ctx, const char *buf, size_t len) {
   if (!ctx || !buf) return;
-  sendto(ctx->sockfd, buf, len, 0, (struct sockaddr *)&ctx->peer, ctx->peerlen);
+  if (ctx->is_tcp) {
+    send(ctx->sockfd, buf, len, 0);
+  } else {
+    sendto(ctx->sockfd, buf, len, 0, (struct sockaddr *)&ctx->peer, ctx->peerlen);
+  }
 }
 
 /* Build SIP response from request: parse headers from req, build from parts. Caller frees returned buffer. */
@@ -839,6 +843,9 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
   if (ctx->is_tcp && ctx->sockfd > 0) {
     ext_reg_t *reg = registration_get_by_number(NULL, extension_num);
     if (reg) {
+      if (reg->tcp_sock > 0 && reg->tcp_sock != ctx->sockfd) {
+        close(reg->tcp_sock);
+      }
       reg->tcp_sock = ctx->sockfd;
       log_trace("REGISTER: stored TCP socket %d for extension %s", ctx->sockfd, extension_num);
     }
@@ -2694,7 +2701,22 @@ PT_THREAD(daemon_root_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)
               notify_extension_and_trunk_lists(global_cfg);
             }
           }
-          close(client_fd);
+          /* Only close the socket if it wasn't stored in a registration for persistent TCP */
+          int socket_stored = 0;
+          {
+            ext_reg_t **all_regs = NULL;
+            size_t n_regs = registration_get_regs(NULL, NULL, &all_regs);
+            for (size_t i = 0; i < n_regs; i++) {
+              if (all_regs[i]->tcp_sock == client_fd) {
+                socket_stored = 1;
+                break;
+              }
+            }
+            if (all_regs) free(all_regs);
+          }
+          if (!socket_stored) {
+            close(client_fd);
+          }
         }
       }
       /* Handle TCP data from registered extensions with persistent connections */
