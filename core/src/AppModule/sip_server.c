@@ -2591,7 +2591,10 @@ PT_THREAD(sip_tcp_listener_pt(struct pt *pt, int64_t timestamp, struct pt_task *
           inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
           snprintf(peer_str, sizeof(peer_str), "%s:%u", ip, (unsigned)ntohs(client_addr.sin_port));
           spawn_tcp_client(client_fd, peer_str);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          log_warn("TCP listener: accept failed: %s", strerror(errno));
         }
+        PT_YIELD(pt);
       }
     } else {
       PT_YIELD(pt);
