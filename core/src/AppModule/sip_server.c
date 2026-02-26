@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#include <stdint.h>
 
 #include "common/pt.h"
 #include "common/socket_util.h"
@@ -25,6 +26,7 @@
 #include "common/digest_auth.h"
 #include "rxi/log.h"
 #include "config.h"
+#include "AppModule/command/daemon.h"
 #include "AppModule/plugin.h"
 #include "PluginModule/plugin.h"
 #include "AppModule/sip_server.h"
@@ -1005,7 +1007,6 @@ static int extension_has_active_call(const char *ext_number, const call_t *exclu
 /* Protothread: pending extension handler + overflow timer.
  * The pending handler runs every iteration (sub-millisecond latency).
  * The overflow timer runs every ~1s. */
-static struct pt pt_overflow;
 static time_t overflow_last_run;
 
 static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
@@ -1061,6 +1062,14 @@ static PT_THREAD(overflow_pt(struct pt *pt, upbx_config *cfg, int sockfd)) {
     PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+static int daemon_sockfd = -1;
+static int daemon_tcp_sockfd = -1;
+
+static char overflow_wrapper(struct pt *pt, int64_t timestamp, struct pt_task *task) {
+  (void)task;
+  return overflow_pt(pt, global_cfg, daemon_sockfd);
 }
 
 /* Send a forked INVITE to a single extension registration.
@@ -2029,6 +2038,8 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
   }
   if (!callee_num && call->dest_str) callee_num = call->dest_str;
 
+  int should_forward = 1;
+
   /* Chain rewrites: strip our Via, rewrite SDP if present. */
   char tmp1[SIP_READ_BUF_SIZE], tmp2[SIP_READ_BUF_SIZE];
   int cur_len;
@@ -2074,8 +2085,8 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
   /* 3. Rewrite Contact in responses to point to PBX (keeps ACK/BYE in the signaling path). */
   {
     char via_host[256], via_port[32];
+    char contact_val[256];
     if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
-      char contact_val[256];
       const char *user_part = callee_num ? callee_num : (call->dest_str ? call->dest_str : "");
       sip_format_contact_uri_value(user_part, via_host, via_port, contact_val, sizeof(contact_val));
       int rw_len = sip_rewrite_header(tmp1, (size_t)cur_len, "Contact", contact_val, tmp2, sizeof(tmp2));
@@ -2083,64 +2094,49 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
     }
   }
 
-  /* Decide whether to forward this response to the caller */
-  int should_forward = 1;
-
-  /* ACK non-2xx final responses back to callee (RFC 3261 §17.1.1.3). */
-  if (code >= 300) {
+  /* Handle non-2xx responses: update fork state and decide forward behavior */
+  if (code >= 300 && fork_idx != (size_t)-1) {
+    /* Send ACK to callee for non-2xx responses (RFC 3261) */
     char ack_cseq[64];
     int ack_cseq_num = get_cseq_number(buf, len);
     snprintf(ack_cseq, sizeof(ack_cseq), "%d ACK", ack_cseq_num);
-    char ack_req_uri[256];
-    ack_req_uri[0] = '\0';
-    if (fork_idx != (size_t)-1)
-      fork_uri_from_addr(&call->fork_addrs[fork_idx], call->fork_ids[fork_idx], ack_req_uri, sizeof(ack_req_uri));
+    char ack_req_uri[256] = {0};
+    fork_uri_from_addr(&call->fork_addrs[fork_idx], call->fork_ids[fork_idx], ack_req_uri, sizeof(ack_req_uri));
     if (ack_req_uri[0]) {
-      char ack_via[512], ack_from[384], ack_to[384], ack_callid[256];
-      ack_via[0] = ack_from[0] = ack_to[0] = ack_callid[0] = '\0';
+      char ack_via[512] = {0}, ack_from[384] = {0}, ack_to[384] = {0}, ack_callid[256] = {0};
       sip_header_copy(buf, len, "Via", ack_via, sizeof(ack_via));
       sip_header_copy(buf, len, "From", ack_from, sizeof(ack_from));
       sip_header_copy(buf, len, "To", ack_to, sizeof(ack_to));
       sip_header_copy(buf, len, "Call-ID", ack_callid, sizeof(ack_callid));
-      char *ack = sip_build_request_parts("ACK", ack_req_uri,
-        ack_via, ack_from[0] ? ack_from : NULL, ack_to[0] ? ack_to : NULL,
-        ack_callid[0] ? ack_callid : NULL, ack_cseq, NULL,
-        0, NULL, 0, NULL);
+      char *ack = sip_build_request_parts("ACK", ack_req_uri, ack_via, ack_from, ack_to, ack_callid, ack_cseq, NULL, 0, NULL, 0, NULL);
       if (ack) {
-        log_trace("SIP: ACK to callee at %s for %d", peer_str, code);
+        log_trace("SIP: ACK to callee for %d", code);
         udp_send_to(ctx->sockfd, (struct sockaddr *)&ctx->peer, ctx->peerlen, ack, strlen(ack));
         free(ack);
       }
     }
 
-    /* Update per-fork state and decide whether to forward to caller. */
-    if (fork_idx != (size_t)-1) {
-      if (code == 486 && !call->cancelling) {
-        /* 486 Busy: add extension to pending for retry when free. */
-        call->fork_state[fork_idx] = FORK_BUSY;
-        if (call->fork_ids[fork_idx] && call->n_pending_exts < CALL_MAX_FORKS) {
-          call->pending_exts[call->n_pending_exts++] = strdup(call->fork_ids[fork_idx]);
-        }
-        log_debug("SIP response: fork %zu (%s) busy, added to pending for call %.32s", fork_idx,
-                 call->fork_ids[fork_idx] ? call->fork_ids[fork_idx] : "?", call_id_buf);
-        should_forward = 0; /* don't forward 486 to caller, others may still ring */
-      } else {
-        call->fork_state[fork_idx] = FORK_DONE;
+    /* Update fork state and decide forward behavior */
+    if (code == 486 && !call->cancelling) {
+      call->fork_state[fork_idx] = FORK_BUSY;
+      if (call->fork_ids[fork_idx] && call->n_pending_exts < CALL_MAX_FORKS) {
+        call->pending_exts[call->n_pending_exts++] = strdup(call->fork_ids[fork_idx]);
       }
+      log_debug("SIP response: fork %zu busy, added to pending", fork_idx);
+      should_forward = 0;
+    } else {
+      call->fork_state[fork_idx] = FORK_DONE;
     }
 
-    /* Check if all forks are done (no active forks remaining). */
+    /* Check if all forks done */
     int all_done = 1;
     for (size_t f = 0; f < call->n_forks; f++) {
       if (call->fork_state[f] == FORK_ACTIVE) { all_done = 0; break; }
     }
     if (all_done && call->n_pending_exts == 0) {
-      /* All forks finished and no pending retries: forward final response and clean up. */
       should_forward = 1;
     } else if (!all_done || call->n_pending_exts > 0) {
-      /* Some forks still ringing or pending retries: absorb this response. */
-      if (call->fork_state[fork_idx != (size_t)-1 ? fork_idx : 0] != FORK_ACTIVE)
-        should_forward = 0;
+      if (call->fork_state[fork_idx] != FORK_ACTIVE) should_forward = 0;
     }
   }
 
@@ -2233,10 +2229,10 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
   }
   if (method_len == 8 && strncasecmp(method, "REGISTER", 8) == 0) {
     log_trace("REGISTER: step udp_msg calling handle_register");
-    handle_register(buf, len, cfg, &ctx);
+    handle_register(buf, len, global_cfg, &ctx);
     log_trace("REGISTER: step udp_msg handle_register returned");
   } else if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
-    handle_invite(cfg, buf, len, &ctx);
+    handle_invite(global_cfg, buf, len, &ctx);
   } else if (method_len == 3 && strncasecmp(method, "ACK", 3) == 0) {
     /* ACK: for 2xx → forward to callee; for non-2xx → absorb (we already sent our own ACK). */
     char cid[CALL_ID_MAX];
@@ -2483,50 +2479,49 @@ static int tcp_bind(const char *listen_addr) {
   return fd;
 }
 
-/* Main loop: select on SIP + RTP + trunk fds, dispatch, run protothreads. */
-void daemon_root(int argc, void *argv[]) {
-  upbx_config *cfg = (upbx_config *)argv[0];
-  if (argc < 1 || !cfg) return;
+static int daemon_initialized = 0;
+
+static int daemon_init_once(void) {
+  if (daemon_initialized) return 0;
+  daemon_initialized = 1;
+
+  upbx_config *cfg = global_cfg;
+  if (!cfg) return -1;
 
   const char *listen_addr = (cfg->listen && cfg->listen[0]) ? cfg->listen : "0.0.0.0:5060";
   log_info("SIP binding to %s", listen_addr);
-  int sockfd = udp_bind(listen_addr);
-  if (sockfd < 0) {
+  daemon_sockfd = udp_bind(listen_addr);
+  if (daemon_sockfd < 0) {
     log_fatal("daemon_root: UDP bind %s failed", listen_addr);
-    return;
+    return -1;
   }
   log_info("SIP listening on UDP %s", listen_addr);
 
-  /* Also listen on TCP for SIP (same address as UDP) */
-  int tcp_sockfd = tcp_bind(listen_addr);
-  if (tcp_sockfd < 0) {
+  daemon_tcp_sockfd = tcp_bind(listen_addr);
+  if (daemon_tcp_sockfd < 0) {
     log_warn("daemon_root: TCP bind %s failed, TCP disabled", listen_addr);
   } else {
     log_info("SIP listening on TCP %s", listen_addr);
   }
 
-  /* Register callback so all call removals (including timeout aging) fire call.hangup. */
+  return 0;
+}
+
+/* Main loop: select on SIP + RTP + trunk fds, dispatch, run protothreads. */
+PT_THREAD(daemon_root_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  (void)timestamp;
+  PT_BEGIN(pt);
+
+  if (daemon_init_once() != 0) {
+    PT_EXIT(pt);
+  }
+
   call_set_pre_remove_callback(call_pre_remove_handler);
-
-  /* Initialize registration subsystem. */
   registration_init();
-
-  log_info("trunk registration started");
-  notify_extension_and_trunk_lists(cfg);
-
+  notify_extension_and_trunk_lists(global_cfg);
   trunk_reg_start();
   api_start();
   metrics_init();
-
-  PT_INIT(&pt_overflow);
-  struct pt pt_trunk_reg;
-  PT_INIT(&pt_trunk_reg);
-  struct pt pt_api;
-  PT_INIT(&pt_api);
-  struct pt pt_reg_expiry;
-  PT_INIT(&pt_reg_expiry);
-  struct pt pt_metrics;
-  PT_INIT(&pt_metrics);
 
   char buf[SIP_READ_BUF_SIZE];
   struct sockaddr_storage peer;
@@ -2535,15 +2530,14 @@ void daemon_root(int argc, void *argv[]) {
   for (;;) {
     plugmod_tick();
     plugin_sync();
-    time_t loop_timestamp = time(NULL);
 
     fd_set r;
     FD_ZERO(&r);
-    FD_SET(sockfd, &r);
-    int maxfd = sockfd;
-    if (tcp_sockfd >= 0) {
-      FD_SET(tcp_sockfd, &r);
-      if (tcp_sockfd > maxfd) maxfd = tcp_sockfd;
+    FD_SET(daemon_sockfd, &r);
+    int maxfd = daemon_sockfd;
+    if (daemon_tcp_sockfd >= 0) {
+      FD_SET(daemon_tcp_sockfd, &r);
+      if (daemon_tcp_sockfd > maxfd) maxfd = daemon_tcp_sockfd;
     }
     call_fill_rtp_fds(&r, &maxfd);
     trunk_reg_fill_fds(&r, &maxfd);
@@ -2553,9 +2547,9 @@ void daemon_root(int argc, void *argv[]) {
     struct timeval tv = { 0, 50000 }; /* 50ms */
     int n = select(maxfd + 1, &r, NULL, NULL, &tv);
     if (n > 0) {
-      if (FD_ISSET(sockfd, &r)) {
+      if (FD_ISSET(daemon_sockfd, &r)) {
         peerlen = sizeof(peer);
-        ssize_t nr = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
+        ssize_t nr = recvfrom(daemon_sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peerlen);
         if (nr > 0 && (size_t)nr <= SIP_READ_BUF_SIZE - 1) {
           char peer_str[64];
           if (peer.ss_family == AF_INET) {
@@ -2574,19 +2568,19 @@ void daemon_root(int argc, void *argv[]) {
             msg->len = (size_t)nr;
             memcpy(msg->buf, buf, (size_t)nr);
             msg->buf[nr] = '\0';
-            handle_udp_msg(cfg, msg, sockfd);
+            handle_udp_msg(global_cfg, msg, daemon_sockfd);
           }
           if (registration_is_notify_pending()) {
             registration_clear_notify_pending();
-            notify_extension_and_trunk_lists(cfg);
+            notify_extension_and_trunk_lists(global_cfg);
           }
         }
       }
       /* Handle incoming TCP connections */
-      if (tcp_sockfd >= 0 && FD_ISSET(tcp_sockfd, &r)) {
+      if (daemon_tcp_sockfd >= 0 && FD_ISSET(daemon_tcp_sockfd, &r)) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(tcp_sockfd, (struct sockaddr *)&client_addr, &client_len);
+        int client_fd = accept(daemon_tcp_sockfd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd >= 0) {
           ssize_t nr = recv(client_fd, buf, sizeof(buf) - 1, 0);
           if (nr > 0) {
@@ -2612,9 +2606,9 @@ void daemon_root(int argc, void *argv[]) {
                 size_t method_len = 0;
                 if (sip_request_method(buf, (size_t)nr, &method, &method_len)) {
                   if (method_len == 8 && strncasecmp(method, "REGISTER", 8) == 0) {
-                    handle_register(buf, (size_t)nr, cfg, &ctx);
+                    handle_register(buf, (size_t)nr, global_cfg, &ctx);
                   } else if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
-                    handle_invite(cfg, buf, (size_t)nr, &ctx);
+                    handle_invite(global_cfg, buf, (size_t)nr, &ctx);
                   } else if (method_len == 3 && strncasecmp(method, "ACK", 3) == 0) {
                     /* ACK: for 2xx → forward to callee; for non-2xx → absorb (we already sent our own ACK). */
                     char cid[CALL_ID_MAX];
@@ -2623,7 +2617,7 @@ void daemon_root(int argc, void *argv[]) {
                     call_t *c = call_find(cid);
                     if (c && c->answered && c->b.sip_len > 0) {
                       char via_host[256], via_port[32];
-                      if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
+                      if (get_advertise_addr(global_cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
                         char t1[SIP_READ_BUF_SIZE], t2[SIP_READ_BUF_SIZE];
                         memcpy(t1, buf, (size_t)nr);
                         int clen = (int)nr;
@@ -2664,7 +2658,7 @@ void daemon_root(int argc, void *argv[]) {
                       }
                       if (fwd_addr && fwd_len > 0) {
                         char via_host[256], via_port[32];
-                        if (get_advertise_addr(cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
+                        if (get_advertise_addr(global_cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
                           char via_val[256];
                           sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
                           char t1[SIP_READ_BUF_SIZE];
@@ -2694,12 +2688,12 @@ void daemon_root(int argc, void *argv[]) {
                   }
                 }
               } else {
-                handle_sip_response(cfg, buf, (size_t)nr, &ctx);
+                handle_sip_response(global_cfg, buf, (size_t)nr, &ctx);
               }
             }
             if (registration_is_notify_pending()) {
               registration_clear_notify_pending();
-              notify_extension_and_trunk_lists(cfg);
+              notify_extension_and_trunk_lists(global_cfg);
             }
           }
           close(client_fd);
@@ -2725,7 +2719,7 @@ void daemon_root(int argc, void *argv[]) {
                 size_t method_len = 0;
                 if (sip_request_method(buf, (size_t)nr, &method, &method_len)) {
                   if (method_len == 6 && strncasecmp(method, "INVITE", 6) == 0) {
-                    handle_invite(cfg, buf, (size_t)nr, &ctx);
+                    handle_invite(global_cfg, buf, (size_t)nr, &ctx);
                   } else if (method_len == 3 && strncasecmp(method, "BYE", 3) == 0) {
                     char cid[CALL_ID_MAX];
                     cid[0] = '\0';
@@ -2750,11 +2744,12 @@ void daemon_root(int argc, void *argv[]) {
       call_relay_rtp(&r);
       trunk_reg_poll(&r);
     }
-    PT_SCHEDULE(overflow_pt(&pt_overflow, cfg, sockfd));
-    PT_SCHEDULE(trunk_reg_pt(&pt_trunk_reg));
-    PT_SCHEDULE(api_pt(&pt_api, &r, loop_timestamp));
-    PT_SCHEDULE(registration_remove_expired_pt(&pt_reg_expiry, loop_timestamp));
-    PT_SCHEDULE(metrics_tick_pt(&pt_metrics, loop_timestamp));
-    call_age_idle(120); /* remove calls with no RTP for 2 minutes */
+    PT_YIELD(pt);
   }
+  PT_END(pt);
+}
+
+static void __attribute__((constructor)) sip_server_register(void) {
+  appmodule_pt_add(daemon_root_pt, NULL);
+  appmodule_pt_add(overflow_wrapper, NULL);
 }

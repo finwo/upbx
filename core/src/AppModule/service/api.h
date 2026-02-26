@@ -11,8 +11,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/select.h>
-#include <time.h>
+#include <stdint.h>
 #include "common/pt.h"
+
+struct pt_task;
 
 /* Client handle (opaque to command implementations) */
 typedef struct api_client api_client_t;
@@ -43,7 +45,7 @@ bool api_write_kv_time(api_client_t *c, const char *key, long t);
 /* Lifecycle + protothread. loop_timestamp: global timestamp from daemon (for 60s listen rebind). */
 void api_start(void);
 void api_fill_fds(fd_set *read_set, int *maxfd);
-PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp));
+PT_THREAD(api_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
 void api_stop(void);
 
 #endif

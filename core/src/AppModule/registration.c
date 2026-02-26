@@ -10,6 +10,7 @@
 #include "rxi/log.h"
 #include "common/pt.h"
 #include "AppModule/registration.h"
+#include "AppModule/command/daemon.h"
 
 #define DEFAULT_EXPIRES 300  /* 5 minutes */
 
@@ -215,9 +216,11 @@ int registration_fill_tcp_fds(fd_set *read_set, int *maxfd) {
 /* Expiry removal protothread: wait 60s, then remove expired entries, repeat. */
 static time_t next_reg_expiry_check = 0;
 
-PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp)) {
+PT_THREAD(registration_remove_expired_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  time_t loop_timestamp = 0;
   PT_BEGIN(pt);
   for (;;) {
+    loop_timestamp = (time_t)(timestamp / 1000);
     PT_WAIT_UNTIL(pt, next_reg_expiry_check == 0 || loop_timestamp >= next_reg_expiry_check);
     next_reg_expiry_check = loop_timestamp + 60;
 
@@ -239,7 +242,12 @@ PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp)) 
     if (w != reg_count)
       registration_set_notify_pending();
     reg_count = w;
+    PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+static void __attribute__((constructor)) registration_register(void) {
+  appmodule_pt_add(registration_remove_expired_pt, NULL);
 }
 

@@ -6,8 +6,11 @@
 #define UPBX_TRUNK_REG_H
 
 #include <sys/select.h>
+#include <stdint.h>
 
 #include "common/pt.h"
+
+struct pt_task;
 
 /* Call once at daemon start. Uses live config (no cfg). */
 void trunk_reg_start(void);
@@ -19,7 +22,7 @@ void trunk_reg_fill_fds(fd_set *read_set, int *maxfd);
 void trunk_reg_poll(fd_set *read_set);
 
 /* Protothread: decides when to start registration for each trunk. Schedule from main loop. Uses live config. */
-PT_THREAD(trunk_reg_pt(struct pt *pt));
+PT_THREAD(trunk_reg_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
 
 /* Check whether a trunk's upstream registration is currently active (2xx received). */
 int trunk_reg_is_available(const char *trunk_name);

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include "cofyc/argparse.h"
 #include "rxi/log.h"
@@ -13,7 +14,112 @@
 #include "config.h"
 #include "AppModule/command/daemon.h"
 #include "AppModule/plugin.h"
-#include "AppModule/sip_server.h"
+
+static pt_task_t *tasks = NULL;
+static size_t task_count = 0;
+static size_t task_cap = 0;
+static int pt_running = 1;
+
+int pt_task_has_data(pt_task_t *task, int *out_fd) {
+  if (!task || !out_fd || task->read_fds_count == 0)
+    return -1;
+  *out_fd = -1;
+  return -1;
+}
+
+pt_task_t *appmodule_pt_add(pt_task_fn func, void *udata) {
+  if (!func) return NULL;
+
+  if (task_count >= task_cap) {
+    size_t new_cap = task_cap == 0 ? 4 : task_cap * 2;
+    pt_task_t *new_tasks = realloc(tasks, new_cap * sizeof(pt_task_t));
+    if (!new_tasks) {
+      log_error("appmodule_pt_add: failed to allocate memory");
+      return NULL;
+    }
+    tasks = new_tasks;
+    task_cap = new_cap;
+  }
+
+  pt_task_t *task = &tasks[task_count];
+  memset(task, 0, sizeof(*task));
+  PT_INIT(&task->pt);
+  task->udata = udata;
+  task->func = func;
+  task->read_fds = NULL;
+  task->read_fds_count = 0;
+  task->maxfd = -1;
+  task->state = PT_WAITING;
+  task_count++;
+
+  return task;
+}
+
+void appmodule_pt_stop(void) {
+  pt_running = 0;
+}
+
+static int64_t get_timestamp_ms(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+}
+
+static void scheduler_run(void) {
+  fd_set read_fds;
+  int maxfd = -1;
+
+  for (;;) {
+    if (!pt_running) break;
+
+    int64_t timestamp = get_timestamp_ms();
+
+    FD_ZERO(&read_fds);
+    maxfd = -1;
+
+    for (size_t i = 0; i < task_count; i++) {
+      pt_task_t *task = &tasks[i];
+      task->maxfd = -1;
+      for (int j = 0; j < task->read_fds_count; j++) {
+        int fd = task->read_fds[j];
+        if (fd >= 0) {
+          FD_SET(fd, &read_fds);
+          if (fd > maxfd) maxfd = fd;
+          if (task->maxfd < fd) task->maxfd = fd;
+        }
+      }
+    }
+
+    struct timeval tv = { 0, 100000 };
+    int n = select(maxfd + 1, &read_fds, NULL, NULL, &tv);
+    timestamp = get_timestamp_ms();
+
+    if (n > 0) {
+      for (size_t i = 0; i < task_count; i++) {
+        pt_task_t *task = &tasks[i];
+        task->state = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
+      }
+    } else {
+      for (size_t i = 0; i < task_count; i++) {
+        pt_task_t *task = &tasks[i];
+        task->state = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
+      }
+    }
+
+    for (size_t i = 0; i < task_count; ) {
+      pt_task_t *task = &tasks[i];
+      if (task->state == PT_EXITED || task->state == PT_ENDED) {
+        if (task->read_fds) free(task->read_fds);
+        task_count--;
+        if (i < task_count) {
+          memmove(&tasks[i], &tasks[i + 1], (task_count - i) * sizeof(pt_task_t));
+        }
+      } else {
+        i++;
+      }
+    }
+  }
+}
 
 /// # DAEMON
 /// **daemon** is the command that runs the SIP PBX server. It has no subcommands, only local options.
@@ -136,13 +242,14 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
   if (want_daemonize && do_daemonize() != 0)
     return 1;
 
+  global_cfg = &cfg;
+
   log_info("daemon starting");
   plugin_sync();
 
-  void *av[1];
-  av[0] = &cfg;
-  daemon_root(1, av);
-  /* never returns */
+  plugin_start(&cfg);
+
+  scheduler_run();
 
   plugin_stop();
   config_free(&cfg);

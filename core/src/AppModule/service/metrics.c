@@ -13,6 +13,8 @@
 
 #include "rxi/log.h"
 #include "config.h"
+#include "AppModule/command/daemon.h"
+#include "AppModule/service/metrics.h"
 #include "PluginModule/plugin.h"
 #include "AppModule/service/api.h"
 #include "common/pt.h"
@@ -262,9 +264,11 @@ void metrics_init(void) {
 
 static time_t next_metrics_tick = 0;
 
-PT_THREAD(metrics_tick_pt(struct pt *pt, time_t loop_timestamp)) {
+PT_THREAD(metrics_tick_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  time_t loop_timestamp = 0;
   PT_BEGIN(pt);
   for (;;) {
+    loop_timestamp = (time_t)(timestamp / 1000);
     PT_WAIT_UNTIL(pt, next_metrics_tick == 0 || loop_timestamp >= next_metrics_tick);
     next_metrics_tick = loop_timestamp + 1;
 
@@ -291,8 +295,13 @@ PT_THREAD(metrics_tick_pt(struct pt *pt, time_t loop_timestamp)) {
         last_reconcile = now;
       }
     }
+    PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+static void __attribute__((constructor)) metrics_register(void) {
+  appmodule_pt_add(metrics_tick_pt, NULL);
 }
 
 void metrics_call_active(void) {

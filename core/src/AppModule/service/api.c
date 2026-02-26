@@ -26,6 +26,7 @@
 #include "config.h"
 #include "PluginModule/plugin.h"
 #include "AppModule/service/api.h"
+#include "AppModule/command/daemon.h"
 
 /* Constants */
 
@@ -528,10 +529,10 @@ static void accept_connection(void) {
   }
 }
 
-static void process_client(struct api_client *c, fd_set *read_set) {
+static void process_client(struct api_client *c, int ready_fd) {
   if (c->fd < 0) return;
 
-  if (!FD_ISSET(c->fd, read_set)) {
+  if (c->fd != ready_fd) {
     client_flush(c);
     return;
   }
@@ -600,10 +601,12 @@ void api_fill_fds(fd_set *read_set, int *maxfd) {
   }
 }
 
-PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp)) {
+PT_THREAD(api_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  time_t loop_timestamp = 0;
   PT_BEGIN(pt);
   for (;;) {
-    /* 60s listen rebind check */
+    loop_timestamp = (time_t)(timestamp / 1000);
+
     if (listen_fd >= 0 && loop_timestamp >= next_listen_check) {
       next_listen_check = loop_timestamp + 60;
       resp_object *listen_val = config_key_get("api", "listen");
@@ -622,15 +625,31 @@ PT_THREAD(api_pt(struct pt *pt, fd_set *read_set, time_t loop_timestamp)) {
         }
       }
     }
+
     if (listen_fd >= 0) {
-      if (FD_ISSET(listen_fd, read_set))
+      int ready_fd = -1;
+      if (task->read_fds_count > 0) {
+        pt_task_has_data(task, &ready_fd);
+      }
+
+      if (ready_fd == listen_fd) {
         accept_connection();
-      for (int i = 0; i < API_MAX_CLIENTS; i++)
-        process_client(&clients[i], read_set);
+      } else if (ready_fd >= 0) {
+        for (int i = 0; i < API_MAX_CLIENTS; i++) {
+          if (clients[i].fd == ready_fd) {
+            process_client(&clients[i], ready_fd);
+            break;
+          }
+        }
+      }
     }
     PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+static void __attribute__((constructor)) api_register(void) {
+  appmodule_pt_add(api_pt, NULL);
 }
 
 void api_stop(void) {

@@ -8,6 +8,8 @@
 #include "config.h"
 #include "RespModule/resp.h"
 
+upbx_config *global_cfg = NULL;
+
 #define STRDUP(s) ((s) != NULL ? strdup(s) : NULL)
 #define PREFIX_MATCH(sec, pre) (strncmp(sec, pre, sizeof(pre)-1) == 0 && (sec)[sizeof(pre)-1])
 #define SECTION_TAIL(sec, pre) ((sec) + sizeof(pre) - 1)

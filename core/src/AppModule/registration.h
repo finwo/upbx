@@ -10,7 +10,10 @@
 #include <stddef.h>
 #include <time.h>
 #include <sys/types.h>
+#include <stdint.h>
 #include "common/pt.h"
+
+struct pt_task;
 
 typedef struct {
   char *number;       /* Extension number (e.g. "206") for config lookup */
@@ -70,6 +73,6 @@ int registration_get_tcp_sock(const ext_reg_t *reg);
 int registration_fill_tcp_fds(fd_set *read_set, int *maxfd);
 
 /* Protothread: every 60s removes expired entries from the registration list. Run each daemon iteration. */
-PT_THREAD(registration_remove_expired_pt(struct pt *pt, time_t loop_timestamp));
+PT_THREAD(registration_remove_expired_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
 
 #endif

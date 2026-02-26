@@ -78,6 +78,9 @@ struct upbx_config {
   config_api api;
 };
 
+/* Global config instance (set after config_load in daemon) */
+extern upbx_config *global_cfg;
+
 /* Load config from file. Returns 0 on success, -1 on file error, >0 line number of first parse error. */
 int config_load(upbx_config *cfg, const char *path);
 

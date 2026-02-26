@@ -18,6 +18,8 @@
 #include "common/hexdump.h"
 #include "common/digest_auth.h"
 #include "rxi/log.h"
+#include "AppModule/command/daemon.h"
+#include "AppModule/trunk_reg.h"
 #include "config.h"
 #include "PluginModule/plugin.h"
 #include "AppModule/sip_parse.h"
@@ -343,9 +345,10 @@ void trunk_reg_poll(fd_set *read_set) {
   free(buf);
 }
 
-PT_THREAD(trunk_reg_pt(struct pt *pt)) {
+PT_THREAD(trunk_reg_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   PT_BEGIN(pt);
   for (;;) {
+    (void)timestamp;
     resp_object *sections = config_sections_list();
     if (!sections || sections->type != RESPT_ARRAY) {
       if (sections) resp_free(sections);
@@ -421,6 +424,10 @@ PT_THREAD(trunk_reg_pt(struct pt *pt)) {
     PT_YIELD(pt);
   }
   PT_END(pt);
+}
+
+static void __attribute__((constructor)) trunk_reg_register(void) {
+  appmodule_pt_add(trunk_reg_pt, NULL);
 }
 
 int trunk_reg_is_available(const char *trunk_name) {
