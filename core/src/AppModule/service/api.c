@@ -35,17 +35,19 @@
 #define WRITE_BUF_INIT    4096
 #define MAX_ARGS          32
 
-/* Per-client connection state */
+/* Per-client connection state (stored in pt udata) */
 
-struct api_client {
+struct api_client_state {
   int       fd;
-  char     *username;       /* authenticated username (NULL or "" = anonymous [api:*]) */
+  char     *username;
   char      rbuf[READ_BUF_SIZE];
-  size_t    rlen;           /* bytes in read buffer */
+  size_t    rlen;
   char     *wbuf;
   size_t    wlen;
   size_t    wcap;
 };
+
+typedef struct api_client_state api_client_t;
 
 /* Command entry */
 
@@ -59,8 +61,8 @@ typedef struct {
 static int       listen_fd = -1;
 static char     *current_listen = NULL;    /* current bind address for 60s rebind check */
 static time_t   next_listen_check = 0;    /* next time to check config api listen */
-static struct api_client clients[API_MAX_CLIENTS];
 static struct hashmap  *cmd_map = NULL;
+static int       api_initialized = 0;
 
 /* Write helpers */
 
@@ -153,12 +155,7 @@ bool api_write_kv_time(api_client_t *c, const char *key, long t) {
 
 /* Client lifecycle */
 
-static void client_init(struct api_client *c) {
-  memset(c, 0, sizeof(*c));
-  c->fd = -1;
-}
-
-static void client_close(struct api_client *c) {
+static void client_close(api_client_t *c) {
   if (c->fd >= 0) {
     close(c->fd);
     c->fd = -1;
@@ -171,7 +168,7 @@ static void client_close(struct api_client *c) {
   c->username = NULL;
 }
 
-static void client_flush(struct api_client *c) {
+static void client_flush(api_client_t *c) {
   if (c->fd < 0 || c->wlen == 0) return;
   ssize_t n = send(c->fd, c->wbuf, c->wlen, 0);
   if (n > 0) {
@@ -217,7 +214,7 @@ static int parse_inline(const char *line, size_t len, char **args, int max_args)
 
 /* RESP2 multibulk parser */
 
-static int parse_resp_command(struct api_client *c, char **args, int max_args, int *nargs) {
+static int parse_resp_command(api_client_t *c, char **args, int max_args, int *nargs) {
   *nargs = 0;
   if (c->rlen == 0) return 0;
 
@@ -422,7 +419,7 @@ static bool is_builtin(const char *name) {
           strcasecmp(name, "command") == 0);
 }
 
-static void dispatch_command(struct api_client *c, char **args, int nargs) {
+static void dispatch_command(api_client_t *c, char **args, int nargs) {
   if (nargs <= 0) return;
 
   /* Lowercase the command name */
@@ -504,73 +501,8 @@ static int create_listen_socket(const char *listen_addr) {
   return fd;
 }
 
-/* Connection management */
-
-static void accept_connection(void) {
-  struct sockaddr_storage addr;
-  socklen_t addrlen = sizeof(addr);
-  int fd = accept(listen_fd, (struct sockaddr *)&addr, &addrlen);
-  if (fd < 0) return;
-  set_socket_nonblocking(fd, 1);
-  int slot = -1;
-  for (int i = 0; i < API_MAX_CLIENTS; i++) {
-    if (clients[i].fd < 0) { slot = i; break; }
-  }
-  if (slot < 0) {
-    const char *msg = "-ERR max connections\r\n";
-    send(fd, msg, strlen(msg), 0);
-    close(fd);
-    log_debug("api: rejected connection, max clients reached");
-  } else {
-    client_init(&clients[slot]);
-    clients[slot].fd = fd;
-    clients[slot].username = NULL; /* anonymous until AUTH */
-    log_trace("api: accepted connection (slot %d)", slot);
-  }
-}
-
-static void process_client(struct api_client *c, int ready_fd) {
-  if (c->fd < 0) return;
-
-  if (c->fd != ready_fd) {
-    client_flush(c);
-    return;
-  }
-
-  size_t space = sizeof(c->rbuf) - c->rlen;
-  if (space == 0) {
-    client_close(c);
-    return;
-  }
-  ssize_t n = recv(c->fd, c->rbuf + c->rlen, space, 0);
-  if (n <= 0) {
-    if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-      client_close(c);
-    return;
-  }
-  c->rlen += (size_t)n;
-
-  char *args[MAX_ARGS];
-  int nargs;
-  int rc;
-  while (c->fd >= 0 && (rc = parse_resp_command(c, args, MAX_ARGS, &nargs)) > 0) {
-    dispatch_command(c, args, nargs);
-    for (int j = 0; j < nargs; j++) free(args[j]);
-  }
-  if (rc < 0) {
-    api_write_err(c, "Protocol error");
-    client_flush(c);
-    client_close(c);
-    return;
-  }
-  client_flush(c);
-}
-
-/* Public API */
-
-void api_start(void) {
-  for (int i = 0; i < API_MAX_CLIENTS; i++)
-    client_init(&clients[i]);
+static void api_listener_init(void) {
+  if (api_initialized) return;
 
   resp_object *listen_val = config_key_get("api", "listen");
   const char *listen_str = (listen_val && (listen_val->type == RESPT_BULK || listen_val->type == RESPT_SIMPLE) && listen_val->u.s && listen_val->u.s[0])
@@ -586,28 +518,55 @@ void api_start(void) {
   if (!current_listen) return;
   init_builtins();
   listen_fd = create_listen_socket(current_listen);
-  next_listen_check = 0; /* so first api_pt tick will set it from loop_timestamp + 60 */
+  next_listen_check = 0;
+  api_initialized = 1;
 }
 
-void api_fill_fds(fd_set *read_set, int *maxfd) {
-  if (listen_fd < 0) return;
-  FD_SET(listen_fd, read_set);
-  if (listen_fd > *maxfd) *maxfd = listen_fd;
-  for (int i = 0; i < API_MAX_CLIENTS; i++) {
-    if (clients[i].fd >= 0) {
-      FD_SET(clients[i].fd, read_set);
-      if (clients[i].fd > *maxfd) *maxfd = clients[i].fd;
-    }
+/* Public API */
+
+void api_start(void) {
+  if (api_initialized) return;
+  api_listener_init();
+}
+
+static void handle_accept(void) {
+  struct sockaddr_storage addr;
+  socklen_t addrlen = sizeof(addr);
+  int fd = accept(listen_fd, (struct sockaddr *)&addr, &addrlen);
+  if (fd < 0) return;
+  set_socket_nonblocking(fd, 1);
+
+  api_client_t *state = calloc(1, sizeof(*state));
+  if (!state) {
+    const char *msg = "-ERR out of memory\r\n";
+    send(fd, msg, strlen(msg), 0);
+    close(fd);
+    return;
   }
+  state->fd = fd;
+
+  appmodule_pt_add(api_client_pt, state);
+  log_trace("api: accepted connection, spawned client pt");
 }
 
-PT_THREAD(api_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+PT_THREAD(api_listener_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   time_t loop_timestamp = 0;
   PT_BEGIN(pt);
+
+  task->read_fds = &listen_fd;
+  task->read_fds_count = (listen_fd >= 0) ? 1 : 0;
+
   for (;;) {
+    if (listen_fd >= 0) {
+      task->read_fds = &listen_fd;
+      task->read_fds_count = 1;
+    } else {
+      task->read_fds_count = 0;
+    }
+
     loop_timestamp = (time_t)(timestamp / 1000);
 
-    if (listen_fd >= 0 && loop_timestamp >= next_listen_check) {
+    if (loop_timestamp >= next_listen_check) {
       next_listen_check = loop_timestamp + 60;
       resp_object *listen_val = config_key_get("api", "listen");
       const char *new_str = (listen_val && (listen_val->type == RESPT_BULK || listen_val->type == RESPT_SIMPLE) && listen_val->u.s)
@@ -624,44 +583,88 @@ PT_THREAD(api_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
           if (listen_fd < 0) { free(current_listen); current_listen = NULL; }
         }
       }
+
+      if (!api_initialized && current_listen) {
+        api_initialized = 1;
+      }
     }
 
     if (listen_fd >= 0) {
       int ready_fd = -1;
-      if (task->read_fds_count > 0) {
-        pt_task_has_data(task, &ready_fd);
-      }
+      PT_WAIT_UNTIL(pt, pt_task_has_data(task, &ready_fd) == 0 && ready_fd == listen_fd);
 
       if (ready_fd == listen_fd) {
-        accept_connection();
-      } else if (ready_fd >= 0) {
-        for (int i = 0; i < API_MAX_CLIENTS; i++) {
-          if (clients[i].fd == ready_fd) {
-            process_client(&clients[i], ready_fd);
-            break;
-          }
-        }
+        handle_accept();
       }
+    } else {
+      PT_YIELD(pt);
     }
-    PT_YIELD(pt);
   }
   PT_END(pt);
 }
 
+PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  (void)timestamp;
+  api_client_t *state = task->udata;
+
+  PT_BEGIN(pt);
+
+  task->read_fds = &state->fd;
+  task->read_fds_count = 1;
+
+  for (;;) {
+    int ready_fd = -1;
+    PT_WAIT_UNTIL(pt, pt_task_has_data(task, &ready_fd) == 0 && ready_fd == state->fd);
+
+    size_t space = sizeof(state->rbuf) - state->rlen;
+    if (space == 0) {
+      break;
+    }
+    ssize_t n = recv(state->fd, state->rbuf + state->rlen, space, 0);
+    if (n <= 0) {
+      if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        break;
+    }
+    state->rlen += (size_t)n;
+
+    char *args[MAX_ARGS];
+    int nargs;
+    int rc = 0;
+    while (state->fd >= 0 && (rc = parse_resp_command(state, args, MAX_ARGS, &nargs)) > 0) {
+      dispatch_command(state, args, nargs);
+      for (int j = 0; j < nargs; j++) free(args[j]);
+    }
+    if (rc < 0) {
+      api_write_err(state, "Protocol error");
+    }
+
+    client_flush(state);
+
+    if (state->fd < 0) break;
+  }
+
+  if (state->fd >= 0) {
+    close(state->fd);
+  }
+  free(state->wbuf);
+  free(state->username);
+  free(state);
+
+  PT_END(pt);
+}
+
 static void __attribute__((constructor)) api_register(void) {
-  appmodule_pt_add(api_pt, NULL);
+  appmodule_pt_add(api_listener_pt, NULL);
 }
 
 void api_stop(void) {
-  for (int i = 0; i < API_MAX_CLIENTS; i++) {
-    if (clients[i].fd >= 0) client_close(&clients[i]);
-  }
   if (listen_fd >= 0) {
     close(listen_fd);
     listen_fd = -1;
   }
   free(current_listen);
   current_listen = NULL;
+  api_initialized = 0;
   if (cmd_map) {
     hashmap_free(cmd_map);
     cmd_map = NULL;

@@ -19,11 +19,21 @@ static pt_task_t *tasks = NULL;
 static size_t task_count = 0;
 static size_t task_cap = 0;
 static int pt_running = 1;
+static fd_set g_select_result;
 
 int pt_task_has_data(pt_task_t *task, int *out_fd) {
   if (!task || !out_fd || task->read_fds_count == 0)
     return -1;
+
   *out_fd = -1;
+
+  for (int i = 0; i < task->read_fds_count; i++) {
+    int fd = task->read_fds[i];
+    if (fd >= 0 && FD_ISSET(fd, &g_select_result)) {
+      *out_fd = fd;
+      return 0;
+    }
+  }
   return -1;
 }
 
@@ -93,6 +103,7 @@ static void scheduler_run(void) {
     struct timeval tv = { 0, 100000 };
     int n = select(maxfd + 1, &read_fds, NULL, NULL, &tv);
     timestamp = get_timestamp_ms();
+    g_select_result = read_fds;
 
     if (n > 0) {
       for (size_t i = 0; i < task_count; i++) {

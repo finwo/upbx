@@ -17,7 +17,7 @@
 struct pt_task;
 
 /* Client handle (opaque to command implementations) */
-typedef struct api_client api_client_t;
+typedef struct api_client_state api_client_t;
 
 /* Command handler signature.
  * args[0] = command name (lowercased), args[1..nargs-1] = arguments.
@@ -44,8 +44,8 @@ bool api_write_kv_time(api_client_t *c, const char *key, long t);
 
 /* Lifecycle + protothread. loop_timestamp: global timestamp from daemon (for 60s listen rebind). */
 void api_start(void);
-void api_fill_fds(fd_set *read_set, int *maxfd);
-PT_THREAD(api_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
+PT_THREAD(api_listener_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
+PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
 void api_stop(void);
 
 #endif

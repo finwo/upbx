@@ -2520,7 +2520,6 @@ PT_THREAD(daemon_root_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)
   registration_init();
   notify_extension_and_trunk_lists(global_cfg);
   trunk_reg_start();
-  api_start();
   metrics_init();
 
   char buf[SIP_READ_BUF_SIZE];
@@ -2541,7 +2540,6 @@ PT_THREAD(daemon_root_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)
     }
     call_fill_rtp_fds(&r, &maxfd);
     trunk_reg_fill_fds(&r, &maxfd);
-    api_fill_fds(&r, &maxfd);
     registration_fill_tcp_fds(&r, &maxfd);
 
     struct timeval tv = { 0, 50000 }; /* 50ms */
