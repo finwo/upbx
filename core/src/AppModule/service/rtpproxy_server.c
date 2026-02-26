@@ -484,6 +484,8 @@ static PT_THREAD(rtpproxy_init_fn(struct pt *pt, int64_t timestamp, struct pt_ta
 
   PT_WAIT_UNTIL(pt, config_get_path() != NULL);
 
+  static const char default_url[] = "unix:///var/run/upbx-rtpproxy.sock";
+
   resp_object *mode_obj = config_key_get("rtpproxy", "mode");
   char *mode = NULL;
   if (mode_obj && (mode_obj->type == RESPT_BULK || mode_obj->type == RESPT_SIMPLE) && mode_obj->u.s) {
@@ -492,14 +494,15 @@ static PT_THREAD(rtpproxy_init_fn(struct pt *pt, int64_t timestamp, struct pt_ta
 
   /* Default to builtin if not specified */
   int is_builtin = (mode && strcmp(mode, "builtin") == 0) || mode == NULL;
+  char *url = NULL;
 
   if (is_builtin) {
     resp_object *url_obj = config_key_get("rtpproxy", "url");
-    char *url = NULL;
     if (url_obj && (url_obj->type == RESPT_BULK || url_obj->type == RESPT_SIMPLE) && url_obj->u.s && url_obj->u.s[0]) {
-      url = url_obj->u.s;
+      url = strdup(url_obj->u.s);
+      resp_free(url_obj);
     } else {
-      url = "unix:///var/run/upbx-rtpproxy.sock";
+      url = (char *)default_url;
       if (url_obj) { resp_free(url_obj); url_obj = NULL; }
     }
 
@@ -542,6 +545,7 @@ static PT_THREAD(rtpproxy_init_fn(struct pt *pt, int64_t timestamp, struct pt_ta
   }
 
   if (mode_obj) resp_free(mode_obj);
+  if (url && url != default_url) free(url);
 
   PT_END(pt);
 }

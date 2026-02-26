@@ -427,29 +427,32 @@ int rtpproxy_client_global_init(void) {
   const char *config_path = config_get_path();
   if (!config_path) return -1;
 
+  static const char default_url[] = "unix:///var/run/upbx-rtpproxy.sock";
+
   resp_object *url_obj = config_key_get("rtpproxy", "url");
   char *url = NULL;
   if (url_obj && (url_obj->type == RESPT_BULK || url_obj->type == RESPT_SIMPLE) && url_obj->u.s && url_obj->u.s[0]) {
-    url = url_obj->u.s;
+    url = strdup(url_obj->u.s);
+    resp_free(url_obj);
   } else {
-    url = "unix:///var/run/upbx-rtpproxy.sock";
+    url = (char *)default_url;
     if (url_obj) { resp_free(url_obj); url_obj = NULL; }
   }
 
   rtpproxy_client = (rtpp_client_t *)malloc(sizeof(rtpp_client_t));
   if (!rtpproxy_client) {
-    if (url_obj) resp_free(url_obj);
+    if (url != default_url) free(url);
     return -1;
   }
 
   if (rtpp_client_init(rtpproxy_client, url) < 0) {
     free(rtpproxy_client);
     rtpproxy_client = NULL;
-    if (url_obj) resp_free(url_obj);
+    if (url != default_url) free(url);
     return -1;
   }
 
-  if (url_obj) resp_free(url_obj);
+  if (url != default_url) free(url);
 
   return 0;
 }

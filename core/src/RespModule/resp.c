@@ -117,6 +117,7 @@ static void resp_free_internal(resp_object *o) {
 
 void resp_free(resp_object *o) {
   resp_free_internal(o);
+  free(o);
 }
 
 resp_object *resp_deep_copy(const resp_object *o) {
