@@ -59,7 +59,7 @@ pt_task_t *appmodule_pt_add(pt_task_fn func, void *udata) {
   task->read_fds = NULL;
   task->read_fds_count = 0;
   task->maxfd = -1;
-  task->state = PT_WAITING;
+  task->is_active = PT_WAITING;
   task_count++;
 
   return task;
@@ -108,18 +108,19 @@ static void scheduler_run(void) {
     if (n > 0) {
       for (size_t i = 0; i < task_count; i++) {
         pt_task_t *task = &tasks[i];
-        task->state = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
+        task->is_active = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
       }
     } else {
       for (size_t i = 0; i < task_count; i++) {
         pt_task_t *task = &tasks[i];
-        task->state = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
+        task->is_active = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
       }
     }
 
     for (size_t i = 0; i < task_count; ) {
       pt_task_t *task = &tasks[i];
-      if (task->state == PT_EXITED || task->state == PT_ENDED) {
+      /* PT_SCHEDULE returns 0 (false) when protothread is done (PT_EXITED or PT_ENDED) */
+      if (!task->is_active) {
         if (task->read_fds) free(task->read_fds);
         task_count--;
         if (i < task_count) {

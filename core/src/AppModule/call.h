@@ -55,6 +55,9 @@ typedef struct call {
   int                rtp_port_b;      /* local even port for party B      */
   struct sockaddr_in rtp_remote_b;    /* where party B expects RTP        */
 
+  char               rtp_proxy_ip_a[64];   /* IP returned by rtpproxy for party A */
+  char               rtp_proxy_ip_b[64];   /* IP returned by rtpproxy for party B */
+
   int                rtp_sock_a_tcp;  /* TCP socket for party A (if TCP used) */
   int                rtp_sock_b_tcp;  /* TCP socket for party B (if TCP used) */
   int                rtp_tcp_conn_a;  /* Outbound TCP connection to party A */
@@ -110,8 +113,10 @@ call_t *call_first(void);
 /* RTP port allocation */
 
 /* Bind an even UDP port from the configured range.
- * On success, sets *sock and *port. Returns 0 on success, -1 on failure. */
-int call_rtp_alloc_port(struct in_addr local_ip, int port_low, int port_high,
+ * On success, sets *sock and *port. Returns 0 on success, -1 on failure.
+ * If call is provided and rtpproxy returns an IP, stores it in call->rtp_proxy_ip_[ab] */
+int call_rtp_alloc_port(call_t *call, int side_a,
+                        struct in_addr local_ip, int port_low, int port_high,
                         int *sock, int *port);
 
 /* select() integration */

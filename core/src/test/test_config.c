@@ -53,9 +53,11 @@ void test_config_load_basic(void) {
 
   /* Check upbx section. */
   ASSERT_STRING_EQUALS("0.0.0.0:5060", c.listen);
-  ASSERT_EQUALS(10000, c.rtp_port_low);
-  ASSERT_EQUALS(20000, c.rtp_port_high);
   ASSERT_EQUALS(3, c.locality);
+
+  /* Check rtpproxy section defaults. */
+  ASSERT_EQUALS(10000, c.rtpproxy.port_low);
+  ASSERT_EQUALS(20000, c.rtpproxy.port_high);
 
   config_free(&c);
   unlink(path);

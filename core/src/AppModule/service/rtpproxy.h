@@ -7,6 +7,9 @@
  *   - TCP to UDP (phone uses TCP, PBX forwards to UDP)
  *   - UDP to TCP (phone receives TCP)
  *   - TCP to TCP (both use TCP)
+ *
+ * In builtin mode, runs as an RTPP server that accepts commands from
+ * the rtpproxy_client library.
  */
 #ifndef UPBX_RTPPROXY_H
 #define UPBX_RTPPROXY_H
@@ -14,6 +17,7 @@
 #include <stddef.h>
 #include <sys/select.h>
 #include <netinet/in.h>
+#include "common/pt.h"
 
 #define RTP_BUF_SIZE 1520
 
@@ -24,7 +28,7 @@ int rtpproxy_alloc_udp_port(struct in_addr local_ip, int port_low, int port_high
                              int *sock, int *port);
 
 int rtpproxy_alloc_tcp_port(struct in_addr local_ip, int port_low, int port_high,
-                           int *sock, int *port);
+                            int *sock, int *port);
 
 int rtpproxy_connect_tcp(const char *remote_ip, int remote_port);
 
@@ -39,5 +43,10 @@ void rtpproxy_process(fd_set *read_set,
                       int forward_sock_a, int tcp_listen_a, int tcp_conn_a, struct sockaddr_in *remote_a,
                       int forward_sock_b, int tcp_listen_b, int tcp_conn_b, struct sockaddr_in *remote_b,
                       time_t *active_at, unsigned long *pkts_a2b, unsigned long *pkts_b2a);
+
+/* RTPP Server: starts listening on configured URL for builtin mode */
+void rtpproxy_server_set_config(const char *url, int port_low, int port_high);
+int rtpproxy_server_init(void);
+void rtpproxy_server_shutdown(void);
 
 #endif

@@ -1,10 +1,22 @@
 [upbx]
 listen = 0.0.0.0:5060
-rtp_ports = 7000-7099
 daemonize = 0
 # locality = 4
 # emergency = 911
 # emergency = 112
+
+# RTP Proxy configuration
+# mode: "builtin" (default) or "external"
+# url: socket URL for RTPP control protocol
+#   - unix:///path/to/socket   (Unix domain socket)
+#   - cunix:///path/to/socket  (Connection-oriented Unix socket)
+#   - tcp://host:port          (TCP socket, default port 22222)
+#   - udp://host:port          (UDP socket, default port 22222)
+# ports: RTP port range for relay (default 10000-20000)
+[rtpproxy]
+mode = builtin
+url = unix:///var/run/upbx-rtpproxy.sock
+ports = 7000-7099
 
 # [plugin:myplugin]
 # exec = /usr/bin/my-plugin-binary

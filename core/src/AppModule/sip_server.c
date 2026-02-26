@@ -35,7 +35,7 @@
 #include "AppModule/util/sdp_parse.h"
 #include "AppModule/call.h"
 #include "AppModule/registration.h"
-#include "AppModule/rtpproxy.h"
+#include "AppModule/service/rtpproxy.h"
 #include "AppModule/service/api.h"
 #include "AppModule/service/metrics.h"
 
@@ -1223,7 +1223,7 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
   if (use_tcp) {
     struct in_addr bind_any;
     bind_any.s_addr = INADDR_ANY;
-    if (rtpproxy_alloc_tcp_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
+    if (rtpproxy_alloc_tcp_port(bind_any, cfg->rtpproxy.port_low, cfg->rtpproxy.port_high,
                                 &call->rtp_sock_b_tcp, &call->rtp_port_b) != 0) {
       log_warn("RTP: failed to allocate TCP port for extension side");
     }
@@ -1323,12 +1323,14 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
   /* Allocate RTP port pair: one facing caller (A), one facing callee (B). */
   struct in_addr bind_any;
   bind_any.s_addr = INADDR_ANY;
-  if (call_rtp_alloc_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
-                          &call->rtp_sock_a, &call->rtp_port_a) != 0)
-    log_error("RTP: failed to allocate port for party A, call %.32s", call_id_buf);
-  if (call_rtp_alloc_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
-                          &call->rtp_sock_b, &call->rtp_port_b) != 0)
-    log_error("RTP: failed to allocate port for party B, call %.32s", call_id_buf);
+  if (call_rtp_alloc_port(call, 1, bind_any, cfg->rtpproxy.port_low, cfg->rtpproxy.port_high,
+                          &call->rtp_sock_a, &call->rtp_port_a) != 0) {
+    log_warn("RTP: failed to allocate port for party A, call %.32s", call_id_buf);
+  }
+  if (call_rtp_alloc_port(call, 0, bind_any, cfg->rtpproxy.port_low, cfg->rtpproxy.port_high,
+                          &call->rtp_sock_b, &call->rtp_port_b) != 0) {
+    log_warn("RTP: failed to allocate port for party B, call %.32s", call_id_buf);
+  }
 
   log_debug("RTP: relay ports A=%d B=%d for call %.32s",
            call->rtp_port_a, call->rtp_port_b, call_id_buf);
@@ -1524,10 +1526,14 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
     /* Allocate RTP relay ports. */
     struct in_addr bind_any;
     bind_any.s_addr = INADDR_ANY;
-    call_rtp_alloc_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
-                        &call->rtp_sock_a, &call->rtp_port_a);
-    call_rtp_alloc_port(bind_any, cfg->rtp_port_low, cfg->rtp_port_high,
-                        &call->rtp_sock_b, &call->rtp_port_b);
+    if (call_rtp_alloc_port(call, 1, bind_any, cfg->rtpproxy.port_low, cfg->rtpproxy.port_high,
+                            &call->rtp_sock_a, &call->rtp_port_a) != 0) {
+      log_warn("RTP: failed to allocate port for party A, call %.32s", call_id_buf);
+    }
+    if (call_rtp_alloc_port(call, 0, bind_any, cfg->rtpproxy.port_low, cfg->rtpproxy.port_high,
+                            &call->rtp_sock_b, &call->rtp_port_b) != 0) {
+      log_warn("RTP: failed to allocate port for party B, call %.32s", call_id_buf);
+    }
 
     /* Set transport for trunk side (side B) */
     call_set_transport(call, 0, trunk_tcp ? "tcp" : "udp");

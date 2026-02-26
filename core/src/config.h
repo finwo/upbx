@@ -57,13 +57,18 @@ typedef struct {
   size_t user_count;
 } config_api;
 
+typedef struct {
+  char *mode;         /* "builtin" or "external" */
+  char *url;          /* Socket URL: unix://, tcp://, udp:// */
+  int port_low;       /* RTP port range low (default 10000) */
+  int port_high;     /* RTP port range high (default 20000) */
+} config_rtpproxy;
+
 struct upbx_config {
   int locality;       /* 0 = disabled */
   int daemonize;      /* 0 or 1 */
   int cross_group_calls; /* 1 = allow ext-to-ext across groups (default), 0 = block */
   char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
-  int rtp_port_low;   /* RTP relay port range (from rtp_ports low-high; default 10000-20000) */
-  int rtp_port_high;
   char **emergency;   /* Numbers that always route externally (e.g. "911") */
   size_t emergency_count;
   config_plugin *plugins;
@@ -76,6 +81,8 @@ struct upbx_config {
   size_t extension_count;
 
   config_api api;
+
+  config_rtpproxy rtpproxy;
 };
 
 /* Global config instance (set after config_load in daemon) */

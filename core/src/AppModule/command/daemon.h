@@ -16,7 +16,7 @@ typedef struct pt_task {
   int *read_fds;
   int read_fds_count;
   int maxfd;
-  char state;
+  char is_active;
 } pt_task_t;
 
 int pt_task_has_data(pt_task_t *task, int *out_fd);

@@ -17,7 +17,8 @@
 
 #include "common/socket_util.h"
 #include "AppModule/call.h"
-#include "AppModule/rtpproxy.h"
+#include "AppModule/service/rtpproxy.h"
+#include "AppModule/util/rtpproxy_client.h"
 #include "rxi/log.h"
 
 #define RTP_BUF_SIZE 1520
@@ -25,9 +26,6 @@
 /* Linked list of active calls */
 
 static call_t *call_list = NULL;
-
-/* Track last-used port so we rotate through the range. */
-static int prev_port = 0;
 
 /* Pre-remove callback (e.g. for plugin CALL.HANGUP notifications). */
 static call_pre_remove_cb pre_remove_cb = NULL;
@@ -131,37 +129,60 @@ static int bind_udp(struct in_addr ip, int port) {
   return sock;
 }
 
-/* Check if a port is already in use by any call's RTP sockets. */
-static int port_in_use(struct in_addr ip, int port) {
-  for (call_t *c = call_list; c; c = c->next) {
-    if (c->rtp_sock_a > 0 && c->rtp_port_a == port) return 1;
-    if (c->rtp_sock_b > 0 && c->rtp_port_b == port) return 1;
-  }
-  return 0;
-}
-
-int call_rtp_alloc_port(struct in_addr local_ip, int port_low, int port_high,
+int call_rtp_alloc_port(call_t *call, int side_a,
+                        struct in_addr local_ip, int port_low, int port_high,
                         int *sock_out, int *port_out) {
-  int range = port_high - port_low + 1;
-  if (range <= 0) return -1;
-  if (prev_port < port_low || prev_port > port_high)
-    prev_port = port_high;
+  (void)port_low;
+  (void)port_high;
 
-  for (int k = 0; k < range; k++) {
-    int p = (prev_port - port_low + 2 + k) % range + port_low;
-    p &= ~1;  /* force even */
-    if (p < port_low) p += 2;
-    if (p > port_high) continue;
-    if (port_in_use(local_ip, p)) continue;
-
-    int s = bind_udp(local_ip, p);
-    if (s < 0) continue;
-    prev_port  = p;
-    *sock_out  = s;
-    *port_out  = p;
-    return 0;
+  rtpp_client_t *client = rtpproxy_get_client();
+  if (!client) {
+    log_error("call: no rtpproxy available");
+    return -1;
   }
-  return -1;
+
+  static int call_num = 0;
+  char call_id[64];
+  snprintf(call_id, sizeof(call_id), "call-%d", call_num++);
+  
+  int port = 0;
+  char rtp_ip[64] = {0};
+  int r = rtpp_update(client, call_id, "0.0.0.0", 0, call_id, NULL, NULL, &port, rtp_ip, sizeof(rtp_ip));
+  if (r != 0 || port <= 0) {
+    log_error("call: rtpproxy allocation failed");
+    return -1;
+  }
+
+  int s = bind_udp(local_ip, port);
+  if (s < 0) {
+    log_error("call: failed to bind rtpproxy port %d", port);
+    return -1;
+  }
+
+  *sock_out = s;
+  *port_out = port;
+  
+  /* Store the IP to use in SDP */
+  if (call) {
+    char *dest_ip = call->rtp_proxy_ip_a;
+    if (!side_a) dest_ip = call->rtp_proxy_ip_b;
+    
+    if (rtp_ip[0]) {
+      strncpy(dest_ip, rtp_ip, 63);
+    } else {
+      const char *fallback = rtpproxy_get_fallback_ip();
+      if (fallback) {
+        strncpy(dest_ip, fallback, 63);
+      } else {
+        inet_ntop(AF_INET, &local_ip, dest_ip, 64);
+      }
+    }
+    dest_ip[63] = '\0';
+  }
+  
+  log_trace("call: allocated RTP port %d via rtpproxy (ip=%s)", port, 
+            call ? (side_a ? call->rtp_proxy_ip_a : call->rtp_proxy_ip_b) : "n/a");
+  return 0;
 }
 
 /* select() integration */

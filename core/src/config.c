@@ -191,14 +191,6 @@ static int handler(void *user, const char *section, const char *name, const char
       cfg->listen = STRDUP(val);
       return 1;
     }
-    if (strcmp(key, "rtp_ports") == 0) {
-      int low = 0, high = 0;
-      if (sscanf(val, "%d-%d", &low, &high) == 2 && low > 0 && high >= low) {
-        cfg->rtp_port_low = low;
-        cfg->rtp_port_high = high;
-      }
-      return 1;
-    }
     if (strcmp(key, "cross_group_calls") == 0) {
       cfg->cross_group_calls = (atoi(val) != 0) ? 1 : 0;
       return 1;
@@ -362,6 +354,29 @@ static int handler(void *user, const char *section, const char *name, const char
     return 1;
   }
 
+  if (strcmp(sec, "rtpproxy") == 0) {
+    if (strcmp(key, "mode") == 0) {
+      free(cfg->rtpproxy.mode);
+      cfg->rtpproxy.mode = STRDUP(val);
+      return 1;
+    }
+    if (strcmp(key, "url") == 0) {
+      free(cfg->rtpproxy.url);
+      cfg->rtpproxy.url = STRDUP(val);
+      return 1;
+    }
+    if (strcmp(key, "ports") == 0) {
+      int low = 0, high = 0;
+      if (sscanf(val, "%d-%d", &low, &high) == 2 && low > 0 && high >= low) {
+        cfg->rtpproxy.port_low = low;
+        cfg->rtpproxy.port_high = high;
+      }
+      return 1;
+    }
+    log_warn("config line %d: unknown key '%s' in section '%s'", lineno, key, sec);
+    return 1;
+  }
+
   if (PREFIX_MATCH(sec, "ext:")) {
     config_extension *e = find_or_add_extension(cfg, SECTION_TAIL(sec, "ext:"));
     if (!e) { set_last_parse_error(sec, key); return 0; }
@@ -385,8 +400,8 @@ static int handler(void *user, const char *section, const char *name, const char
 
 void config_init(upbx_config *cfg) {
   memset(cfg, 0, sizeof(*cfg));
-  cfg->rtp_port_low = 10000;
-  cfg->rtp_port_high = 20000;
+  cfg->rtpproxy.port_low = 10000;
+  cfg->rtpproxy.port_high = 20000;
   cfg->cross_group_calls = 1;
 }
 
@@ -450,6 +465,9 @@ void config_free(upbx_config *cfg) {
     free(u->permits);
   }
   free(cfg->api.users);
+
+  free(cfg->rtpproxy.mode);
+  free(cfg->rtpproxy.url);
 
   config_init(cfg);
 }
