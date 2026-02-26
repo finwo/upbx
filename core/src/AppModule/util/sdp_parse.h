@@ -33,10 +33,12 @@ int sdp_rewrite_addr(const char *body, size_t body_len,
                      const char *new_ip, int new_port,
                      char *out, size_t out_cap);
 
-/* Rewrite SDP body with transport (TCP/UDP). Adds RTP/AVP/TCP and a=setup:active for TCP.
- * use_tcp: 1 = use TCP, 0 = use UDP */
+/* Rewrite SDP body with transport (TCP/UDP) and optional direction attribute.
+ * use_tcp: 1 = use TCP, 0 = use UDP
+ * direction: 0 = none, 1 = sendonly, 2 = recvonly, 3 = sendrecv */
 int sdp_rewrite_addr_with_transport(const char *body, size_t body_len,
                                     const char *new_ip, int new_port, int use_tcp,
+                                    int direction,
                                     char *out, size_t out_cap);
 
 #endif

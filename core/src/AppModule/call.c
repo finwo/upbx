@@ -127,12 +127,15 @@ int call_rtpproxy_session_create(call_t *call, int side_caller,
 
   int port = 0;
   char rtp_ip[64] = {0};
+  log_trace("rtpproxy: creating session call=%.32s caller_tag=%.32s callee_tag=%.32s",
+            call->call_id, call->rtp_session_caller, call->rtp_session_callee);
   int r = rtpp_update(client, call->call_id, "0.0.0.0", 0,
                       call->rtp_session_caller[0] ? call->rtp_session_caller : call->call_id,
                       call->rtp_session_callee[0] ? call->rtp_session_callee : NULL,
                       NULL, &port, rtp_ip, sizeof(rtp_ip));
+  log_trace("rtpproxy: rtpp_update returned r=%d port=%d rtp_ip=%.32s", r, port, rtp_ip);
   if (r != 0 || port <= 0) {
-    log_error("call: rtpproxy session create failed");
+    log_error("call: rtpproxy session create failed (r=%d, port=%d)", r, port);
     return -1;
   }
 

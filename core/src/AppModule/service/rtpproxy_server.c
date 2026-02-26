@@ -262,6 +262,12 @@ static PT_THREAD(rtpproxy_init_fn(struct pt *pt, int64_t timestamp, struct pt_ta
   rtpproxy_server_running = 1;
   log_info("rtpproxy: builtin listening on %s", url);
 
+  if (rtpproxy_client_global_init() < 0) {
+    log_fatal("rtpproxy: failed to initialize client for builtin - FATAL");
+    _exit(1);
+  }
+  log_info("rtpproxy: client initialized for builtin mode");
+
   PT_END(pt);
 }
 

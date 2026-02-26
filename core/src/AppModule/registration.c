@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 #include <sys/select.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "rxi/log.h"
 #include "common/pt.h"
@@ -41,6 +43,7 @@ int  registration_is_notify_pending(void)    { return reg_list_notify_pending; }
 
 void registration_update(char *number, char *uri_user, const char *trunk_name,
     char *contact, const char *learned_host, const char *learned_port,
+    const char *src_host, const char *src_port,
     char *plugin_data, const char *transport) {
   log_trace("%s: number=%s", __func__, number ? number : "(null)");
 
@@ -67,6 +70,14 @@ void registration_update(char *number, char *uri_user, const char *trunk_name,
         reg_list[i].learned_port[sizeof(reg_list[i].learned_port) - 1] = '\0';
       } else {
         reg_list[i].learned_host[0] = '\0';
+      }
+      if (src_host && src_host[0]) {
+        memset(&reg_list[i].remote_addr, 0, sizeof(reg_list[i].remote_addr));
+        reg_list[i].remote_addr.sin_family = AF_INET;
+        inet_pton(AF_INET, src_host, &reg_list[i].remote_addr.sin_addr);
+        if (src_port && src_port[0]) {
+          reg_list[i].remote_addr.sin_port = htons((uint16_t)atoi(src_port));
+        }
       }
       if (transport && strcasecmp(transport, "tcp") == 0) {
         memcpy(reg_list[i].transport, "tcp", 3);
@@ -107,6 +118,14 @@ void registration_update(char *number, char *uri_user, const char *trunk_name,
     reg_list[reg_count].learned_port[sizeof(reg_list[reg_count].learned_port) - 1] = '\0';
   } else {
     reg_list[reg_count].learned_host[0] = '\0';
+  }
+  if (src_host && src_host[0]) {
+    memset(&reg_list[reg_count].remote_addr, 0, sizeof(reg_list[reg_count].remote_addr));
+    reg_list[reg_count].remote_addr.sin_family = AF_INET;
+    inet_pton(AF_INET, src_host, &reg_list[reg_count].remote_addr.sin_addr);
+    if (src_port && src_port[0]) {
+      reg_list[reg_count].remote_addr.sin_port = htons((uint16_t)atoi(src_port));
+    }
   }
   reg_list[reg_count].plugin_data = plugin_data;
   reg_list[reg_count].expires = time(NULL) + DEFAULT_EXPIRES;
@@ -197,6 +216,18 @@ void registration_set_tcp_sock(ext_reg_t *reg, int sock) {
 int registration_get_tcp_sock(const ext_reg_t *reg) {
   if (!reg || strcmp(reg->transport, "tcp") != 0) return -1;
   return reg->tcp_sock;
+}
+
+ext_reg_t *registration_get_by_tcp_sock(int sockfd) {
+  if (sockfd <= 0) return NULL;
+  time_t now = time(NULL);
+  for (size_t i = 0; i < reg_count; i++) {
+    if (reg_list[i].expires <= now) continue;
+    if (reg_list[i].tcp_sock > 0 && reg_list[i].tcp_sock == sockfd) {
+      return &reg_list[i];
+    }
+  }
+  return NULL;
 }
 
 int registration_fill_tcp_fds(fd_set *read_set, int *maxfd) {

@@ -11,6 +11,7 @@
 #include <time.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <netinet/in.h>
 #include "common/pt.h"
 
 struct pt_task;
@@ -20,8 +21,9 @@ typedef struct {
   char *uri_user;     /* Original username from REGISTER (e.g. "206%40finwo") */
   char *trunk_name;
   char *contact;
-  char learned_host[256];
+  char learned_host[256];   /* What client put in Contact header (for SDP rewriting) */
   char learned_port[32];
+  struct sockaddr_in remote_addr;   /* Actual remote address we received REGISTER from (for verification) */
   char *plugin_data;  /* Optional custom data from plugin ALLOW */
   char transport[4];  /* "udp" or "tcp", default "udp" */
   int tcp_sock;       /* TCP socket for persistent connection (valid only if transport is "tcp") */
@@ -36,10 +38,12 @@ void registration_clear_notify_pending(void);
 int  registration_is_notify_pending(void);
 
 /* Add or update a registration. Takes ownership of all string arguments (caller must not free).
- * learned_host and learned_port are copied (not transferred).
+ * learned_host/learned_port: what client put in Contact header (for SDP rewriting).
+ * src_host/src_port: actual source IP:port we received REGISTER from (for security verification).
  * transport is "udp" or "tcp", can be NULL (defaults to "udp"). */
 void registration_update(char *number, char *uri_user, const char *trunk_name,
     char *contact, const char *learned_host, const char *learned_port,
+    const char *src_host, const char *src_port,
     char *plugin_data, const char *transport);
 
 /* Find one registration by trunk and number. Returns NULL if not found or expired. */
@@ -67,6 +71,9 @@ void registration_set_tcp_sock(ext_reg_t *reg, int sock);
 
 /* Get TCP socket for a registration. Returns -1 if not a TCP registration. */
 int registration_get_tcp_sock(const ext_reg_t *reg);
+
+/* Find registration by TCP socket (returns NULL if not found). */
+ext_reg_t *registration_get_by_tcp_sock(int sockfd);
 
 /* Fill TCP sockets from all active registrations into fd_set and update maxfd.
  * Returns count of TCP sockets added. */

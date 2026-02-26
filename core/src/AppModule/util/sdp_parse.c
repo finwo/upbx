@@ -161,15 +161,17 @@ int sdp_rewrite_addr(const char *body, size_t body_len,
   return (int)used;
 }
 
-/* Rewrite SDP with transport (TCP/UDP) */
+/* Rewrite SDP with transport (TCP/UDP) and optional direction attribute */
 
 int sdp_rewrite_addr_with_transport(const char *body, size_t body_len,
                                     const char *new_ip, int new_port, int use_tcp,
+                                    int direction,
                                     char *out, size_t out_cap) {
   const char *p = body, *end = body + body_len;
   size_t used = 0;
   int port_rewritten = 0;
   int setup_added = 0;
+  int direction_added = 0;
 
   #define APPEND(src, n) do { \
     if (used + (n) > out_cap) return -1; \
@@ -235,6 +237,34 @@ int sdp_rewrite_addr_with_transport(const char *body, size_t body_len,
         /* Add a=setup:active */
         APPEND("a=setup:active\r\n", 16);
         setup_added = 1;
+        continue;
+      }
+      continue;
+    }
+    /* Add direction attribute after media lines when requested */
+    else if (direction && !direction_added && ll >= 2 && ls[0] == 'm' && ls[1] != '=') {
+      /* Copy current line first */
+      APPEND(ls, ll);
+      p = le;
+      if (p < end && *p == '\r') { APPEND(p, 1); p++; }
+      if (p < end && *p == '\n') { APPEND(p, 1); p++; }
+      /* Check if next line starts with 'a=' */
+      const char *next = p;
+      while (next < end && (*next == ' ' || *next == '\t' || *next == '\r' || *next == '\n')) {
+        if (*next == '\r' || *next == '\n') break;
+        next++;
+      }
+      if (next < end && *next != 'a') {
+        /* Add direction attribute */
+        const char *dir_str = "";
+        if (direction == 1) dir_str = "a=sendonly\r\n";
+        else if (direction == 2) dir_str = "a=recvonly\r\n";
+        else if (direction == 3) dir_str = "a=sendrecv\r\n";
+        size_t dir_len = strlen(dir_str);
+        if (used + dir_len >= out_cap) return -1;
+        memcpy(out + used, dir_str, dir_len);
+        used += dir_len;
+        direction_added = 1;
         continue;
       }
       continue;

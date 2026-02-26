@@ -46,6 +46,7 @@ typedef struct sip_tcp_connection {
   int fd;
   char peer_str[64];
   time_t last_keepalive;
+  time_t created;        /* Time when connection was created */
 } sip_tcp_connection_t;
 
 static char *auth_generate_nonce(void) {
@@ -842,8 +843,18 @@ static void handle_register(const char *req_buf, size_t req_len, upbx_config *cf
     log_info("REGISTER: extension %s registered on trunk %s", extension_num, trunk_name_str);
   else
     log_info("REGISTER: extension %s registered (no trunk)", extension_num);
+
+  /* Get source address for security tracking */
+  char src_host[64] = {0};
+  char src_port[16] = {0};
+  struct sockaddr_in *sin = (struct sockaddr_in *)&ctx->peer;
+  if (ctx->peerlen >= sizeof(struct sockaddr_in) && ctx->peer.ss_family == AF_INET) {
+    inet_ntop(AF_INET, &sin->sin_addr, src_host, sizeof(src_host));
+    snprintf(src_port, sizeof(src_port), "%d", ntohs(sin->sin_port));
+  }
+
   char *contact_val = get_contact_value(req_buf, req_len);
-  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", NULL, ctx->is_tcp ? "tcp" : "udp");
+  registration_update(extension_num, raw_uri_user, trunk_name_str, contact_val, h, p[0] ? p : "5060", src_host, src_port, NULL, ctx->is_tcp ? "tcp" : "udp");
   /* Store TCP socket on registration if this is a TCP connection.
    * Use NULL trunk_name to find any registration with this number (handles transport switch). */
   if (ctx->is_tcp && ctx->sockfd > 0) {
@@ -1220,7 +1231,8 @@ static int send_fork_invite_to_ext(call_t *call, upbx_config *cfg,
       }
       sdp_host[sizeof(sdp_host) - 1] = '\0';
       char new_sdp[4096];
-      int sdp_len = sdp_rewrite_addr_with_transport(cur_body, cur_body_len, sdp_host, call->rtp_port_callee, use_tcp, new_sdp, sizeof(new_sdp));
+      /* Force callee to send first RTP to punch NAT */
+      int sdp_len = sdp_rewrite_addr_with_transport(cur_body, cur_body_len, sdp_host, call->rtp_port_callee, use_tcp, 1, new_sdp, sizeof(new_sdp));
       if (sdp_len > 0) {
         int new_len = sip_rewrite_body(tmp3, (size_t)cur_len, new_sdp, (size_t)sdp_len, tmp1, sizeof(tmp1));
         if (new_len >= 0) { memcpy(tmp3, tmp1, (size_t)new_len); cur_len = new_len; }
@@ -1331,14 +1343,23 @@ static void fork_invite_to_extension_regs(upbx_config *cfg, const char *req_buf,
   }
 
   /* Create rtpproxy sessions: one for caller side, one for callee side. */
+  /* ALL CALLS MUST GO THROUGH RTPPROXY - never allow direct phone-to-phone */
   char caller_tag[64], callee_tag[64];
   snprintf(caller_tag, sizeof(caller_tag), "caller-%.32s", call_id_buf);
   snprintf(callee_tag, sizeof(callee_tag), "callee-%.32s", call_id_buf);
+  int rtp_failed = 0;
   if (call_rtpproxy_session_create(call, 1, caller_tag, callee_tag) != 0) {
-    log_warn("RTP: failed to create session for caller side, call %.32s", call_id_buf);
+    log_error("RTP: failed to create session for caller side, call %.32s - REJECTING", call_id_buf);
+    rtp_failed = 1;
   }
   if (call_rtpproxy_session_create(call, 0, callee_tag, caller_tag) != 0) {
-    log_warn("RTP: failed to create session for callee side, call %.32s", call_id_buf);
+    log_error("RTP: failed to create session for callee side, call %.32s - REJECTING", call_id_buf);
+    rtp_failed = 1;
+  }
+  if (rtp_failed) {
+    call_remove(call);
+    send_reply(ctx, req_buf, req_len, 503, 0, 0);
+    return;
   }
 
   log_debug("RTP: ports caller=%d callee=%d for call %.32s",
@@ -1598,7 +1619,9 @@ static void handle_invite_outgoing(upbx_config *cfg, const char *buf, size_t len
           }
           sdp_host[sizeof(sdp_host) - 1] = '\0';
           char new_sdp[4096];
-          int sdp_len = sdp_rewrite_addr_with_transport(sb, sbl, sdp_host, call->rtp_port_caller, trunk_tcp, new_sdp, sizeof(new_sdp));
+          /* PBX is trunk's bitch - use trunk's SDP transport, not extension's transport */
+          int use_trunk_tcp = call->trunk_sdp_is_tcp ? 1 : (trunk_tcp ? 1 : 0);
+          int sdp_len = sdp_rewrite_addr_with_transport(sb, sbl, sdp_host, call->rtp_port_caller, use_trunk_tcp, 0, new_sdp, sizeof(new_sdp));
           if (sdp_len > 0) {
             int new_len = sip_rewrite_body(t1, (size_t)cur_len, new_sdp, (size_t)sdp_len, t2, sizeof(t2));
             if (new_len > 0) { memcpy(t1, t2, (size_t)new_len); cur_len = new_len; }
@@ -1667,13 +1690,62 @@ static void handle_invite(upbx_config *cfg, const char *buf, size_t len, sip_sen
   const char *call_id = call_id_buf;
   log_trace("handle_invite: To=%s From=%s Call-ID=%.32s", to_user[0] ? to_user : "(null)", from_user[0] ? from_user : "(null)", call_id);
 
-  /* 1. From a known extension */
+  /* 1. From a known extension - verify CALLER is registered (security) */
   int from_ext_configured = 0;
   if (from_ext[0]) {
     resp_object *s = get_extension_section(from_ext, NULL, 0);
     if (s) { from_ext_configured = 1; resp_free(s); }
   }
   if (from_ext_configured) {
+    /* Security: verify caller has valid registration that matches source (IP for UDP, socket for TCP) */
+    int is_tcp = ctx->is_tcp;
+    int sockfd = ctx->sockfd;
+    
+    /* For TCP, verify the connection is registered */
+    if (is_tcp) {
+      ext_reg_t *reg_by_sock = registration_get_by_tcp_sock(sockfd);
+      log_debug("TCP security: sockfd=%d reg_by_sock=%p number=%s from_ext=%s", 
+                sockfd, reg_by_sock, reg_by_sock ? reg_by_sock->number : "(null)", from_ext);
+      if (!reg_by_sock) {
+        log_warn("INVITE rejected: TCP socket %d has no registration, challenging with 401", sockfd);
+        send_reply(ctx, buf, len, 401, 0, 0);
+        return;
+      }
+      if (strcmp(reg_by_sock->number, from_ext) != 0) {
+        log_warn("INVITE rejected: TCP socket %d registered as %s but call from %s", 
+                 sockfd, reg_by_sock->number, from_ext);
+        send_reply(ctx, buf, len, 403, 0, 0);
+        return;
+      }
+    } else {
+      /* For UDP, verify source IP:port matches remote_addr where we received REGISTER from */
+      ext_reg_t **caller_regs = NULL;
+      size_t n_caller_regs = registration_get_regs(NULL, from_ext, &caller_regs);
+      if (n_caller_regs == 0 || !caller_regs) {
+        log_warn("INVITE rejected: caller %s not registered", from_ext);
+        send_reply(ctx, buf, len, 403, 0, 0);
+        return;
+      }
+      struct sockaddr_in *sin = (struct sockaddr_in *)&ctx->peer;
+      int ip_port_matched = 0;
+      for (size_t i = 0; i < n_caller_regs && !ip_port_matched; i++) {
+        if (caller_regs[i]->remote_addr.sin_family == AF_INET &&
+            caller_regs[i]->remote_addr.sin_addr.s_addr == sin->sin_addr.s_addr &&
+            caller_regs[i]->remote_addr.sin_port == sin->sin_port) {
+          ip_port_matched = 1;
+        }
+      }
+      free(caller_regs);
+      if (!ip_port_matched) {
+        char src_host[64] = {0};
+        if (ctx->peerlen >= sizeof(struct sockaddr_in) && ctx->peer.ss_family == AF_INET) {
+          inet_ntop(AF_INET, &sin->sin_addr, src_host, sizeof(src_host));
+        }
+        log_warn("INVITE rejected: caller %s not registered from %s", from_ext, src_host);
+        send_reply(ctx, buf, len, 403, 0, 0);
+        return;
+      }
+    }
     char *ext_num = strdup(from_ext);
     if (!ext_num) {
       send_reply(ctx, buf, len, 503, 0, 0);
@@ -2098,7 +2170,8 @@ static void handle_sip_response(upbx_config *cfg, const char *buf, size_t len, s
         sdp_host[sizeof(sdp_host) - 1] = '\0';
         char new_sdp[4096];
         int use_tcp = (call->transport_caller[0] && strcmp(call->transport_caller, "tcp") == 0);
-        int sdp_len = sdp_rewrite_addr_with_transport(resp_body, resp_body_len, sdp_host, call->rtp_port_caller, use_tcp, new_sdp, sizeof(new_sdp));
+        /* Force caller to send first RTP to punch NAT, then receive from rtpproxy */
+        int sdp_len = sdp_rewrite_addr_with_transport(resp_body, resp_body_len, sdp_host, call->rtp_port_caller, use_tcp, 1, new_sdp, sizeof(new_sdp));
         if (sdp_len > 0) {
           int new_len = sip_rewrite_body(tmp1, (size_t)cur_len, new_sdp, (size_t)sdp_len, tmp2, sizeof(tmp2));
           if (new_len > 0) {
@@ -2267,6 +2340,16 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
     cid[0] = '\0';
     sip_header_copy(buf, len, "Call-ID", cid, sizeof(cid));
     call_t *c = call_find(cid);
+    /* Security: verify source is party A or B */
+    if (c) {
+      int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+      int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+      if (!from_a && !from_b) {
+        log_warn("ACK rejected: source not party in call %.32s", cid);
+        send_reply(&ctx, buf, len, 403, 0, 0);
+        return;
+      }
+    }
     if (c && c->answered && c->b.sip_len > 0) {
       /* Forward ACK to callee with Request-URI rewritten and our Via prepended. */
       char via_host[256], via_port[32];
@@ -2303,11 +2386,17 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
     sip_header_copy(buf, len, "Call-ID", cid, sizeof(cid));
     call_t *c = call_find(cid);
     if (c) {
+      /* Security: verify source is party A or B */
+      int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+      int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+      if (!from_a && !from_b) {
+        log_warn("BYE rejected: source not party in call %.32s", cid);
+        send_reply(&ctx, buf, len, 403, 0, 0);
+        return;
+      }
       /* Determine who sent the BYE and forward to the other side. */
-      int from_a = sockaddr_match(&ctx.peer, ctx.peerlen,
-                                  (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
-      struct sockaddr_storage *fwd_addr;
-      socklen_t fwd_len;
+      struct sockaddr_storage *fwd_addr = NULL;
+      socklen_t fwd_len = 0;
       if (from_a && c->b.sip_len > 0) {
         fwd_addr = &c->b.sip_addr;
         fwd_len  = c->b.sip_len;
@@ -2345,6 +2434,16 @@ static void handle_udp_msg(upbx_config *cfg, udp_msg_t *msg, int sockfd) {
     cid[0] = '\0';
     sip_header_copy(buf, len, "Call-ID", cid, sizeof(cid));
     call_t *c = call_find(cid);
+    /* Security: verify source is party A or B */
+    if (c) {
+      int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+      int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+      if (!from_a && !from_b) {
+        log_warn("CANCEL rejected: source not party in call %.32s", cid);
+        send_reply(&ctx, buf, len, 403, 0, 0);
+        return;
+      }
+    }
     /* Reply 200 OK to the CANCEL. */
     send_reply(&ctx, buf, len, 200, 0, 0);
     if (c && !c->answered) {
@@ -2548,6 +2647,7 @@ static void spawn_tcp_client(int client_fd, const char *peer_str) {
   strncpy(state->peer_str, peer_str, sizeof(state->peer_str) - 1);
   state->peer_str[sizeof(state->peer_str) - 1] = '\0';
   state->last_keepalive = time(NULL);
+  state->created = time(NULL);
   appmodule_pt_add(sip_tcp_client_pt, state);
   log_trace("TCP client: accepted %s, spawned client pt", peer_str);
 }
@@ -2619,18 +2719,52 @@ PT_THREAD(sip_tcp_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *ta
   task->read_fds_count = 1;
 
   int keepalive_interval = global_cfg->tcp_keepalive_interval > 0 ? global_cfg->tcp_keepalive_interval : 30;
+  #define TCP_UNREGISTERED_TIMEOUT 10
 
   for (;;) {
     int ready_fd = -1;
-    time_t now = 0;
+    time_t now = time(NULL);
+    ext_reg_t *reg = registration_get_by_tcp_sock(state->fd);
+
+    /* Close connection if open >10s without registration */
+    int age = (int)(now - state->created);
+    if (!reg && state->fd >= 0 && age > TCP_UNREGISTERED_TIMEOUT) {
+      log_debug("TCP: closing unregistered connection %s (age=%d > %ds), fd=%d", 
+                state->peer_str, age, TCP_UNREGISTERED_TIMEOUT, state->fd);
+      close(state->fd);
+      state->fd = -1;
+      free(state);
+      PT_EXIT(pt);
+    }
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
     PT_WAIT_UNTIL(pt,
       (now = time(NULL)) &&
       (pt_task_has_data(task, &ready_fd) == 0 ||
-      (now - state->last_keepalive) >= (time_t)keepalive_interval));
+      (now - state->last_keepalive) >= (time_t)keepalive_interval ||
+      (!reg && (now - state->created) > TCP_UNREGISTERED_TIMEOUT)));
 #pragma GCC diagnostic pop
+
+    /* After waking up, re-check registration in case it was registered while we were waiting */
+    if (state->fd < 0) {
+      free(state);
+      PT_EXIT(pt);
+    }
+    reg = registration_get_by_tcp_sock(state->fd);
+    if (!reg && state->fd >= 0 && time(NULL) - state->created > TCP_UNREGISTERED_TIMEOUT) {
+      log_debug("TCP: closing unregistered connection %s after %ds (post-wait)", 
+                state->peer_str, TCP_UNREGISTERED_TIMEOUT);
+      close(state->fd);
+      state->fd = -1;
+      free(state);
+      PT_EXIT(pt);
+    }
+
+    if (state->fd < 0) {
+      free(state);
+      PT_EXIT(pt);
+    }
 
     if (now - state->last_keepalive >= (time_t)keepalive_interval) {
       const char *crlf = "\r\n";
@@ -2670,23 +2804,31 @@ PT_THREAD(sip_tcp_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *ta
                 cid[0] = '\0';
                 sip_header_copy(buf, (size_t)n, "Call-ID", cid, sizeof(cid));
                 call_t *c = call_find(cid);
-                if (c && c->answered && c->b.sip_len > 0) {
-                  char via_host[256], via_port[32];
-                  if (get_advertise_addr(global_cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
-                    char t1[SIP_READ_BUF_SIZE], t2[SIP_READ_BUF_SIZE];
-                    int clen = (int)n;
-                    memcpy(t1, buf, (size_t)n);
-                    char req_uri[256];
-                    if (fork_uri_from_addr(&c->b.sip_addr, c->b.id, req_uri, sizeof(req_uri)) == 0) {
-                      int rw = sip_rewrite_request_uri(t1, (size_t)clen, req_uri, t2, sizeof(t2));
-                      if (rw > 0) { memcpy(t1, t2, (size_t)rw); clen = rw; }
-                    }
-                    char via_val[256];
-                    sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
-                    int plen = sip_prepend_via(t1, (size_t)clen, via_val, t2, sizeof(t2));
-                    if (plen > 0) {
-                      log_debug("SIP TCP: forwarding ACK to callee for call %.32s", cid);
-                      send(state->fd, t2, (size_t)plen, 0);
+                /* Security: verify source is party A or B */
+                if (c) {
+                  int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+                  int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+                  if (!from_a && !from_b) {
+                    log_warn("ACK rejected: source not party in call %.32s", cid);
+                    send_reply(&ctx, buf, (size_t)n, 403, 0, 0);
+                  } else if (c->answered && c->b.sip_len > 0) {
+                    char via_host[256], via_port[32];
+                    if (get_advertise_addr(global_cfg, via_host, sizeof(via_host), via_port, sizeof(via_port)) == 0) {
+                      char t1[SIP_READ_BUF_SIZE], t2[SIP_READ_BUF_SIZE];
+                      int clen = (int)n;
+                      memcpy(t1, buf, (size_t)n);
+                      char req_uri[256];
+                      if (fork_uri_from_addr(&c->b.sip_addr, c->b.id, req_uri, sizeof(req_uri)) == 0) {
+                        int rw = sip_rewrite_request_uri(t1, (size_t)clen, req_uri, t2, sizeof(t2));
+                        if (rw > 0) { memcpy(t1, t2, (size_t)rw); clen = rw; }
+                      }
+                      char via_val[256];
+                      sip_make_via_line(via_host, via_port, via_val, sizeof(via_val));
+                      int plen = sip_prepend_via(t1, (size_t)clen, via_val, t2, sizeof(t2));
+                      if (plen > 0) {
+                        log_debug("SIP TCP: forwarding ACK to callee for call %.32s", cid);
+                        send(state->fd, t2, (size_t)plen, 0);
+                      }
                     }
                   }
                 }
@@ -2696,18 +2838,36 @@ PT_THREAD(sip_tcp_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *ta
                 sip_header_copy(buf, (size_t)n, "Call-ID", cid, sizeof(cid));
                 call_t *c = call_find(cid);
                 if (c) {
-                  send_reply(&ctx, buf, (size_t)n, 200, 0, 0);
-                  call_remove(c);
+                  int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+                  int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+                  if (!from_a && !from_b) {
+                    log_warn("BYE rejected: source not party in call %.32s", cid);
+                    send_reply(&ctx, buf, (size_t)n, 403, 0, 0);
+                  } else {
+                    send_reply(&ctx, buf, (size_t)n, 200, 0, 0);
+                    call_remove(c);
+                  }
                 }
               } else if (method_len == 6 && strncasecmp(method, "CANCEL", 6) == 0) {
                 char cid[CALL_ID_MAX];
                 cid[0] = '\0';
                 sip_header_copy(buf, (size_t)n, "Call-ID", cid, sizeof(cid));
                 call_t *c = call_find(cid);
-                send_reply(&ctx, buf, (size_t)n, 200, 0, 0);
-                if (c && !c->answered) {
-                  cancel_active_forks(c, state->fd);
-                  c->cancelling = 1;
+                if (c) {
+                  int from_a = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->a.sip_addr, c->a.sip_len);
+                  int from_b = sockaddr_match(&ctx.peer, ctx.peerlen, (struct sockaddr_storage *)&c->b.sip_addr, c->b.sip_len);
+                  if (!from_a && !from_b) {
+                    log_warn("CANCEL rejected: source not party in call %.32s", cid);
+                    send_reply(&ctx, buf, (size_t)n, 403, 0, 0);
+                  } else {
+                    send_reply(&ctx, buf, (size_t)n, 200, 0, 0);
+                    if (!c->answered) {
+                      cancel_active_forks(c, state->fd);
+                      c->cancelling = 1;
+                    }
+                  }
+                } else {
+                  send_reply(&ctx, buf, (size_t)n, 200, 0, 0);
                 }
               } else {
                 send_reply(&ctx, buf, (size_t)n, 501, 0, 0);
