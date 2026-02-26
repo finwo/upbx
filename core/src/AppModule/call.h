@@ -18,7 +18,8 @@ typedef struct {
   char                  *tag;         /* From-tag (party A) or To-tag (B) */
 } call_party_t;
 
-/* Unified call state: SIP session + RTP relay. */
+/* Unified call state: SIP session + RTP proxy sessions.
+ * PBX communicates with rtpproxy via control protocol only - no RTP relay in PBX. */
 typedef struct call {
   struct call *next;
   char         call_id[CALL_ID_MAX];
@@ -44,26 +45,16 @@ typedef struct call {
   char                  *pending_exts[CALL_MAX_FORKS];
   size_t                 n_pending_exts;
 
-  /* RTP relay: one socket facing each party.
-   * Receive on rtp_sock_a → sendto(rtp_remote_b)
-   * Receive on rtp_sock_b → sendto(rtp_remote_a) */
-  int                rtp_sock_a;      /* bound UDP socket facing party A  */
-  int                rtp_port_a;      /* local even port for party A      */
-  struct sockaddr_in rtp_remote_a;    /* where party A expects RTP        */
-
-  int                rtp_sock_b;      /* bound UDP socket facing party B  */
-  int                rtp_port_b;      /* local even port for party B      */
-  struct sockaddr_in rtp_remote_b;    /* where party B expects RTP        */
-
-  char               rtp_proxy_ip_a[64];   /* IP returned by rtpproxy for party A */
-  char               rtp_proxy_ip_b[64];   /* IP returned by rtpproxy for party B */
-
-  int                rtp_sock_a_tcp;  /* TCP socket for party A (if TCP used) */
-  int                rtp_sock_b_tcp;  /* TCP socket for party B (if TCP used) */
-  int                rtp_tcp_conn_a;  /* Outbound TCP connection to party A */
-  int                rtp_tcp_conn_b;  /* Outbound TCP connection to party B */
-  char               transport_a[4];   /* "udp" or "tcp" for party A */
-  char               transport_b[4];   /* "udp" or "tcp" for party B */
+  /* rtpproxy session info (for SDP and session management).
+   * PBX talks to rtpproxy via control protocol - these store session state. */
+  char               rtp_proxy_ip_caller[64];   /* IP from rtpproxy for caller side SDP */
+  char               rtp_proxy_ip_callee[64];   /* IP from rtpproxy for callee side SDP */
+  int                rtp_port_caller;           /* port from rtpproxy for caller side SDP */
+  int                rtp_port_callee;           /* port from rtpproxy for callee side SDP */
+  char               rtp_session_caller[64];    /* session handle from rtpproxy (from_tag) */
+  char               rtp_session_callee[64];    /* session handle from rtpproxy (to_tag) */
+  char               transport_caller[4];       /* "udp" or "tcp" for caller */
+  char               transport_callee[4];       /* "udp" or "tcp" for callee */
 
   /* SIP state */
   int           sockfd;               /* UDP socket used for SIP sending  */
@@ -71,10 +62,6 @@ typedef struct call {
   int           cancelling;            /* CANCEL sent to forks, awaiting 487 */
   time_t        created_at;
   time_t        answered_at;
-  time_t        rtp_active_at;        /* last RTP forwarded (for aging)   */
-  unsigned long rtp_pkts_a2b;         /* packets relayed caller→callee    */
-  unsigned long rtp_pkts_b2a;         /* packets relayed callee→caller    */
-  time_t        rtp_log_at;           /* last time we logged RTP stats    */
 
   char         *original_invite;      /* stored for ACK/BYE generation    */
   size_t        original_invite_len;
@@ -104,36 +91,30 @@ call_t *call_create(const char *call_id);
 /* Find a call by Call-ID. Returns NULL if not found. */
 call_t *call_find(const char *call_id);
 
-/* Remove a call: close RTP sockets, free strings, unlink from list. */
+/* Remove a call: cleanup rtpproxy sessions, free strings, unlink from list. */
 void call_remove(call_t *call);
 
 /* Return the head of the call list (for iteration). */
 call_t *call_first(void);
 
-/* RTP port allocation */
+/* rtpproxy session management (via control protocol) */
 
-/* Bind an even UDP port from the configured range.
- * On success, sets *sock and *port. Returns 0 on success, -1 on failure.
- * If call is provided and rtpproxy returns an IP, stores it in call->rtp_proxy_ip_[ab] */
-int call_rtp_alloc_port(call_t *call, int side_a,
-                        struct in_addr local_ip, int port_low, int port_high,
-                        int *sock, int *port);
+/* Create an rtpproxy session for one side of a call.
+ * Calls rtpp_update() via rtpproxy_client to create session.
+ * On success: stores session handle, proxy IP, port in call struct.
+ * Returns 0 on success, -1 on failure. */
+int call_rtpproxy_session_create(call_t *call, int side_caller,
+                                  const char *from_tag, const char *to_tag);
 
-/* select() integration */
+/* Delete rtpproxy sessions for a call.
+ * Calls rtpp_delete() via rtpproxy_client for both sides.
+ * Returns 0 on success, -1 on failure (errors logged, doesn't fail call removal). */
+int call_rtpproxy_session_delete(call_t *call);
 
-/* Add all active RTP sockets to the fd_set for select(). */
-void call_fill_rtp_fds(fd_set *read_set, int *maxfd);
-
-/* For each readable RTP socket, forward to the opposite party. */
-void call_relay_rtp(fd_set *read_set);
-
-/* Remove calls with no RTP activity for more than timeout_sec. */
+/* Remove calls that have been idle for more than timeout_sec. */
 void call_age_idle(int timeout_sec);
 
-/* Set transport for a party (call_t, side 'a' or 'b') */
+/* Set transport for a party (call_t, side_caller=1 or side_callee=0) */
 void call_set_transport(call_t *call, int side_a, const char *transport);
-
-/* Connect outbound TCP RTP to remote (for trunks using TCP) */
-int call_connect_tcp_rtp(call_t *call, int side_a, const char *remote_ip, int remote_port);
 
 #endif

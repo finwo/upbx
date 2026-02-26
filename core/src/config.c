@@ -195,6 +195,11 @@ static int handler(void *user, const char *section, const char *name, const char
       cfg->cross_group_calls = (atoi(val) != 0) ? 1 : 0;
       return 1;
     }
+    if (strcmp(key, "tcp_keepalive_interval") == 0) {
+      int v = atoi(val);
+      cfg->tcp_keepalive_interval = (v > 0) ? v : 30;
+      return 1;
+    }
     if (strcmp(key, "emergency") == 0) {
       char **n = realloc(cfg->emergency, (cfg->emergency_count + 1) * sizeof(char *));
       if (n) { cfg->emergency = n; cfg->emergency[cfg->emergency_count++] = STRDUP(val); }
@@ -947,7 +952,7 @@ resp_object *config_key_get_path(const char *path, const char *section, const ch
     .val_cap = 0,
     .single_val = NULL,
     .int_val = 0,
-    .want_int = (strcmp(key, "locality") == 0 || strcmp(key, "daemonize") == 0 || strcmp(key, "rtp_port_low") == 0 || strcmp(key, "rtp_port_high") == 0 || strcmp(key, "cross_group_calls") == 0 || strcmp(key, "overflow_timeout") == 0 || strcmp(key, "filter_incoming") == 0)
+    .want_int = (strcmp(key, "locality") == 0 || strcmp(key, "daemonize") == 0 || strcmp(key, "rtp_port_low") == 0 || strcmp(key, "rtp_port_high") == 0 || strcmp(key, "cross_group_calls") == 0 || strcmp(key, "overflow_timeout") == 0 || strcmp(key, "filter_incoming") == 0 || strcmp(key, "tcp_keepalive_interval") == 0)
   };
   int r = ini_parse(path, key_get_handler, &ctx);
   if (r != 0 || !ctx.found) {

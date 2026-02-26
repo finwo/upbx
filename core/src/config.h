@@ -68,6 +68,7 @@ struct upbx_config {
   int locality;       /* 0 = disabled */
   int daemonize;      /* 0 or 1 */
   int cross_group_calls; /* 1 = allow ext-to-ext across groups (default), 0 = block */
+  int tcp_keepalive_interval; /* TCP keepalive interval in seconds (default: 30) */
   char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
   char **emergency;   /* Numbers that always route externally (e.g. "911") */
   size_t emergency_count;
