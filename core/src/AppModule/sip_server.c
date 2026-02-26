@@ -2615,14 +2615,19 @@ PT_THREAD(sip_tcp_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *ta
   task->read_fds = &state->fd;
   task->read_fds_count = 1;
 
+  int keepalive_interval = global_cfg->tcp_keepalive_interval > 0 ? global_cfg->tcp_keepalive_interval : 30;
+
   for (;;) {
     int ready_fd = -1;
-    int keepalive_interval = global_cfg->tcp_keepalive_interval > 0 ? global_cfg->tcp_keepalive_interval : 30;
-    time_t now = time(NULL);
+    time_t now = 0;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
     PT_WAIT_UNTIL(pt,
-      pt_task_has_data(task, &ready_fd) == 0 ||
-      (now - state->last_keepalive) >= (time_t)keepalive_interval);
+      (now = time(NULL)) &&
+      (pt_task_has_data(task, &ready_fd) == 0 ||
+      (now - state->last_keepalive) >= (time_t)keepalive_interval));
+#pragma GCC diagnostic pop
 
     if (now - state->last_keepalive >= (time_t)keepalive_interval) {
       const char *crlf = "\r\n";
