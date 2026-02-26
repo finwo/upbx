@@ -1,0 +1,25 @@
+---
+
+name: Test
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: finwo/dep@main
+        name: Install dep
+
+      - name: Install dependencies
+        shell: bash
+        run: cd core && dep install
+
+      - name: Run tests
+        shell: bash
+        run: cd core && make test
