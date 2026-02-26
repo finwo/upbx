@@ -140,24 +140,34 @@ int call_rtpproxy_session_create(call_t *call, int side_caller,
   if (side_caller) {
     call->rtp_port_caller = port;
     if (rtp_ip[0]) {
-      strncpy(call->rtp_proxy_ip_caller, rtp_ip, sizeof(call->rtp_proxy_ip_caller) - 1);
+      size_t n = strlen(rtp_ip);
+      if (n >= sizeof(call->rtp_proxy_ip_caller)) n = sizeof(call->rtp_proxy_ip_caller) - 1;
+      memcpy(call->rtp_proxy_ip_caller, rtp_ip, n);
+      call->rtp_proxy_ip_caller[n] = '\0';
     } else {
       const char *fallback = rtpproxy_get_fallback_ip();
       if (fallback) {
-        strncpy(call->rtp_proxy_ip_caller, fallback, sizeof(call->rtp_proxy_ip_caller) - 1);
+        size_t n = strlen(fallback);
+        if (n >= sizeof(call->rtp_proxy_ip_caller)) n = sizeof(call->rtp_proxy_ip_caller) - 1;
+        memcpy(call->rtp_proxy_ip_caller, fallback, n);
+        call->rtp_proxy_ip_caller[n] = '\0';
       }
-      call->rtp_proxy_ip_caller[sizeof(call->rtp_proxy_ip_caller) - 1] = '\0';
     }
   } else {
     call->rtp_port_callee = port;
     if (rtp_ip[0]) {
-      strncpy(call->rtp_proxy_ip_callee, rtp_ip, sizeof(call->rtp_proxy_ip_callee) - 1);
+      size_t n = strlen(rtp_ip);
+      if (n >= sizeof(call->rtp_proxy_ip_callee)) n = sizeof(call->rtp_proxy_ip_callee) - 1;
+      memcpy(call->rtp_proxy_ip_callee, rtp_ip, n);
+      call->rtp_proxy_ip_callee[n] = '\0';
     } else {
       const char *fallback = rtpproxy_get_fallback_ip();
       if (fallback) {
-        strncpy(call->rtp_proxy_ip_callee, fallback, sizeof(call->rtp_proxy_ip_callee) - 1);
+        size_t n = strlen(fallback);
+        if (n >= sizeof(call->rtp_proxy_ip_callee)) n = sizeof(call->rtp_proxy_ip_callee) - 1;
+        memcpy(call->rtp_proxy_ip_callee, fallback, n);
+        call->rtp_proxy_ip_callee[n] = '\0';
       }
-      call->rtp_proxy_ip_callee[sizeof(call->rtp_proxy_ip_callee) - 1] = '\0';
     }
   }
 

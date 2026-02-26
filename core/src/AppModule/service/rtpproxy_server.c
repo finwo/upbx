@@ -48,7 +48,6 @@ static int next_port = 0;
 static int rtpproxy_server_port_low = 10000;
 static int rtpproxy_server_port_high = 20000;
 
-static char *rtpproxy_server_url = NULL;
 static int rtpproxy_server_sockfd = -1;
 static int rtpproxy_server_running = 0;
 
