@@ -1,0 +1,106 @@
+---
+
+name: Build
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  version:
+    name: Extract version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - name: linux-amd64
+            runs-on: ubuntu-latest
+            bin: upbx-core-linux-amd64
+            cross: false
+
+          - name: linux-arm64
+            runs-on: ubuntu-latest
+            bin: upbx-core-linux-arm64
+            cross: true
+            arch: aarch64
+
+          - name: linux-armv7
+            runs-on: ubuntu-latest
+            bin: upbx-core-linux-armv7
+            cross: true
+            arch: armv7
+
+          - name: linux-riscv64
+            runs-on: ubuntu-latest
+            bin: upbx-core-linux-riscv64
+            cross: true
+            arch: riscv64
+
+          - name: windows-amd64
+            runs-on: windows-latest
+            bin: upbx-core-windows-amd64.exe
+            cross: false
+
+          - name: darwin-arm64
+            runs-on: macos-latest
+            bin: upbx-core-darwin-arm64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: matrix.runs-on == 'windows-latest'
+        name: Add mingw64 to PATH
+        shell: bash
+        run: |
+          echo "/c/msys64/mingw64/bin" >> $GITHUB_PATH
+
+      - uses: finwo/dep@main
+        name: Install dep
+
+      - name: Install dependencies
+        shell: bash
+        run: cd core && dep install
+
+      - if: matrix.cross
+        uses: uraimo/run-on-arch-action@v2
+        name: Build
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ubuntu_latest
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -y
+            apt-get install -yq build-essential
+          run: |
+            cd core
+            make -j upbx VERSION=${{ needs.version.outputs.version }}
+            mv upbx ${{ matrix.bin }}
+
+      - if: '!matrix.cross'
+        name: Build
+        shell: bash
+        run: |
+          cd core
+          make -j upbx VERSION=${{ needs.version.outputs.version }}
+          mv upbx ${{ matrix.bin }}
+
+      - name: Upload to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: core/${{ matrix.bin }}
+          file_glob: false
+          overwrite: true
+          tag: ${{ github.ref }}
