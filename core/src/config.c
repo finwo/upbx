@@ -348,16 +348,14 @@ static resp_object *config_get_section_key(const char *section, const char *key)
   if (!sec || sec->type != RESPT_ARRAY) {
     return NULL;
   }
-  resp_object *result = NULL;
   for (size_t i = 0; i + 1 < sec->u.arr.n; i += 2) {
     if (sec->u.arr.elem[i].type == RESPT_BULK &&
         sec->u.arr.elem[i].u.s &&
         strcmp(sec->u.arr.elem[i].u.s, key) == 0) {
-      result = resp_deep_copy(&sec->u.arr.elem[i + 1]);
-      break;
+      return &sec->u.arr.elem[i + 1];
     }
   }
-  return result;
+  return NULL;
 }
 
 static char *config_get_string(const char *section, const char *key) {
@@ -367,7 +365,6 @@ static char *config_get_string(const char *section, const char *key) {
   if (val->type == RESPT_BULK || val->type == RESPT_SIMPLE) {
     result = strdup(val->u.s ? val->u.s : "");
   }
-  resp_free(val);
   return result;
 }
 
@@ -380,7 +377,6 @@ static int config_get_int(const char *section, const char *key, int default_val)
   } else if (val->type == RESPT_BULK || val->type == RESPT_SIMPLE) {
     result = atoi(val->u.s ? val->u.s : "");
   }
-  resp_free(val);
   return result;
 }
 
@@ -393,7 +389,7 @@ char *config_get_rtp_mode(void) {
 }
 
 char *config_get_rtp_socket(void) {
-  char *s = config_get_string("rtpproxy", "socket");
+  char *s = config_get_string("rtpproxy", "url");
   if (s && s[0]) return s;
   free(s);
   return strdup("/var/run/rtpproxy.sock");
@@ -436,6 +432,13 @@ resp_object *config_get_extensions(void) {
     }
   }
   return result;
+}
+
+resp_object *config_get_extension(const char *number) {
+  if (!global_cfg || !number) return NULL;
+  char key[32];
+  snprintf(key, sizeof(key), "ext:%s", number);
+  return resp_map_get(global_cfg, key);
 }
 
 resp_object *config_get_trunks(void) {

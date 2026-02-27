@@ -275,6 +275,17 @@ PT_THREAD(rtp_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
     socket_path = strdup("/var/run/rtpproxy.sock");
   }
 
+  if (strncmp(socket_path, "unix://", 7) == 0) {
+    memmove(socket_path, socket_path + 7, strlen(socket_path + 7) + 1);
+  }
+
+  char *last_slash = strrchr(socket_path, '/');
+  if (last_slash) {
+    *last_slash = '\0';
+    mkdir(socket_path, 0755);
+    *last_slash = '/';
+  }
+
   port_low = config_get_rtp_port_low();
   port_high = config_get_rtp_port_high();
   port_cur = port_low;

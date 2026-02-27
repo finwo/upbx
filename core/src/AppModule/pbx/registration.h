@@ -3,13 +3,15 @@
 
 #include <time.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 typedef struct {
   char *number;
   char *name;
   char *contact;
-  char *via_addr;
-  int via_port;
+  struct sockaddr_storage remote_addr;
+  int tcp_fd;
   time_t expires;
   time_t registered_at;
   char *realm;
@@ -18,7 +20,7 @@ typedef struct {
 } extension_reg_t;
 
 extension_reg_t *registration_find(const char *number);
-void registration_add(const char *number, const char *contact, const char *via_addr, int via_port, time_t expires);
+void registration_add(const char *number, const char *contact, const struct sockaddr *remote_addr, int tcp_fd, time_t expires);
 void registration_remove(const char *number);
 void registration_cleanup(void);
 void registration_notify_plugins(void);

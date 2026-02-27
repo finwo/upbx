@@ -70,13 +70,25 @@ char *sip_build_register_request(const char *request_uri, const char *via_value,
   const char *call_id, const char *cseq, const char *contact_val, int expires, int max_forwards, const char *user_agent,
   const char *auth_value, size_t *out_len);
 
-/* Build response from explicit parts (no copy from request). All args = header values only (no "Via: " prefix). NULL = omit.
- * Via is normalised internally (full "Via: ..." line accepted). extra_headers = "Name: value" lines. Caller frees. */
-char *sip_build_response_parts(int status_code, const char *reason,
-  const char *via_val, const char *from_val, const char *to_val,
-  const char *call_id, const char *cseq_val, const char *contact_val, const char *user_agent,
-  const char *body, size_t body_len,
-  const char **extra_headers, size_t n_extra, size_t *out_len);
+/* Response builder struct - all fields optional (NULL/0 = omit). */
+typedef struct {
+  int status_code;
+  const char *reason;
+  const char *via;
+  const char *from;
+  const char *to;
+  const char *call_id;
+  const char *cseq;
+  const char *contact;
+  const char *user_agent;
+  const char *body;
+  size_t body_len;
+  const char **extra_headers;
+  size_t n_extra;
+} sip_response_t;
+
+/* Build response from struct. Caller frees. */
+char *sip_build_response(sip_response_t *resp, size_t *out_len);
 
 /* Write Via header value only into out (no "Via: " prefix, no CRLF). Same contract as sip_header_copy(..., "Via", ...). */
 int sip_make_via_line(const char *host, const char *port, char *out, size_t out_size);
@@ -119,5 +131,8 @@ int sip_insert_header(const char *buf, size_t len, const char *header_name,
 int sip_rewrite_body(const char *buf, size_t len,
                      const char *new_body, size_t new_body_len,
                      char *out, size_t out_cap);
+
+/* Process incoming SIP request and return response (caller frees). remote_addr for UDP, tcp_fd for TCP (-1 if UDP). */
+char *sip_process_request(const char *buf, size_t len, size_t *out_len, const struct sockaddr_storage *remote_addr, int tcp_fd);
 
 #endif

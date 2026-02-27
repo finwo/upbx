@@ -37,6 +37,18 @@ static trunk_reg_t *find_trunk(const char *name) {
 static int send_register(trunk_reg_t *t) {
   if (t->fd < 0) return -1;
   
+  char via_ip[INET6_ADDRSTRLEN] = "0.0.0.0";
+  int via_port = 0;
+  if (t->remote_addr.ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&t->remote_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, via_ip, sizeof(via_ip));
+    via_port = ntohs(sin->sin_port);
+  } else if (t->remote_addr.ss_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->remote_addr;
+    inet_ntop(AF_INET6, &sin6->sin6_addr, via_ip, sizeof(via_ip));
+    via_port = ntohs(sin6->sin6_port);
+  }
+  
   char req[1024];
   int len = snprintf(req, sizeof(req),
     "REGISTER sip:%s:%d SIP/2.0\r\n"
@@ -51,12 +63,12 @@ static int send_register(trunk_reg_t *t) {
     "Content-Length: 0\r\n"
     "\r\n",
     t->host, t->port,
-    t->transport, t->via_addr, t->via_port, (unsigned long long)time(NULL),
+    t->transport, via_ip, via_port, (unsigned long long)time(NULL),
     t->username, t->host,
     (unsigned long long)time(NULL),
     t->username, t->host,
     (unsigned long long)time(NULL),
-    t->username, t->via_addr, t->via_port,
+    t->username, via_ip, via_port,
     t->username, t->host, t->port
   );
   
@@ -92,6 +104,9 @@ PT_THREAD(trunk_reg_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) 
   addr.sin_family = AF_INET;
   memcpy(&addr.sin_addr, he->h_addr, he->h_length);
   addr.sin_port = htons(t->port);
+  
+  memset(&t->remote_addr, 0, sizeof(t->remote_addr));
+  memcpy(&t->remote_addr, &addr, sizeof(addr));
   
   if (strcmp(t->transport, "tcp") == 0) {
     if (connect(t->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -195,8 +210,6 @@ void trunk_reg_start_all(void) {
       t->username = username ? strdup(username) : NULL;
       t->password = password ? strdup(password) : NULL;
       t->fd = -1;
-      t->via_addr = "0.0.0.0";
-      t->via_port = 0;
       
       appmodule_pt_add(trunk_reg_pt, t);
       trunks[trunk_count++] = t;

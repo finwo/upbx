@@ -2,6 +2,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "rxi/log.h"
 #include "config.h"
@@ -13,6 +18,27 @@
 #include "PluginModule/plugin.h"
 
 #define MAX_CALLS 128
+#define MAX_FORKS 32
+
+typedef struct {
+  char *orig_call_id;
+  char *target_ext;
+  char *target_contact;
+  int fd;
+  int pending;
+} call_fwd_t;
+
+static call_fwd_t call_fwds[MAX_FORKS];
+static size_t call_fwd_count = 0;
+
+static call_fwd_t *call_fwd_find(const char *orig_call_id) {
+  for (size_t i = 0; i < call_fwd_count; i++) {
+    if (call_fwds[i].orig_call_id && strcmp(call_fwds[i].orig_call_id, orig_call_id) == 0) {
+      return &call_fwds[i];
+    }
+  }
+  return NULL;
+}
 
 static call_t *calls[MAX_CALLS];
 static size_t call_count = 0;
@@ -88,7 +114,6 @@ static int is_emergency(const char *number) {
 
   resp_object *emergency = config_get_emergency();
   if (!emergency || emergency->type != RESPT_ARRAY) {
-    resp_free(emergency);
     return 0;
   }
 
@@ -96,12 +121,10 @@ static int is_emergency(const char *number) {
     if (emergency->u.arr.elem[i].type == RESPT_BULK || emergency->u.arr.elem[i].type == RESPT_SIMPLE) {
       const char *e = emergency->u.arr.elem[i].u.s;
       if (e && strcmp(e, number) == 0) {
-        resp_free(emergency);
         return 1;
       }
     }
   }
-  resp_free(emergency);
   return 0;
 }
 
@@ -119,6 +142,7 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
   }
 
   extension_reg_t *dest_reg = registration_find(to);
+  log_trace("call_route: dest_reg=%p for %s", dest_reg, to);
   if (dest_reg) {
     log_info("call_route: ext-to-ext %s -> %s", from_ext, to);
 
@@ -135,8 +159,12 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
     c->dest_contact = strdup(dest_reg->contact);
     c->created = time(NULL);
     c->active = 1;
+  } else {
+    log_warn("call_route: destination %s not registered", to);
+    return -2;
+  }
 
-    char src_ip[64] = "0.0.0.0";
+  char src_ip[64] = "0.0.0.0";
     int src_port = 0;
     parse_sdp_port(sdp, "audio", &src_port, src_ip, sizeof(src_ip));
 
@@ -152,9 +180,20 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
     }
 
     dest_reg = registration_find(to);
-    if (dest_reg && dest_reg->via_addr) {
+    if (dest_reg && dest_reg->remote_addr.ss_family != 0) {
+      char dest_ip[INET6_ADDRSTRLEN];
+      int dest_port = 0;
+      if (dest_reg->remote_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&dest_reg->remote_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, dest_ip, sizeof(dest_ip));
+        dest_port = ntohs(sin->sin_port);
+      } else if (dest_reg->remote_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&dest_reg->remote_addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_ip, sizeof(dest_ip));
+        dest_port = ntohs(sin6->sin6_port);
+      }
       rtp_session_info_t info2;
-      if (rtp_client_create_session(call_id, dest_reg->via_addr, dest_reg->via_port, "dest", &info2) == 0) {
+      if (rtp_client_create_session(call_id, dest_ip, dest_port, "dest", &info2) == 0) {
         c->dest_rtp_port = info2.port;
         if (info2.advertise_ip) {
           strncpy(c->dest_rtp_ip, info2.advertise_ip, sizeof(c->dest_rtp_ip) - 1);
@@ -171,6 +210,54 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
 
     *out_sdp = strdup(sdp);
     rewrite_sdp_port(*out_sdp, c->dest_rtp_port, c->dest_rtp_ip[0] ? c->dest_rtp_ip : NULL);
+
+    log_trace("call_route: built out_sdp, dest_rtp_port=%d", c->dest_rtp_port);
+
+    extension_reg_t *reg = registration_find(to);
+    log_trace("call_route: found reg=%p for %s", reg, to);
+    if (reg && reg->remote_addr.ss_family != 0) {
+      char dest_ip[INET6_ADDRSTRLEN];
+      int dest_port = 5060;
+      if (reg->remote_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&reg->remote_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, dest_ip, sizeof(dest_ip));
+        dest_port = ntohs(sin->sin_port);
+      } else if (reg->remote_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&reg->remote_addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_ip, sizeof(dest_ip));
+        dest_port = ntohs(sin6->sin6_port);
+      }
+      int fdfwd = socket(reg->remote_addr.ss_family, SOCK_DGRAM, 0);
+      if (fdfwd >= 0) {
+        char *fwd_sdp = strdup(sdp);
+        rewrite_sdp_port(fwd_sdp, c->source_rtp_port, c->source_rtp_ip[0] ? c->source_rtp_ip : NULL);
+        char inv[2048];
+        int invlen = snprintf(inv, sizeof(inv),
+          "INVITE sip:%s@192.168.69.87 SIP/2.0\r\n"
+          "Via: SIP/2.0/UDP %s:%d;branch=z9hG4bKupbx%llx\r\n"
+          "From: <sip:pbx@192.168.69.87>;tag=%llx\r\n"
+          "To: <sip:%s@192.168.69.87>\r\n"
+          "Call-ID: %s-fwd\r\n"
+          "CSeq: 1 INVITE\r\n"
+          "Contact: <sip:pbx@192.168.69.87:5060>\r\n"
+          "Content-Type: application/sdp\r\n"
+          "Content-Length: %d\r\n"
+          "\r\n%s",
+          to, c->dest_rtp_ip, c->dest_rtp_port, (unsigned long long)time(NULL),
+          (unsigned long long)time(NULL), to, call_id, (int)strlen(fwd_sdp), fwd_sdp);
+        free(fwd_sdp);
+        struct sockaddr_storage addr;
+        memcpy(&addr, &reg->remote_addr, sizeof(addr));
+        if (addr.ss_family == AF_INET) ((struct sockaddr_in *)&addr)->sin_port = htons(dest_port);
+        else ((struct sockaddr_in6 *)&addr)->sin6_port = htons(dest_port);
+        if (sendto(fdfwd, inv, (size_t)invlen, 0, (struct sockaddr *)&addr, addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)) == invlen) {
+          log_info("call_route: forwarded INVITE to %s at %s:%d", to, dest_ip, dest_port);
+        } else {
+          log_error("call_route: failed forward: %s", strerror(errno));
+        }
+        close(fdfwd);
+      }
+    }
 
     return 0;
   }

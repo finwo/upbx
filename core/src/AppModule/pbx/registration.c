@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 #include "rxi/log.h"
 #include "config.h"
@@ -26,12 +27,11 @@ extension_reg_t *registration_find(const char *number) {
   return find_by_number(number);
 }
 
-void registration_add(const char *number, const char *contact, const char *via_addr, int via_port, time_t expires) {
+void registration_add(const char *number, const char *contact, const struct sockaddr *remote_addr, int tcp_fd, time_t expires) {
   extension_reg_t *ext = find_by_number(number);
   
   if (ext) {
     free(ext->contact);
-    free(ext->via_addr);
   } else {
     if (extension_count >= MAX_EXTENSIONS) {
       log_error("registration: max extensions reached");
@@ -44,14 +44,28 @@ void registration_add(const char *number, const char *contact, const char *via_a
   }
   
   ext->contact = strdup(contact);
-  free(ext->via_addr);
-  ext->via_addr = strdup(via_addr);
-  ext->via_port = via_port;
+  if (remote_addr) {
+    memcpy(&ext->remote_addr, remote_addr, sizeof(ext->remote_addr));
+  }
+  ext->tcp_fd = tcp_fd;
   ext->expires = expires;
   ext->registered_at = time(NULL);
   
-  log_debug("registration: %s registered at %s:%d, expires %ld", 
-            number, via_addr, via_port, (long)expires);
+  char addr_str[INET6_ADDRSTRLEN];
+  int port = 0;
+  if (remote_addr) {
+    if (remote_addr->sa_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)remote_addr;
+      inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
+      port = ntohs(sin->sin_port);
+    } else if (remote_addr->sa_family == AF_INET6) {
+      struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)remote_addr;
+      inet_ntop(AF_INET6, &sin6->sin6_addr, addr_str, sizeof(addr_str));
+      port = ntohs(sin6->sin6_port);
+    }
+  }
+  log_debug("registration: %s registered at %s:%d fd=%d, expires %ld", 
+            number, addr_str, port, tcp_fd, (long)expires);
   
   registration_notify_plugins();
 }
@@ -63,7 +77,6 @@ void registration_remove(const char *number) {
   free(ext->number);
   free(ext->name);
   free(ext->contact);
-  free(ext->via_addr);
   free(ext->realm);
   free(ext->nonce);
   
@@ -99,9 +112,15 @@ const char *registration_get_contact(const char *number) {
 
 const char *registration_get_advertise_addr(const char *number, char *buf, size_t buf_len) {
   extension_reg_t *ext = find_by_number(number);
-  if (!ext || !ext->via_addr) return NULL;
+  if (!ext || ext->remote_addr.ss_family == 0) return NULL;
   
-  snprintf(buf, buf_len, "%s:%d", ext->via_addr, ext->via_port);
+  if (ext->remote_addr.ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ext->remote_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, buf, buf_len);
+  } else if (ext->remote_addr.ss_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ext->remote_addr;
+    inet_ntop(AF_INET6, &sin6->sin6_addr, buf, buf_len);
+  }
   return buf;
 }
 

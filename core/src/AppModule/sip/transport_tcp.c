@@ -13,6 +13,7 @@
 #include "config.h"
 #include "AppModule/scheduler/daemon.h"
 #include "AppModule/sip/transport_tcp.h"
+#include "AppModule/sip_parse.h"
 
 #define TCP_BUF_SIZE 16384
 
@@ -69,6 +70,21 @@ PT_THREAD(sip_tcp_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *ta
     state->buf[total_len] = '\0';
     log_trace("sip_tcp: received %zu bytes", total_len);
 
+    if (sip_security_check_raw(state->buf, total_len) != 0) {
+      log_warn("sip_tcp: security check failed");
+    } else {
+      size_t resp_len;
+      char *resp = sip_process_request(state->buf, total_len, &resp_len, NULL, state->fd);
+      if (resp) {
+        ssize_t sent = send(state->fd, resp, resp_len, 0);
+        if (sent > 0) {
+          log_trace("sip_tcp: sent %zd bytes response", sent);
+        }
+        free(resp);
+      }
+    }
+
+    state->rlen = 0;
     (void)timestamp;
   }
 

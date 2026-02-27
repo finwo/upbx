@@ -6,9 +6,16 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 #include "rxi/log.h"
 #include "AppModule/sip_parse.h"
+#include "AppModule/pbx/registration.h"
+#include "AppModule/pbx/call.h"
+#include "common/hexdump.h"
+#include "config.h"
+#include "common/digest_auth.h"
+#include "RespModule/resp.h"
 
 #define SEC_MINLEN      16
 #define SEC_MAXLINELEN  2048
@@ -47,13 +54,17 @@ int sip_security_check_raw(char *sip_buffer, size_t size) {
     return 0;
 
   if (size > 20) {
-    if (strncmp(sip_buffer, "INVITE  SIP/2.0",  15) == 0) return 0;
-    if (strncmp(sip_buffer, "ACK  SIP/2.0",     12) == 0) return 0;
-    if (strncmp(sip_buffer, "BYE  SIP/2.0",     12) == 0) return 0;
-    if (strncmp(sip_buffer, "CANCEL  SIP/2.0",  15) == 0) return 0;
-    if (strncmp(sip_buffer, "REGISTER  SIP/2.0", 17) == 0) return 0;
-    if (strncmp(sip_buffer, "OPTIONS  SIP/2.0",  16) == 0) return 0;
-    if (strncmp(sip_buffer, "INFO  SIP/2.0",     13) == 0) return 0;
+    char method[16] = {0};
+    char proto[16] = {0};
+    if (sscanf(sip_buffer, "%15s %*s %15s", method, proto) == 2) {
+      if ((strcmp(method, "INVITE") == 0 || strcmp(method, "ACK") == 0 ||
+           strcmp(method, "BYE") == 0 || strcmp(method, "CANCEL") == 0 ||
+           strcmp(method, "REGISTER") == 0 || strcmp(method, "OPTIONS") == 0 ||
+           strcmp(method, "INFO") == 0) && strcmp(proto, "SIP/2.0") == 0) {
+        return 0;
+      }
+      if (strcmp(proto, "SIP/2.0") == 0) return 0;
+    }
   }
 
   return 1;
@@ -343,7 +354,6 @@ int sip_parse_authorization_digest(const char *buf, size_t len,
   char **nc_out, char **qop_out, char **uri_out, char **response_out) {
   const char *val;
   size_t val_len;
-  char *u = NULL, *r = NULL, *n = NULL, *uri = NULL, *resp = NULL;
   if (username_out) *username_out = NULL;
   if (realm_out) *realm_out = NULL;
   if (nonce_out) *nonce_out = NULL;
@@ -355,49 +365,62 @@ int sip_parse_authorization_digest(const char *buf, size_t len,
   if (!sip_header_get(buf, len, "Authorization", &val, &val_len)) return 0;
   if (val_len < 7 || strncasecmp(val, "Digest ", 7) != 0) return 0;
   val += 7; val_len -= 7;
-  if (!parse_digest_param(val, val_len, "username", username_out ? username_out : &u)) return 0;
-  if (!parse_digest_param(val, val_len, "realm", realm_out ? realm_out : &r)) {
-    if (username_out) free(*username_out); else free(u);
-    if (username_out) *username_out = NULL;
-    if (realm_out) free(*realm_out); else free(r);
-    if (realm_out) *realm_out = NULL;
+  while (val_len > 0 && (*val == ' ' || *val == '\t')) { val++; val_len--; }
+
+  char *tmp = malloc(val_len + 1);
+  memcpy(tmp, val, val_len);
+  tmp[val_len] = '\0';
+
+  resp_object *digest = resp_array_init();
+  char *saveptr = NULL;
+  char *token = strtok_r(tmp, ",", &saveptr);
+  while (token) {
+    while (*token == ' ' || *token == '\t') token++;
+    char *eq = strchr(token, '=');
+    if (eq) {
+      *eq = '\0';
+      char *key = token;
+      char *v = eq + 1;
+      while (*v == ' ' || *v == '\t') v++;
+      size_t vlen = strlen(v);
+      if (vlen >= 2 && v[0] == '"' && v[vlen-1] == '"') {
+        v[vlen-1] = '\0';
+        v++;
+      }
+      resp_array_append_bulk(digest, key);
+      resp_array_append_bulk(digest, v);
+    }
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  free(tmp);
+
+  const char *username = resp_map_get_string(digest, "username");
+  const char *realm = resp_map_get_string(digest, "realm");
+  const char *nonce = resp_map_get_string(digest, "nonce");
+  const char *uri = resp_map_get_string(digest, "uri");
+  const char *response = resp_map_get_string(digest, "response");
+  if (!username || !realm || !nonce || !uri || !response) {
+    resp_free(digest);
     return 0;
   }
-  if (!parse_digest_param(val, val_len, "nonce", nonce_out ? nonce_out : &n)) {
-    if (username_out) free(*username_out); else free(u);
-    if (realm_out) free(*realm_out); else free(r);
-    if (username_out) *username_out = NULL;
-    if (realm_out) *realm_out = NULL;
-    return 0;
+  if (username_out) *username_out = strdup(username);
+  if (realm_out) *realm_out = strdup(realm);
+  if (nonce_out) *nonce_out = strdup(nonce);
+  if (uri_out) *uri_out = strdup(uri);
+  if (response_out) *response_out = strdup(response);
+  if (cnonce_out) {
+    const char *cnonce = resp_map_get_string(digest, "cnonce");
+    if (cnonce) *cnonce_out = strdup(cnonce);
   }
-  if (!parse_digest_param(val, val_len, "uri", uri_out ? uri_out : &uri)) {
-    if (username_out) free(*username_out); else free(u);
-    if (realm_out) free(*realm_out); else free(r);
-    if (nonce_out) free(*nonce_out); else free(n);
-    if (username_out) *username_out = NULL;
-    if (realm_out) *realm_out = NULL;
-    if (nonce_out) *nonce_out = NULL;
-    return 0;
+  if (nc_out) {
+    const char *nc = resp_map_get_string(digest, "nc");
+    if (nc) *nc_out = strdup(nc);
   }
-  if (!parse_digest_param(val, val_len, "response", response_out ? response_out : &resp)) {
-    if (username_out) free(*username_out); else free(u);
-    if (realm_out) free(*realm_out); else free(r);
-    if (nonce_out) free(*nonce_out); else free(n);
-    if (uri_out) free(*uri_out); else free(uri);
-    if (username_out) *username_out = NULL;
-    if (realm_out) *realm_out = NULL;
-    if (nonce_out) *nonce_out = NULL;
-    if (uri_out) *uri_out = NULL;
-    return 0;
+  if (qop_out) {
+    const char *qop = resp_map_get_string(digest, "qop");
+    if (qop) *qop_out = strdup(qop);
   }
-  if (!username_out) free(u);
-  if (!realm_out) free(r);
-  if (!nonce_out) free(n);
-  if (!uri_out) free(uri);
-  if (!response_out) free(resp);
-  if (cnonce_out) parse_digest_param(val, val_len, "cnonce", cnonce_out);
-  if (nc_out) parse_digest_param(val, val_len, "nc", nc_out);
-  if (qop_out) parse_digest_param(val, val_len, "qop", qop_out);
+  resp_free(digest);
   return 1;
 }
 
@@ -629,66 +652,85 @@ char *sip_build_register_request(const char *request_uri, const char *via_value,
   return out;
 }
 
-/* Build response from explicit parts (no copy from request). First line by status/reason; headers: Via, From, To, Call-ID, CSeq, Contact, User-Agent, then extra_headers, then Content-Length (if body). Caller frees.
- * All header args are header values only (no "Via: " etc.); Via is normalised so full line is also accepted. */
-char *sip_build_response_parts(int status_code, const char *reason,
-  const char *via_line, const char *from_val, const char *to_val,
-  const char *call_id, const char *cseq_val, const char *contact_val, const char *user_agent,
-  const char *body, size_t body_len,
-  const char **extra_headers, size_t n_extra, size_t *out_len) {
+/* Build response from struct. Caller frees. */
+char *sip_build_response(sip_response_t *data, size_t *out_len) {
   size_t cap = 4096;
-  if (body_len > 0)
-    cap += body_len;
+  if (data->body_len > 0)
+    cap += data->body_len;
   char *out = malloc(cap);
   if (!out) return NULL;
   size_t used = 0;
   int n = snprintf(out + used, cap - used, "SIP/2.0 %d %s\r\n",
-    status_code, reason && reason[0] ? reason : "OK");
+    data->status_code, data->reason && data->reason[0] ? data->reason : "OK");
   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
   used += (size_t)n;
   {
-    const char *via_val = via_value_only(via_line);
+    const char *via_val = via_value_only(data->via);
     if (via_val && via_val[0]) {
       n = snprintf(out + used, cap - used, "Via: %s\r\n", via_val);
       if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
       used += (size_t)n;
     }
   }
-  if (from_val && from_val[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", from_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  if (to_val && to_val[0])     { n = snprintf(out + used, cap - used, "To: %s\r\n", to_val);     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  if (call_id && call_id[0])   { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  if (cseq_val && cseq_val[0]) { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", cseq_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  if (contact_val && contact_val[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", contact_val); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  if (user_agent && user_agent[0]) { n = snprintf(out + used, cap - used, "User-Agent: %s\r\n", user_agent); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
-  for (size_t i = 0; i < n_extra && extra_headers && extra_headers[i]; i++) {
-    size_t el = strlen(extra_headers[i]);
+  if (data->from && data->from[0]) { n = snprintf(out + used, cap - used, "From: %s\r\n", data->from); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (data->to && data->to[0])     { n = snprintf(out + used, cap - used, "To: %s\r\n", data->to);     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (data->call_id && data->call_id[0])   { n = snprintf(out + used, cap - used, "Call-ID: %s\r\n", data->call_id); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (data->cseq && data->cseq[0]) { n = snprintf(out + used, cap - used, "CSeq: %s\r\n", data->cseq); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (data->contact && data->contact[0]) { n = snprintf(out + used, cap - used, "Contact: %s\r\n", data->contact); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  if (data->user_agent && data->user_agent[0]) { n = snprintf(out + used, cap - used, "User-Agent: %s\r\n", data->user_agent); if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; } used += (size_t)n; }
+  for (size_t i = 0; i < data->n_extra && data->extra_headers && data->extra_headers[i]; i++) {
+    size_t el = strlen(data->extra_headers[i]);
     if (used + el + 2 > cap) break;
-    memcpy(out + used, extra_headers[i], el);
+    memcpy(out + used, data->extra_headers[i], el);
     used += el;
     out[used++] = '\r'; out[used++] = '\n';
   }
 
-  if (body_len > 0) {
+  if (data->body_len > 0) {
     n = snprintf(out + used, cap - used, "Content-Type: application/sdp\r\n");
     if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
     used += (size_t)n;
   }
-  n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", body_len);
+  n = snprintf(out + used, cap - used, "Content-Length: %zu\r\n", data->body_len);
   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
   used += (size_t)n;
   n = snprintf(out + used, cap - used, "\r\n");
   if (n < 0 || (size_t)n >= cap - used) { free(out); return NULL; }
   used += (size_t)n;
-  if (body_len > 0 && body) {
-    if (used + body_len > cap) { free(out); return NULL; }
-    memcpy(out + used, body, body_len);
-    used += body_len;
+  if (data->body_len > 0 && data->body) {
+    if (used + data->body_len > cap) { free(out); return NULL; }
+    memcpy(out + used, data->body, data->body_len);
+    used += data->body_len;
   }
   char *ret = realloc(out, used + 1);
   if (ret) { ret[used] = '\0'; if (out_len) *out_len = used; return ret; }
   out[used] = '\0';
   if (out_len) *out_len = used;
   return out;
+}
+
+/* Build response from explicit parts (no copy from request). DEPRECATED: use sip_build_response. */
+char *sip_build_response_parts(int status_code, const char *reason,
+  const char *via_line, const char *from_val, const char *to_val,
+  const char *call_id, const char *cseq_val, const char *contact_val, const char *user_agent,
+  const char *body, size_t body_len,
+  const char **extra_headers, size_t n_extra, size_t *out_len) {
+  sip_response_t data = {
+    .status_code = status_code,
+    .reason = reason,
+    .via = via_line,
+    .from = from_val,
+    .to = to_val,
+    .call_id = call_id,
+    .cseq = cseq_val,
+    .contact = contact_val,
+    .user_agent = user_agent,
+    .body = body,
+    .body_len = body_len,
+    .extra_headers = extra_headers,
+    .n_extra = n_extra
+  };
+  return sip_build_response(&data, out_len);
 }
 
 /* Write Via header value only (no "Via: " prefix, no CRLF). Same contract as other header values for sip_build_*_parts. */
@@ -1024,4 +1066,394 @@ int sip_rewrite_body(const char *buf, size_t len,
     if (rw_append(out, out_cap, &used, new_body, new_body_len)) return -1;
   }
   return (int)used;
+}
+
+typedef struct {
+  const char *buf;
+  size_t len;
+  char method[16];
+  char uri[256];
+  char via[512];
+  char from[512];
+  char to[512];
+  char contact[512];
+  char call_id[128];
+  char cseq[32];
+  int expires;
+} sip_request_parsed_t;
+
+static int sip_parse_request_line(const char *buf, size_t len, sip_request_parsed_t *req) {
+  const char *method_start = buf;
+  const char *p = method_start;
+  while (*p && *p != ' ' && (size_t)(p - buf) < len && (size_t)(p - method_start) < sizeof(req->method) - 1) p++;
+  size_t method_len = (size_t)(p - method_start);
+  if (method_len == 0 || method_len >= sizeof(req->method)) return -1;
+  memcpy(req->method, method_start, method_len);
+  req->method[method_len] = '\0';
+  while (*p == ' ' && (size_t)(p - buf) < len) p++;
+  const char *uri_start = p;
+  while (*p && *p != ' ' && (size_t)(p - buf) < len && (size_t)(p - uri_start) < sizeof(req->uri) - 1) p++;
+  size_t uri_len = (size_t)(p - uri_start);
+  if (uri_len == 0 || uri_len >= sizeof(req->uri)) return -1;
+  memcpy(req->uri, uri_start, uri_len);
+  req->uri[uri_len] = '\0';
+  return 0;
+}
+
+static int sip_parse_request(const char *buf, size_t len, sip_request_parsed_t *req) {
+  memset(req, 0, sizeof(*req));
+  req->buf = buf;
+  req->len = len;
+  req->expires = 3600;
+  if (sip_parse_request_line(buf, len, req) != 0) return -1;
+  sip_header_copy(buf, len, "Via", req->via, sizeof(req->via));
+  sip_header_copy(buf, len, "From", req->from, sizeof(req->from));
+  sip_header_copy(buf, len, "To", req->to, sizeof(req->to));
+  sip_header_copy(buf, len, "Contact", req->contact, sizeof(req->contact));
+  sip_header_copy(buf, len, "Call-ID", req->call_id, sizeof(req->call_id));
+  sip_header_copy(buf, len, "CSeq", req->cseq, sizeof(req->cseq));
+  const char *exp_val;
+  size_t exp_len;
+  if (sip_header_get(buf, len, "Expires", &exp_val, &exp_len)) {
+    req->expires = atoi(exp_val);
+  } else if (sip_header_get(buf, len, "Contact", &exp_val, &exp_len)) {
+    const char *semi = memchr(exp_val, ';', exp_len);
+    if (semi) {
+      const char *exp_p = memmem(exp_val, (size_t)(semi - exp_val), "expires=", 8);
+      if (exp_p) req->expires = atoi(exp_p + 8);
+    }
+  }
+  return 0;
+}
+
+static void extract_user_from_sip_uri(const char *uri, size_t len, char *user_out, size_t user_size) {
+  if (!user_out || user_size == 0 || len == 0) return;
+  const char *end = uri + len;
+  const char *p = uri;
+  while (p < end && *p == ' ') p++;
+  if (*p == '"') {
+    const char *q = p + 1;
+    while (q < end && *q != '"') q++;
+    if (q < end) p = q + 1;
+  }
+  while (p < end && (*p == '<' || *p == ' ' || *p == '\t')) p++;
+  if (p + 4 <= end && strncasecmp(p, "sip:", 4) == 0) p += 4;
+  const char *user_start = p;
+  const char *ats = NULL;
+  while (p < end && *p != ';' && *p != ' ' && *p != '\r' && *p != '\n' && *p != '>') {
+    if (*p == '@') { ats = p; break; }
+    p++;
+  }
+  if (!ats) return;
+  size_t user_len = (size_t)(ats - user_start);
+  if (user_len == 0 || user_len >= user_size) return;
+  memcpy(user_out, user_start, user_len);
+  user_out[user_len] = '\0';
+}
+
+static char *handle_register(sip_request_parsed_t *req, size_t *out_len, const struct sockaddr_storage *remote_addr, int tcp_fd) {
+  log_trace("handle_register: entry, len=%zu", req->len);
+  char user[128] = "";
+  char host[128] = "";
+  char port[16] = "";
+  if (req->to && req->to[0]) {
+    extract_user_from_sip_uri(req->to, strlen(req->to), user, sizeof(user));
+  }
+  if (!user[0] && req->uri && req->uri[0]) {
+    sip_request_uri_user(req->uri, strlen(req->uri), user, sizeof(user));
+  }
+  sip_request_uri_host_port(req->uri, strlen(req->uri), host, sizeof(host), port, sizeof(port));
+  log_trace("handle_register: user=%s host=%s to=%s", user, host, req->to);
+  char contact_host[128] = "";
+  char contact_port[16] = "";
+  if (req->contact[0]) {
+    const char *c = req->contact;
+    if (strncmp(c, "sip:", 4) == 0) c += 4;
+    const char *ats = strchr(c, '@');
+    if (ats) {
+      const char *host_start = ats + 1;
+      const char *colon = strchr(host_start, ':');
+      size_t hlen = colon ? (size_t)(colon - host_start) : strlen(host_start);
+      if (hlen >= sizeof(contact_host)) hlen = sizeof(contact_host) - 1;
+      memcpy(contact_host, host_start, hlen);
+      contact_host[hlen] = '\0';
+      if (colon) {
+        size_t plen = strlen(colon + 1);
+        if (plen >= sizeof(contact_port)) plen = sizeof(contact_port) - 1;
+        memcpy(contact_port, colon + 1, plen);
+        contact_port[plen] = '\0';
+      }
+    }
+  }
+  char *auth_header = NULL;
+  size_t auth_len = 0;
+  char *username = NULL;
+  char *realm = NULL;
+  char *nonce = NULL;
+  char *cnonce = NULL;
+  char *nc = NULL;
+  char *qop = NULL;
+  char *uri = NULL;
+  char *response = NULL;
+  
+  if (sip_header_get(req->buf, req->len, "Authorization", (const char**)&auth_header, &auth_len)) {
+    log_trace("handle_register: Authorization header found, len=%zu", auth_len);
+    sip_parse_authorization_digest(req->buf, req->len, &username, &realm, &nonce, &cnonce, &nc, &qop, &uri, &response);
+  } else {
+    log_trace("handle_register: NO Authorization header found");
+  }
+  
+  if (!username || !user[0] || strcmp(username, user) != 0) {
+    log_trace("handle_register: no valid auth, returning 401");
+    char *www_auth = sip_build_www_authenticate("upbx", "nonce123");
+    log_trace("handle_register: www_auth=%s", www_auth ? www_auth : "null");
+    sip_response_t data = {
+      .status_code = 401,
+      .reason = "Unauthorized",
+      .via = req->via,
+      .via = req->via,
+      .from = req->from,
+      .to = req->to,
+      .call_id = req->call_id,
+      .cseq = req->cseq,
+      .extra_headers = (const char*[]){ www_auth, NULL },
+      .n_extra = www_auth ? 1 : 0
+    };
+    free(username); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(response);
+    char *resp = sip_build_response(&data, out_len);
+    free(www_auth);
+    log_trace("handle_register: 401 response:\n%s", resp ? resp : "null");
+    return resp;
+  }
+
+  resp_object *ext = config_get_extension(user);
+  const char *password = ext ? resp_map_get_string(ext, "secret") : NULL;
+  if (!password) {
+    log_trace("handle_register: extension %s not found or no password", user);
+    free(username); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(response);
+    char *www_auth = sip_build_www_authenticate("upbx", "nonce123");
+    sip_response_t data = {
+      .status_code = 401,
+      .reason = "Unauthorized",
+      .via = req->via,
+      
+      .from = req->from,
+      .to = req->to,
+      .call_id = req->call_id,
+      .cseq = req->cseq,
+      .extra_headers = (const char*[]){ www_auth, NULL },
+      .n_extra = www_auth ? 1 : 0
+    };
+    char *resp = sip_build_response(&data, out_len);
+    free(www_auth);
+    return resp;
+  }
+
+  HASHHEX ha1, computed_response;
+  digest_calc_ha1(NULL, username, realm ? realm : "upbx", password, nonce, cnonce, ha1);
+  digest_calc_response(ha1, nonce, nc, cnonce, qop, "REGISTER", uri ? uri : "", NULL, computed_response);
+
+  if (response && strncmp(response, (const char*)computed_response, DIGEST_HASHHEXLEN) != 0) {
+    log_trace("handle_register: digest mismatch, expected=%s got=%s", computed_response, response);
+    free(username); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(response);
+    char *www_auth = sip_build_www_authenticate("upbx", "nonce123");
+    sip_response_t data = {
+      .status_code = 401,
+      .reason = "Unauthorized",
+      .via = req->via,
+      
+      .from = req->from,
+      .to = req->to,
+      .call_id = req->call_id,
+      .cseq = req->cseq,
+      .extra_headers = (const char*[]){ www_auth, NULL },
+      .n_extra = www_auth ? 1 : 0
+    };
+    char *resp = sip_build_response(&data, out_len);
+    free(www_auth);
+    return resp;
+  }
+
+  log_trace("handle_register: digest OK, authenticated extension %s", user);
+  
+  if (req->expires == 0 || req->contact[0] == '\0') {
+    registration_remove(user);
+  } else {
+    registration_add(user, req->contact, (struct sockaddr *)remote_addr, tcp_fd, req->expires);
+  }
+  
+  free(username); free(realm); free(nonce); free(cnonce); free(nc); free(qop); free(uri); free(response);
+  
+  log_trace("handle_register: building response");
+  char contact_uri[512] = "";
+  if (req->contact[0]) {
+    snprintf(contact_uri, sizeof(contact_uri), "<%s>", req->contact);
+  }
+  sip_response_t data = {
+    .status_code = 200,
+    .reason = "OK",
+    .via = req->via,
+    .from = req->from,
+    .to = req->to,
+    .call_id = req->call_id,
+    .cseq = req->cseq,
+    .contact = contact_uri[0] ? contact_uri : NULL
+  };
+  log_trace("handle_register: calling sip_build_response");
+  char *resp = sip_build_response(&data, out_len);
+  log_trace("handle_register: sip_build_response returned, len=%zu", out_len ? *out_len : 0);
+  return resp;
+}
+
+char *sip_process_request(const char *buf, size_t len, size_t *out_len, const struct sockaddr_storage *remote_addr, int tcp_fd) {
+  log_trace("sip_process_request: entry");
+  sip_request_parsed_t req;
+  if (sip_parse_request(buf, len, &req) != 0) {
+    log_trace("sip_process_request: parse failed");
+    sip_response_t data = { .status_code = 400, .reason = "Bad Request" };
+    return sip_build_response(&data, out_len);
+  }
+  log_trace("sip_process_request: method=%s uri=%s", req.method, req.uri);
+  if (strcmp(req.method, "REGISTER") == 0) {
+    log_trace("sip_process_request: calling handle_register");
+    char *resp = handle_register(&req, out_len, remote_addr, tcp_fd);
+    log_trace("sip_process_request: handle_register returned");
+    return resp;
+  }
+  if (strcmp(req.method, "INVITE") == 0) {
+    char from_user[128] = "", to_user[128] = "";
+    if (req.from && req.from[0]) extract_user_from_sip_uri(req.from, strlen(req.from), from_user, sizeof(from_user));
+    if (req.to && req.to[0]) extract_user_from_sip_uri(req.to, strlen(req.to), to_user, sizeof(to_user));
+
+    log_info("INVITE: %s -> %s, call_id=%s", from_user, to_user, req.call_id);
+
+    extension_reg_t *reg = registration_find(from_user);
+    if (!reg) {
+      log_warn("INVITE: source %s not registered", from_user);
+      char *www_auth = sip_build_www_authenticate("upbx", "nonce123");
+      sip_response_t data = { 
+        .status_code = 401, 
+        .reason = "Unauthorized",
+        .via = req.via,
+        .from = req.from, 
+        .to = req.to, 
+        .call_id = req.call_id, 
+        .cseq = req.cseq,
+        .extra_headers = (const char*[]){ www_auth, NULL },
+        .n_extra = www_auth ? 1 : 0
+      };
+      char *resp = sip_build_response(&data, out_len);
+      free(www_auth);
+      return resp;
+    }
+
+    int authorized = 0;
+    if (tcp_fd > 0) {
+      if (reg->tcp_fd > 0 && reg->tcp_fd == tcp_fd) {
+        authorized = 1;
+      }
+    } else if (remote_addr && remote_addr->ss_family != 0 && reg->remote_addr.ss_family != 0) {
+      if (reg->remote_addr.ss_family == remote_addr->ss_family) {
+        if (reg->remote_addr.ss_family == AF_INET) {
+          struct sockaddr_in *sin = (struct sockaddr_in *)&reg->remote_addr;
+          struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
+          if (sin->sin_addr.s_addr == src->sin_addr.s_addr && sin->sin_port == src->sin_port) {
+            authorized = 1;
+          }
+        } else if (reg->remote_addr.ss_family == AF_INET6) {
+          struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&reg->remote_addr;
+          struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
+          if (memcmp(&sin6->sin6_addr, &src->sin6_addr, sizeof(sin6->sin6_addr)) == 0 && sin6->sin6_port == src->sin6_port) {
+            authorized = 1;
+          }
+        }
+      }
+    }
+    if (!authorized) {
+      log_warn("INVITE: auth failed for %s - registered fd=%d tcp_fd=%d", from_user, reg->tcp_fd, tcp_fd);
+      sip_response_t data = { .status_code = 403, .reason = "Forbidden",  .from = req.from, .to = req.to, .call_id = req.call_id, .cseq = req.cseq };
+      return sip_build_response(&data, out_len);
+    }
+
+    const char *body = NULL;
+    size_t body_len = 0;
+    sip_request_get_body(req.buf, req.len, &body, &body_len);
+
+    char *new_sdp = NULL;
+    int r = call_route_invite(from_user, to_user, req.call_id, body, &new_sdp);
+    log_trace("INVITE: call_route returned r=%d new_sdp=%p", r, new_sdp);
+    if (r == -2) {
+      sip_response_t data = {
+        .status_code = 404,
+        .reason = "Not Found",
+        .via = req.via,
+        .from = req.from,
+        .to = req.to,
+        .call_id = req.call_id,
+        .cseq = req.cseq
+      };
+      return sip_build_response(&data, out_len);
+    }
+    if (r < 0) {
+      sip_response_t data = {
+        .status_code = 486,
+        .reason = "Busy Here",
+        .via = req.via,
+        .from = req.from,
+        .to = req.to,
+        .call_id = req.call_id,
+        .cseq = req.cseq
+      };
+      return sip_build_response(&data, out_len);
+    }
+
+    char contact_uri[256] = "";
+    char *advertise = config_get_rtp_advertise_addr();
+    if (advertise) {
+      snprintf(contact_uri, sizeof(contact_uri), "%%3Csip:%%3E; %%3Csip:%s%%3E", advertise);
+      free(advertise);
+    }
+
+    sip_response_t data = {
+      .status_code = 200,
+      .reason = "OK",
+      
+      .from = req.from,
+      .to = req.to,
+      .call_id = req.call_id,
+      .cseq = req.cseq,
+      .contact = contact_uri[0] ? contact_uri : NULL,
+      .body = new_sdp
+    };
+    char *resp = sip_build_response(&data, out_len);
+    free(new_sdp);
+    return resp;
+  }
+
+  if (strcmp(req.method, "ACK") == 0 || strcmp(req.method, "BYE") == 0 ||
+      strcmp(req.method, "CANCEL") == 0 || strcmp(req.method, "OPTIONS") == 0) {
+    if (strcmp(req.method, "BYE") == 0) {
+      call_handle_bye(req.call_id);
+    }
+    sip_response_t data = {
+      .status_code = 200,
+      .reason = "OK",
+      
+      .from = req.from,
+      .to = req.to,
+      .call_id = req.call_id,
+      .cseq = req.cseq
+    };
+    return sip_build_response(&data, out_len);
+  }
+  sip_response_t data = {
+    .status_code = 405,
+    .reason = "Method Not Allowed",
+    
+    .from = req.from,
+    .to = req.to,
+    .call_id = req.call_id,
+    .cseq = req.cseq
+  };
+  return sip_build_response(&data, out_len);
 }

@@ -118,11 +118,11 @@ void test_sip_strip_top_via(void) {
 }
 
 void test_sip_security_check_raw(void) {
-  /* Valid SIP message should pass. */
+  /* Valid SIP message should pass (return 0). */
   char buf[2048];
   strncpy(buf, INVITE_REQ, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
-  ASSERT("valid message passes", sip_security_check_raw(buf, strlen(buf)));
+  ASSERT("valid message passes", sip_security_check_raw(buf, strlen(buf)) == 0);
 }
 
 void test_looks_like_sip(void) {

@@ -19,6 +19,12 @@ static int send_command(const char *cmd, char *response, size_t resp_size) {
     socket_path = strdup("/var/run/rtpproxy.sock");
   }
 
+  if (strncmp(socket_path, "unix://", 7) == 0) {
+    char *p = strdup(socket_path + 7);
+    free(socket_path);
+    socket_path = p;
+  }
+
   int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
   if (fd < 0) {
     free(socket_path);
@@ -85,7 +91,7 @@ static int parse_response(const char *response, rtp_session_info_t *info) {
 
 int rtp_client_create_session(const char *call_id, const char *remote_ip, int remote_port, const char *from_tag, rtp_session_info_t *info) {
   char cmd[512];
-  snprintf(cmd, sizeof(cmd), "U %s %s %d %s\n", call_id, remote_ip, remote_port, from_tag);
+  snprintf(cmd, sizeof(cmd), "A %s %s %d %s\n", call_id, remote_ip, remote_port, from_tag);
 
   char response[256];
   if (send_command(cmd, response, sizeof(response)) != 0) {

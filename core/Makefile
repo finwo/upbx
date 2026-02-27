@@ -115,7 +115,7 @@ test_md5: src/test/test_md5.o src/common/md5.o
 test_sdp_parse: src/test/test_sdp_parse.o src/AppModule/util/sdp_parse.o
 	$(CC) $^ $(CFLAGS) -o $@
 
-test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o lib/rxi/log/src/log.o
+test_sip_parse: src/test/test_sip_parse.o src/AppModule/sip_parse.o src/AppModule/pbx/registration.o src/config.o src/RespModule/resp.o src/PluginModule/plugin.o lib/benhoyt/inih/ini.o lib/cofyc/argparse/argparse.o lib/rxi/log/src/log.o src/common/socket_util.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_config: src/test/test_config.o src/config.o src/RespModule/resp.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o

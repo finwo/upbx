@@ -3,6 +3,8 @@
 
 #include <time.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #include "common/pt.h"
 
@@ -19,8 +21,7 @@ typedef struct {
   time_t expires;
   time_t last_register;
   char *contact;
-  char *via_addr;
-  int via_port;
+  struct sockaddr_storage remote_addr;
   int fd;
   struct pt pt;
 } trunk_reg_t;

@@ -51,12 +51,12 @@ void config_free(resp_object *cfg);
 void config_set_path(const char *path);
 const char *config_get_path(void);
 
-/* Path-taking (low-level). Return NULL on error or missing path. */
+/* Path-taking (low-level). Load fresh from file, returns COPIES (caller must free). */
 resp_object *config_sections_list_path(const char *path);
 resp_object *config_section_get_path(const char *path, const char *section);
 resp_object *config_key_get_path(const char *path, const char *section, const char *key);
 
-/* Default getters (use stored path). Return NULL if path not set or on error. */
+/* Default getters (use stored path). Load fresh from file, returns COPIES (caller must free). */
 resp_object *config_sections_list(void);
 resp_object *config_section_get(const char *section);
 resp_object *config_key_get(const char *section, const char *key);
@@ -72,10 +72,15 @@ int config_get_locality(void);
 int config_get_daemonize(void);
 int config_get_cross_group_calls(void);
 
-/* Get sections as resp_object arrays (caller must free result) */
+/* Get extension/trunk/plugin by number/name - returns pointer into global_cfg, caller does NOT free */
+resp_object *config_get_extension(const char *number);
+
+/* Get arrays of extensions/trunks/plugins - returns new array with COPIES, caller must free result */
 resp_object *config_get_extensions(void);
 resp_object *config_get_trunks(void);
 resp_object *config_get_plugins(void);
+
+/* Get emergency section - returns pointer into global_cfg, caller does NOT free */
 resp_object *config_get_emergency(void);
 
 #endif
