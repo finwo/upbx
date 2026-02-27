@@ -176,6 +176,22 @@ const char *resp_map_get_string(const resp_object *o, const char *key) {
   return NULL;
 }
 
+void resp_map_set(resp_object *o, const char *key, resp_object *value) {
+  if (!o || !key || o->type != RESPT_ARRAY) return;
+  for (size_t i = 0; i + 1 < o->u.arr.n; i += 2) {
+    const resp_object *k = &o->u.arr.elem[i];
+    const char *s = (k->type == RESPT_BULK || k->type == RESPT_SIMPLE) ? k->u.s : NULL;
+    if (s && strcmp(s, key) == 0 && i + 1 < o->u.arr.n) {
+      resp_free(&o->u.arr.elem[i + 1]);
+      o->u.arr.elem[i + 1] = *value;
+      free(value);
+      return;
+    }
+  }
+  resp_array_append_bulk(o, key);
+  resp_array_append_obj(o, value);
+}
+
 /* Append one RESP-encoded object to buf; realloc as needed. Returns 0 on success. */
 static int resp_append_object(char **buf, size_t *cap, size_t *len, const resp_object *o) {
   if (!o) return -1;

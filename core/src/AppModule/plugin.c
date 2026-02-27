@@ -97,7 +97,6 @@ void plugin_sync(void) {
     configs[n].config_hash = section_hash(sec);
     configs[n].restart_on_update = section_restart_on_update(sec);
     n++;
-    resp_free(sec);
   }
   resp_free(sections);
   plugmod_sync(configs, n, "command", after_discovery_send_config, NULL);
@@ -111,24 +110,53 @@ void plugin_sync(void) {
 }
 
 /* Start all plugins from config; uses COMMAND for discovery and extension./trunk./call. events. */
-void plugin_start(upbx_config *cfg) {
+void plugin_start(void) {
   log_trace("plugin_start: entry");
-  if (!cfg) return;
+  if (!global_cfg) return;
+  
   plugmod_config_item *configs = NULL;
   size_t n = 0;
-  for (size_t i = 0; i < cfg->plugin_count; i++) {
-    if (!cfg->plugins[i].exec || !cfg->plugins[i].exec[0]) continue;
-    plugmod_config_item *p = realloc(configs, (n + 1) * sizeof(plugmod_config_item));
-    if (!p) break;
-    configs = p;
-    configs[n].name = cfg->plugins[i].name;
-    configs[n].exec = cfg->plugins[i].exec;
-    configs[n].config_hash = 0;
-    configs[n].restart_on_update = 0;
-    n++;
+  
+  for (size_t i = 0; i < 256; i++) {
+    char key[32];
+    snprintf(key, sizeof(key), "plugin:%zu", i);
+    resp_object *sec = resp_map_get(global_cfg, key);
+    if (!sec || sec->type != RESPT_ARRAY) {
+      continue;
+    }
+    
+    const char *name = NULL;
+    const char *exec = NULL;
+    for (size_t j = 0; j + 1 < sec->u.arr.n; j += 2) {
+      if (sec->u.arr.elem[j].type != RESPT_BULK) continue;
+      const char *k = sec->u.arr.elem[j].u.s;
+      if (!k) continue;
+      if (strcmp(k, "name") == 0 && sec->u.arr.elem[j+1].type == RESPT_BULK) {
+        name = sec->u.arr.elem[j+1].u.s;
+      } else if (strcmp(k, "exec") == 0 && sec->u.arr.elem[j+1].type == RESPT_BULK) {
+        exec = sec->u.arr.elem[j+1].u.s;
+      }
+    }
+    
+    if (name && exec && exec[0]) {
+      plugmod_config_item *p = realloc(configs, (n + 1) * sizeof(plugmod_config_item));
+      if (!p) break;
+      configs = p;
+      configs[n].name = strdup(name);
+      configs[n].exec = strdup(exec);
+      configs[n].config_hash = 0;
+      configs[n].restart_on_update = 0;
+      n++;
+    }
   }
+  
   plugmod_start(configs, n, "command", after_discovery_send_config, NULL);
   log_info("plugins started (%zu loaded)", plugmod_count());
+  
+  for (size_t i = 0; i < n; i++) {
+    free((void*)configs[i].name);
+    free((void*)configs[i].exec);
+  }
   free(configs);
 }
 
@@ -194,9 +222,8 @@ void plugin_query_register(const char *extension_num, const char *trunk_name, co
   }
 }
 
-/* Build request map: source_ext, destination, call_id, trunks (array of trunk maps: name, cid, did). Caller resp_frees. */
-static resp_object *build_dialout_request_map(const char *source_ext, const char *destination, const char *call_id,
-  config_trunk **trunks, size_t n_trunks) {
+/* Build request map: source_ext, destination, call_id, trunks (from global_cfg). Caller resp_frees. */
+static resp_object *build_dialout_request_map(const char *source_ext, const char *destination, const char *call_id) {
   resp_object *map = resp_array_init();
   if (!map) return NULL;
   if (resp_array_append_bulk(map, "source_ext") != 0 || resp_array_append_bulk(map, source_ext ? source_ext : "") != 0 ||
@@ -208,32 +235,41 @@ static resp_object *build_dialout_request_map(const char *source_ext, const char
   }
   resp_object *trunks_arr = resp_array_init();
   if (!trunks_arr) { resp_free(map); return NULL; }
-  for (size_t t = 0; t < n_trunks; t++) {
-    config_trunk *tr = trunks[t];
-    resp_object *tm = resp_array_init();
-    if (!tm) { resp_free(trunks_arr); resp_free(map); return NULL; }
-    if (resp_array_append_bulk(tm, "name") != 0 || resp_array_append_bulk(tm, tr->name ? tr->name : "") != 0 ||
-        resp_array_append_bulk(tm, "cid") != 0 || resp_array_append_bulk(tm, tr->cid ? tr->cid : "") != 0 ||
-        resp_array_append_bulk(tm, "did") != 0) {
-      resp_free(tm);
-      resp_free(trunks_arr);
-      resp_free(map);
-      return NULL;
-    }
-    resp_object *did_arr = resp_array_init();
-    if (!did_arr) { resp_free(tm); resp_free(trunks_arr); resp_free(map); return NULL; }
-    for (size_t d = 0; d < tr->did_count; d++) {
-      if (resp_array_append_bulk(did_arr, tr->dids[d] ? tr->dids[d] : "") != 0) {
-        resp_free(did_arr);
-        resp_free(tm);
-        resp_free(trunks_arr);
-        resp_free(map);
-        return NULL;
+  
+  if (global_cfg) {
+    for (size_t sec_idx = 0; sec_idx < 256; sec_idx++) {
+      char sec_name[32];
+      snprintf(sec_name, sizeof(sec_name), "trunk:%zu", sec_idx);
+      resp_object *sec = resp_map_get(global_cfg, sec_name);
+      if (!sec || sec->type != RESPT_ARRAY) { resp_free(sec); continue; }
+      
+      const char *name = NULL;
+      const char *cid = NULL;
+      
+      for (size_t i = 0; i + 1 < sec->u.arr.n; i += 2) {
+        if (sec->u.arr.elem[i].type != RESPT_BULK) continue;
+        const char *key = sec->u.arr.elem[i].u.s;
+        if (!key) continue;
+        if (sec->u.arr.elem[i+1].type != RESPT_BULK) continue;
+        const char *val = sec->u.arr.elem[i+1].u.s;
+        if (!val) continue;
+        if (strcmp(key, "name") == 0) name = val;
+        else if (strcmp(key, "cid") == 0) cid = val;
+      }
+      
+      if (name) {
+        resp_object *tm = resp_array_init();
+        if (tm) {
+          resp_array_append_bulk(tm, "name");
+          resp_array_append_bulk(tm, name);
+          resp_array_append_bulk(tm, "cid");
+          resp_array_append_bulk(tm, cid ? cid : "");
+          resp_array_append_obj(trunks_arr, tm);
+        }
       }
     }
-    if (resp_array_append_obj(tm, did_arr) != 0) { resp_free(did_arr); resp_free(tm); resp_free(trunks_arr); resp_free(map); return NULL; }
-    if (resp_array_append_obj(trunks_arr, tm) != 0) { resp_free(tm); resp_free(trunks_arr); resp_free(map); return NULL; }
   }
+  
   if (resp_array_append_obj(map, trunks_arr) != 0) { resp_free(trunks_arr); resp_free(map); return NULL; }
   return map;
 }
@@ -265,68 +301,22 @@ static resp_object *build_dialin_request_map(const char *trunk_name, const char 
   return map;
 }
 
-/* Apply trunk override: from current_trunks (n_current), build new list ordered/filtered by names (string or array).
- * Returns new array and count; caller frees the array (not the config_trunk*). */
-static config_trunk **apply_trunk_override(config_trunk **current_trunks, size_t n_current,
-  resp_object *trunk_val, size_t *out_n) {
-  *out_n = 0;
-  if (!trunk_val || !current_trunks) return NULL;
-  size_t names_cap = 64;
-  const char **names = malloc(names_cap * sizeof(const char *));
-  if (!names) return NULL;
-  size_t n_names = 0;
-  if (trunk_val->type == RESPT_BULK || trunk_val->type == RESPT_SIMPLE) {
-    if (trunk_val->u.s && trunk_val->u.s[0]) {
-      names[n_names++] = trunk_val->u.s;
-    }
-  } else if (trunk_val->type == RESPT_ARRAY) {
-    for (size_t i = 0; i < trunk_val->u.arr.n && n_names < names_cap; i++) {
-      resp_object *e = &trunk_val->u.arr.elem[i];
-      const char *s = (e->type == RESPT_BULK || e->type == RESPT_SIMPLE) ? e->u.s : NULL;
-      if (s && s[0]) names[n_names++] = s;
-    }
-  }
-  if (n_names == 0) { free(names); return NULL; }
-  config_trunk **out = malloc(n_names * sizeof(config_trunk *));
-  if (!out) { free(names); return NULL; }
-  size_t out_n_val = 0;
-  for (size_t i = 0; i < n_names; i++) {
-    for (size_t j = 0; j < n_current; j++) {
-      if (current_trunks[j]->name && strcmp(current_trunks[j]->name, names[i]) == 0) {
-        out[out_n_val++] = current_trunks[j];
-        break;
-      }
-    }
-  }
-  free(names);
-  *out_n = out_n_val;
-  return out;
-}
-
-void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *destination, const char *call_id,
-  config_trunk **initial_trunks, size_t n_initial_trunks,
+void plugin_query_dialout(const char *source_ext, const char *destination, const char *call_id,
   int *out_action, int *out_reject_code, char **out_target_override,
   char ***out_trunk_override, int *out_trunk_override_n) {
-  (void)cfg;
   *out_action = 0;
   *out_reject_code = 403;
   *out_target_override = NULL;
   *out_trunk_override = NULL;
   *out_trunk_override_n = -1;
+  
   char *current_destination = strdup(destination ? destination : "");
   if (!current_destination) return;
-  config_trunk **current_trunks = NULL;
-  size_t n_current = n_initial_trunks;
-  int trunk_override_was_set = 0;
-  if (n_initial_trunks > 0 && initial_trunks) {
-    current_trunks = malloc(n_initial_trunks * sizeof(config_trunk *));
-    if (!current_trunks) { free(current_destination); return; }
-    memcpy(current_trunks, initial_trunks, n_initial_trunks * sizeof(config_trunk *));
-  }
+  
   for (size_t i = 0; i < plugmod_count(); i++) {
     const char *name = plugmod_name_at(i);
     if (!plugmod_has_method(name, "call.dialout")) continue;
-    resp_object *request_map = build_dialout_request_map(source_ext, current_destination, call_id, current_trunks, n_current);
+    resp_object *request_map = build_dialout_request_map(source_ext, current_destination, call_id);
     if (!request_map) continue;
     resp_object *r = NULL;
     if (plugmod_invoke_response(name, "call.dialout", 1, (const resp_object *const *)&request_map, &r) != 0 || !r) {
@@ -354,7 +344,6 @@ void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *
       }
       resp_free(r);
       free(current_destination);
-      free(current_trunks);
       return;
     }
     if (strcasecmp(action_str, "accept") == 0) {
@@ -363,36 +352,17 @@ void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *
       if (d && d[0]) {
         free(current_destination);
         current_destination = strdup(d);
+        *out_target_override = current_destination;
       }
-      resp_object *trunk_val = resp_map_get(r, "trunk");
-      if (trunk_val) {
-        trunk_override_was_set = 1;
-        config_trunk **new_trunks = apply_trunk_override(current_trunks, n_current, trunk_val, &n_current);
-        free(current_trunks);
-        current_trunks = new_trunks;
-      }
-      resp_free(r);
-      continue;
     }
     resp_free(r);
   }
-  if (*out_action == 2) {
+  
+  if (*out_action == 2 && current_destination) {
     *out_target_override = current_destination;
-    current_destination = NULL;
-    if (trunk_override_was_set) {
-      *out_trunk_override_n = (int)n_current;
-      if (n_current > 0 && current_trunks) {
-        char **names = malloc(n_current * sizeof(char *));
-        if (names) {
-          for (size_t k = 0; k < n_current; k++)
-            names[k] = current_trunks[k]->name ? strdup(current_trunks[k]->name) : NULL;
-          *out_trunk_override = names;
-        }
-      }
-    }
+  } else {
+    free(current_destination);
   }
-  free(current_destination);
-  free(current_trunks);
 }
 
 void plugin_query_dialin(const char *trunk_name, const char *did, const char **target_extensions, size_t n_targets, const char *call_id,

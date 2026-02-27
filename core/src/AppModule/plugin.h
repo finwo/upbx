@@ -9,8 +9,8 @@
 #include "config.h"
 #include "PluginModule/plugin.h"
 
-/* Start all plugins from config (spawn process, discovery). Call after config_load. */
-void plugin_start(upbx_config *cfg);
+/* Start all plugins from config (spawn process, discovery). Call after config_init. */
+void plugin_start(void);
 
 /* Stop all plugins (close pipes, kill processes). */
 void plugin_stop(void);
@@ -37,13 +37,12 @@ void plugin_notify_event(const char *event_name, int argc, const resp_object *co
 void plugin_query_register(const char *extension_num, const char *trunk_name, const char *from_user,
   int *out_allow);
 
-/* call.dialout: outgoing call from extension. Input: one map (source_ext, destination, call_id, trunks). Response: map with action = reject | accept; reject_code (int) when reject; optional destination, trunk when accept. Returns: 0 = no-edit, 1 = reject (*out_reject_code), 2 = accept (*out_target_override, *out_trunk_override, *out_trunk_override_n). Caller frees *out_target_override and *out_trunk_override (and each element). */
-void plugin_query_dialout(upbx_config *cfg, const char *source_ext, const char *destination, const char *call_id,
-  config_trunk **initial_trunks, size_t n_initial_trunks,
+/* call.dialout: outgoing call from extension. Uses global_cfg internally. */
+void plugin_query_dialout(const char *source_ext, const char *destination, const char *call_id,
   int *out_action, int *out_reject_code, char **out_target_override,
   char ***out_trunk_override, int *out_trunk_override_n);
 
-/* call.dialin: incoming call from trunk. Input: one map (trunk, did, destinations, call_id). Response: map with action = reject | continue | accept; reject_code (int) when reject; optional destinations (array) when accept. Returns: 0 = dont-care, 1 = reject (*out_reject_code), 2 = accept with override (*out_targets, *out_n; caller frees). */
+/* call.dialin: incoming call from trunk. */
 void plugin_query_dialin(const char *trunk_name, const char *did, const char **target_extensions, size_t n_targets, const char *call_id,
   int *out_action, int *out_reject_code, char ***out_targets, size_t *out_n);
 

@@ -4,109 +4,45 @@
 #include <stddef.h>
 #include "RespModule/resp.h"
 
-typedef struct upbx_config upbx_config;
+/* Global config instance - stored as resp_object map */
+extern resp_object *global_cfg;
 
-typedef struct {
-  char *name;
-  char *exec;
-} config_plugin;
+/* Pending config for double-buffer reload */
+extern resp_object *pending_cfg;
 
-typedef struct {
-  char *pattern;
-  char *replace;
-} config_rewrite;
+/* Initialize pending config */
+void config_pending_init(void);
 
-typedef struct {
-  char *name;
-  char *host;
-  char *port;
-  char *username;         /* Username for trunk registration to upstream */
-  char *password;         /* Password for trunk registration */
-  char **dids;
-  size_t did_count;
-  char *cid;              /* Outgoing caller ID number */
-  char *cid_name;         /* Optional caller ID display name */
-  config_rewrite *rewrites;
-  size_t rewrite_count;
-  void *rewrite_regex;    /* internal: array of compiled regex_t (one per rewrite), set by config_compile_trunk_rewrites */
-  int overflow_timeout;   /* seconds, 0 = disabled */
-  char *overflow_strategy;/* "none", "busy", "include", or "redirect" (default "none" if not set) */
-  char *overflow_target; /* Number for "include" or "redirect" strategy */
-  char *user_agent;       /* Custom User-Agent for trunk registration */
-  char *group_prefix;     /* Group prefix for locality-based trunk assignment (e.g. "1234" for locality 3) */
-  int filter_incoming;    /* 0 (default) = accept any matching extension; 1 = only accept calls to registered DIDs */
-  char transport[8];      /* "udp" or "tcp", case-insensitive, default "udp" */
-} config_trunk;
+/* Swap active and pending configs */
+void config_swap(void);
 
-typedef struct {
-  char *number;   /* extension number from section ext:N */
-  char *name;    /* optional display name */
-  char *secret;
-} config_extension;
+/* Trigger config reload on next scheduler cycle */
+void config_trigger_reload(void);
 
-typedef struct {
-  char *username;     /* from section name; "*" = anonymous */
-  char *secret;       /* password */
-  char **permits;     /* array of permit patterns (e.g. "metrics.*") */
-  size_t permit_count;
-} config_api_user;
+/* Check if config reload is pending */
+int config_is_reload_pending(void);
 
-typedef struct {
-  char *listen;         /* e.g. "127.0.0.1:6380"; NULL = API disabled */
-  config_api_user *users;
-  size_t user_count;
-} config_api;
+/* Reload config from file (double-buffer swap) */
+int config_reload(void);
 
-typedef struct {
-  char *mode;         /* "builtin" or "external" */
-  char *url;          /* Socket URL: unix://, tcp://, udp:// */
-  int port_low;       /* RTP port range low (default 10000) */
-  int port_high;     /* RTP port range high (default 20000) */
-} config_rtpproxy;
+/* Lock/unlock config (no-ops in single-threaded PT system) */
+void config_lock(void);
+void config_unlock(void);
 
-struct upbx_config {
-  int locality;       /* 0 = disabled */
-  int daemonize;      /* 0 or 1 */
-  int cross_group_calls; /* 1 = allow ext-to-ext across groups (default), 0 = block */
-  int tcp_keepalive_interval; /* TCP keepalive interval in seconds (default: 30) */
-  char *listen;       /* SIP listen address, e.g. "0.0.0.0:5060" */
-  char **emergency;   /* Numbers that always route externally (e.g. "911") */
-  size_t emergency_count;
-  config_plugin *plugins;
-  size_t plugin_count;
-
-  config_trunk *trunks;
-  size_t trunk_count;
-
-  config_extension *extensions;
-  size_t extension_count;
-
-  config_api api;
-
-  config_rtpproxy rtpproxy;
-};
-
-/* Global config instance (set after config_load in daemon) */
-extern upbx_config *global_cfg;
-
-/* Load config from file. Returns 0 on success, -1 on file error, >0 line number of first parse error. */
-int config_load(upbx_config *cfg, const char *path);
+/* Load config from file into given resp_object. Returns 0 on success, -1 on file error, >0 line number. */
+int config_load(resp_object *cfg, const char *path);
 
 /* After config_load returned >0, copy the section/key that caused the parse error (for logging). */
 void config_last_parse_error(char *section_out, size_t section_size, char *key_out, size_t key_size);
 
 /* Compile trunk rewrite patterns (POSIX regex). Call after config_load. Returns 0 on success, -1 on compile error. */
-int config_compile_trunk_rewrites(upbx_config *cfg);
+int config_compile_trunk_rewrites(resp_object *cfg);
 
-/* Free all allocated strings and arrays in cfg. Does not free cfg itself. */
-void config_free(upbx_config *cfg);
+/* Initialize config to defaults */
+void config_init(void);
 
-/* Initialize cfg to defaults (zeros). */
-void config_init(upbx_config *cfg);
-
-/* Live config API (re-read file each call; no cache). Caller frees with resp_free.
- * Values are unescaped (\\ -> \, \@ -> @). Raw value starting with @ is a reference:
- * @section or @section.key. Reference specs are used as-is for lookup; no normalization. */
+/* Free config (uses resp_free) */
+void config_free(resp_object *cfg);
 
 /* Set/get config file path (used by default getters). Set once at startup. */
 void config_set_path(const char *path);
@@ -121,5 +57,22 @@ resp_object *config_key_get_path(const char *path, const char *section, const ch
 resp_object *config_sections_list(void);
 resp_object *config_section_get(const char *section);
 resp_object *config_key_get(const char *section, const char *key);
+
+/* Convenience getters for common fields (return copies, caller must free) */
+char *config_get_listen(void);
+char *config_get_rtp_mode(void);
+char *config_get_rtp_socket(void);
+char *config_get_rtp_advertise_addr(void);
+int config_get_rtp_port_low(void);
+int config_get_rtp_port_high(void);
+int config_get_locality(void);
+int config_get_daemonize(void);
+int config_get_cross_group_calls(void);
+
+/* Get sections as resp_object arrays (caller must free result) */
+resp_object *config_get_extensions(void);
+resp_object *config_get_trunks(void);
+resp_object *config_get_plugins(void);
+resp_object *config_get_emergency(void);
 
 #endif

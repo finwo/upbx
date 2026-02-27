@@ -1,5 +1,6 @@
 /*
  * Generic plugin module: RESP over stdio, spawn, discovery, invoke.
+ * Each plugin runs as its own protothread.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -14,21 +15,31 @@
 
 #include "common/socket_util.h"
 #include "rxi/log.h"
+#include "common/pt.h"
 #include "PluginModule/plugin.h"
 #include "RespModule/resp.h"
+
+#ifdef UPBX_BUILD
+#include "AppModule/scheduler/daemon.h"
+#endif
 
 typedef struct {
   char *name;
   pid_t pid;
   int fd_write;
   int fd_read;
-  char **methods;      /* single list of callable names (methods and events) */
+  char **methods;
   size_t method_count;
   int stopping;
   time_t stop_sent_at;
   unsigned long long config_hash;
   int restart_on_update;
   char *exec;
+#ifdef UPBX_BUILD
+  struct pt pt;
+  char rbuf[4096];
+  size_t rlen;
+#endif
 } plugin_state_t;
 
 static plugin_state_t *plugins;
@@ -156,6 +167,11 @@ void plugmod_start(const plugmod_config_item *configs, size_t n,
     if (after_discovery_cb_used)
       after_discovery_cb_used(p->name, after_discovery_user_used);
     log_debug("plugin %s: %zu methods", p->name, p->method_count);
+    
+#ifdef UPBX_BUILD
+    appmodule_pt_add(plugin_pt, p);
+#endif
+    
     plugin_n++;
   }
 }
@@ -330,3 +346,45 @@ const char *plugmod_name_at(size_t i) {
   if (i >= plugin_n) return NULL;
   return plugins[i].name;
 }
+
+#ifdef UPBX_BUILD
+PT_THREAD(plugin_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
+  plugin_state_t *p = task->udata;
+  PT_BEGIN(pt);
+  
+  PT_INIT(&p->pt);
+  task->read_fds = &p->fd_read;
+  task->read_fds_count = 1;
+  
+  for (;;) {
+    if (p->stopping && p->pid <= 0) break;
+    
+    int ready_fd = -1;
+    PT_WAIT_UNTIL(pt, pt_task_has_data(task, &ready_fd) == 0 && ready_fd == p->fd_read);
+    
+    size_t space = sizeof(p->rbuf) - p->rlen;
+    if (space > 0) {
+      ssize_t n = read(p->fd_read, p->rbuf + p->rlen, space);
+      if (n > 0) {
+        p->rlen += (size_t)n;
+      } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        break;
+      }
+    }
+    
+    resp_object *r = resp_read(p->fd_read);
+    if (r) {
+      log_trace("plugin %s: response received", p->name);
+      resp_free(r);
+    }
+    
+    (void)timestamp;
+  }
+  
+  if (p->fd_read >= 0) close(p->fd_read);
+  if (p->fd_write >= 0) close(p->fd_write);
+  p->fd_read = p->fd_write = -1;
+  
+  PT_END(pt);
+}
+#endif

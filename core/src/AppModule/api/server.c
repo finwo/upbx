@@ -653,10 +653,6 @@ PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
   PT_END(pt);
 }
 
-static void __attribute__((constructor)) api_register(void) {
-  appmodule_pt_add(api_listener_pt, NULL);
-}
-
 void api_stop(void) {
   if (listen_fd >= 0) {
     close(listen_fd);

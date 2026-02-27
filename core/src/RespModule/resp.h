@@ -35,6 +35,9 @@ resp_object *resp_map_get(const resp_object *o, const char *key);
 /* Map + key → string value (BULK/SIMPLE), or NULL. Valid until resp freed. */
 const char *resp_map_get_string(const resp_object *o, const char *key);
 
+/* Map helper: set key to value in array-as-map. Takes ownership of value. */
+void resp_map_set(resp_object *map, const char *key, resp_object *value);
+
 /* Decode one RESP value from fd. Caller must resp_free result. Returns NULL on error. */
 resp_object *resp_read(int fd);
 

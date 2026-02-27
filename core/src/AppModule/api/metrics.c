@@ -14,14 +14,14 @@
 #include "rxi/log.h"
 #include "config.h"
 #include "AppModule/command/daemon.h"
-#include "AppModule/service/metrics.h"
+#include "AppModule/api/metrics.h"
 #include "PluginModule/plugin.h"
-#include "AppModule/service/api.h"
+#include "AppModule/api/server.h"
 #include "common/pt.h"
-#include "AppModule/service/metrics.h"
-#include "AppModule/call.h"
-#include "AppModule/registration.h"
-#include "AppModule/trunk_reg.h"
+#include "AppModule/api/metrics.h"
+#include "AppModule/pbx/call.h"
+#include "AppModule/pbx/registration.h"
+#include "AppModule/pbx/trunk_reg.h"
 
 /* EMA decay constants: exp(-1/N) for N seconds in the window */
 
@@ -50,20 +50,20 @@ static size_t count_calls(void) {
 static bool write_call_map(api_client_t *c, call_t *call) {
   if (!api_write_array(c, 20)) return false;
   if (!api_write_kv(c, "call_id", call->call_id)) return false;
-  if (!api_write_kv(c, "direction", call->direction ? call->direction : "")) return false;
+  if (!api_write_kv(c, "direction", call->direction)) return false;
   if (!api_write_kv(c, "source", call->source_str ? call->source_str : "")) return false;
   if (!api_write_kv(c, "destination", call->dest_str ? call->dest_str : "")) return false;
   if (!api_write_kv(c, "trunk", call->trunk_name ? call->trunk_name : "")) return false;
-  if (!api_write_kv_int(c, "answered", call->answered)) return false;
-  if (!api_write_kv_time(c, "created_at", (long)call->created_at)) return false;
-  if (!api_write_kv_time(c, "answered_at", (long)call->answered_at)) return false;
+  if (!api_write_kv_int(c, "answered", call->answered_flag)) return false;
+  if (!api_write_kv_time(c, "created_at", (long)call->created)) return false;
+  if (!api_write_kv_time(c, "answered_at", (long)call->answered)) return false;
   if (!api_write_kv_int(c, "forks", (int)call->n_forks)) return false;
   if (!api_write_kv_int(c, "pending", (int)call->n_pending_exts)) return false;
   return true;
 }
 
 /* Write one extension from registration (metrics uses registration list only) */
-static bool write_extension_map(api_client_t *c, ext_reg_t *reg) {
+static bool write_extension_map(api_client_t *c, extension_reg_t *reg) {
   const char *contact = reg->contact ? reg->contact : "";
   const char *trunk = reg->trunk_name ? reg->trunk_name : "";
   if (!api_write_array(c, 12)) return false;
@@ -116,7 +116,7 @@ static bool cmd_metrics_keys(api_client_t *c, char **args, int nargs) {
 }
 
 /* Count unique trunk names in registration list */
-static size_t count_unique_trunks(ext_reg_t **regs, size_t n) {
+static size_t count_unique_trunks(extension_reg_t **regs, size_t n) {
   size_t u = 0;
   for (size_t i = 0; i < n; i++) {
     const char *t = regs[i]->trunk_name ? regs[i]->trunk_name : "";
@@ -138,14 +138,14 @@ static bool cmd_metrics_llen(api_client_t *c, char **args, int nargs) {
   if (strcasecmp(key, "calls") == 0)
     return api_write_int(c, (int)count_calls());
   if (strcasecmp(key, "extensions") == 0) {
-    ext_reg_t **regs = NULL;
+    extension_reg_t **regs = NULL;
     size_t n = registration_get_regs(NULL, NULL, &regs);
     bool ok = api_write_int(c, (int)n);
     if (regs) free(regs);
     return ok;
   }
   if (strcasecmp(key, "trunks") == 0) {
-    ext_reg_t **regs = NULL;
+    extension_reg_t **regs = NULL;
     size_t n = registration_get_regs(NULL, NULL, &regs);
     size_t u = count_unique_trunks(regs, n);
     bool ok = api_write_int(c, (int)u);
@@ -181,7 +181,7 @@ static bool cmd_metrics_lrange(api_client_t *c, char **args, int nargs) {
   }
 
   if (strcasecmp(key, "extensions") == 0) {
-    ext_reg_t **regs = NULL;
+    extension_reg_t **regs = NULL;
     size_t total = registration_get_regs(NULL, NULL, &regs);
     if (start < 0) start = (int)total + start;
     if (stop  < 0) stop  = (int)total + stop;
@@ -198,7 +198,7 @@ static bool cmd_metrics_lrange(api_client_t *c, char **args, int nargs) {
   }
 
   if (strcasecmp(key, "trunks") == 0) {
-    ext_reg_t **regs = NULL;
+    extension_reg_t **regs = NULL;
     size_t n = registration_get_regs(NULL, NULL, &regs);
     /* Build unique trunk names in order */
     const char **names = (const char **)malloc(n * sizeof(const char *));
