@@ -23,6 +23,15 @@ static const char *stored_config_path;
 static char last_parse_section[TRIM_SECTION_SIZE];
 static char last_parse_key[TRIM_NAME_SIZE];
 
+#define MAX_TRUNK_REWRITES 64
+typedef struct {
+  char *trunk_name;
+  regex_t re;
+  char *replace;
+} trunk_rewrite_t;
+static trunk_rewrite_t trunk_rewrites[MAX_TRUNK_REWRITES];
+static size_t n_trunk_rewrites = 0;
+
 static char *trim_copy(char *dest, size_t dest_size, const char *src) {
   if (!dest || dest_size == 0) return dest;
   dest[0] = '\0';
@@ -220,8 +229,107 @@ void config_last_parse_error(char *section_out, size_t section_size, char *key_o
 }
 
 int config_compile_trunk_rewrites(resp_object *cfg) {
-  (void)cfg;
   log_trace("config_compile_trunk_rewrites");
+
+  for (size_t i = 0; i < n_trunk_rewrites; i++) {
+    if (trunk_rewrites[i].trunk_name) free(trunk_rewrites[i].trunk_name);
+    if (trunk_rewrites[i].replace) free(trunk_rewrites[i].replace);
+    regfree(&trunk_rewrites[i].re);
+  }
+  n_trunk_rewrites = 0;
+
+  for (size_t i = 0; i < 256; i++) {
+    char key[32];
+    snprintf(key, sizeof(key), "trunk:%zu", i);
+    resp_object *trunk = resp_map_get(cfg, key);
+    if (!trunk || trunk->type != RESPT_ARRAY) continue;
+
+    const char *trunk_name = NULL;
+    const char *pattern = NULL;
+    const char *replace = NULL;
+
+    for (size_t j = 0; j + 1 < trunk->u.arr.n; j += 2) {
+      if (trunk->u.arr.elem[j].type != RESPT_BULK) continue;
+      const char *k = trunk->u.arr.elem[j].u.s;
+      if (!k) continue;
+      if (strcmp(k, "name") == 0 && trunk->u.arr.elem[j+1].type == RESPT_BULK) {
+        trunk_name = trunk->u.arr.elem[j+1].u.s;
+      } else if (strcmp(k, "pattern") == 0 && trunk->u.arr.elem[j+1].type == RESPT_BULK) {
+        pattern = trunk->u.arr.elem[j+1].u.s;
+      } else if (strcmp(k, "replace") == 0 && trunk->u.arr.elem[j+1].type == RESPT_BULK) {
+        replace = trunk->u.arr.elem[j+1].u.s;
+      }
+    }
+
+    if (trunk_name && pattern && replace && n_trunk_rewrites < MAX_TRUNK_REWRITES) {
+      int r = regcomp(&trunk_rewrites[n_trunk_rewrites].re, pattern, REG_ICASE|REG_EXTENDED);
+      if (r != 0) {
+        char errbuf[256];
+        regerror(r, &trunk_rewrites[n_trunk_rewrites].re, errbuf, sizeof(errbuf));
+        log_error("trunk '%s': invalid pattern '%s': %s", trunk_name, pattern, errbuf);
+        continue;
+      }
+      trunk_rewrites[n_trunk_rewrites].trunk_name = strdup(trunk_name);
+      trunk_rewrites[n_trunk_rewrites].replace = strdup(replace);
+      n_trunk_rewrites++;
+      log_info("trunk '%s': rewrite pattern '%s' -> '%s'", trunk_name, pattern, replace);
+    }
+  }
+
+  log_info("compiled %zu trunk rewrite rules", n_trunk_rewrites);
+  return 0;
+}
+
+int config_rewrite_destination(const char *trunk_name, const char *input, char *output, size_t out_size) {
+  if (!input || !output || out_size == 0) return -1;
+  output[0] = '\0';
+
+  for (size_t i = 0; i < n_trunk_rewrites; i++) {
+    if (trunk_name && strcmp(trunk_rewrites[i].trunk_name, trunk_name) != 0) continue;
+
+    regmatch_t pmatch[10];
+    if (regexec(&trunk_rewrites[i].re, input, 10, pmatch, 0) != 0) continue;
+
+    char buf[256];
+    strncpy(buf, input, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *rp = strdup(trunk_rewrites[i].replace);
+    if (!rp) break;
+
+    for (char *pos = rp; *pos; pos++) {
+      if (*pos == '\\' && *(pos + 1) > '0' && *(pos + 1) <= '9') {
+        int idx = *(pos + 1) - '0';
+        int so = pmatch[idx].rm_so;
+        int n = pmatch[idx].rm_eo - so;
+        if (so >= 0 && strlen(rp) + n - 1 < (int)sizeof(buf)) {
+          memmove(pos + n, pos + 2, strlen(pos) - 1);
+          memmove(pos, buf + so, n);
+          pos = pos + n - 2;
+        }
+      }
+    }
+
+    int sub = pmatch[1].rm_so;
+    char *p = buf;
+    while (!regexec(&trunk_rewrites[i].re, p, 1, pmatch, 0)) {
+      int n = pmatch[0].rm_eo - pmatch[0].rm_so;
+      p += pmatch[0].rm_so;
+      if (strlen(buf) - n + strlen(rp) >= (int)out_size) break;
+      memmove(p + strlen(rp), p + n, strlen(p) - n + 1);
+      memmove(p, rp, strlen(rp));
+      p += strlen(rp);
+      if (sub >= 0) break;
+    }
+
+    strncpy(output, buf, out_size - 1);
+    output[out_size - 1] = '\0';
+    free(rp);
+    return 1;
+  }
+
+  strncpy(output, input, out_size - 1);
+  output[out_size - 1] = '\0';
   return 0;
 }
 

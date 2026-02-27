@@ -38,6 +38,9 @@ void config_last_parse_error(char *section_out, size_t section_size, char *key_o
 /* Compile trunk rewrite patterns (POSIX regex). Call after config_load. Returns 0 on success, -1 on compile error. */
 int config_compile_trunk_rewrites(resp_object *cfg);
 
+/* Apply trunk rewrite patterns to destination number. Returns 1 if rewritten, 0 if no match. */
+int config_rewrite_destination(const char *trunk_name, const char *input, char *output, size_t out_size);
+
 /* Initialize config to defaults */
 void config_init(void);
 

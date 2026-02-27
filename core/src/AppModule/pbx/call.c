@@ -34,7 +34,7 @@ static int parse_sdp_port(const char *sdp, const char *media, int *port, char *i
       const char *p = m + 2 + strlen(media);
       while (*p == ' ') p++;
       *port = atoi(p);
-      
+
       const char *c = strstr(m, "c=IN ");
       if (c) {
         c += 5;
@@ -67,7 +67,7 @@ static int rewrite_sdp_port(char *sdp, int new_port, const char *new_ip) {
     }
     memcpy(m, buf, new_len);
   }
-  
+
   char *c = strstr(sdp, "c=IN IP4 ");
   if (c && new_ip) {
     char *p = c + 9;
@@ -79,19 +79,19 @@ static int rewrite_sdp_port(char *sdp, int new_port, const char *new_ip) {
     }
     memcpy(c + 9, new_ip, new_len);
   }
-  
+
   return 0;
 }
 
 static int is_emergency(const char *number) {
   if (!global_cfg) return 0;
-  
+
   resp_object *emergency = config_get_emergency();
   if (!emergency || emergency->type != RESPT_ARRAY) {
     resp_free(emergency);
     return 0;
   }
-  
+
   for (size_t i = 0; i < emergency->u.arr.n; i++) {
     if (emergency->u.arr.elem[i].type == RESPT_BULK || emergency->u.arr.elem[i].type == RESPT_SIMPLE) {
       const char *e = emergency->u.arr.elem[i].u.s;
@@ -107,26 +107,26 @@ static int is_emergency(const char *number) {
 
 int call_route_invite(const char *from_ext, const char *to, const char *call_id, const char *sdp, char **out_sdp) {
   log_info("call_route: %s -> %s, call_id=%s", from_ext, to, call_id);
-  
+
   if (is_emergency(to)) {
     log_info("call_route: emergency call %s", to);
   }
-  
+
   const char *source_contact = registration_get_contact(from_ext);
   if (!source_contact) {
     log_error("call_route: extension %s not registered", from_ext);
     return -1;
   }
-  
+
   extension_reg_t *dest_reg = registration_find(to);
   if (dest_reg) {
     log_info("call_route: ext-to-ext %s -> %s", from_ext, to);
-    
+
     if (call_count >= MAX_CALLS) {
       log_error("call_route: max calls reached");
       return -1;
     }
-    
+
     call_t *c = calloc(1, sizeof(*c));
     c->call_id = strdup(call_id);
     c->source = strdup(from_ext);
@@ -135,11 +135,11 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
     c->dest_contact = strdup(dest_reg->contact);
     c->created = time(NULL);
     c->active = 1;
-    
+
     char src_ip[64] = "0.0.0.0";
     int src_port = 0;
     parse_sdp_port(sdp, "audio", &src_port, src_ip, sizeof(src_ip));
-    
+
     rtp_session_info_t info;
     if (rtp_client_create_session(call_id, src_ip, src_port, from_ext, &info) == 0) {
       c->source_rtp_port = info.port;
@@ -150,7 +150,7 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
         strncpy(c->source_rtp_ip, "0.0.0.0", sizeof(c->source_rtp_ip) - 1);
       }
     }
-    
+
     dest_reg = registration_find(to);
     if (dest_reg && dest_reg->via_addr) {
       rtp_session_info_t info2;
@@ -164,24 +164,30 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
         }
       }
     }
-    
+
     calls[call_count++] = c;
     c->next = call_head;
     call_head = c;
-    
+
     *out_sdp = strdup(sdp);
     rewrite_sdp_port(*out_sdp, c->dest_rtp_port, c->dest_rtp_ip[0] ? c->dest_rtp_ip : NULL);
-    
+
     return 0;
   }
-  
+
   log_info("call_route: ext-to-trunk %s -> %s", from_ext, to);
-  
+
+  char rewritten_dest[256] = "";
+  if (config_rewrite_destination("", to, rewritten_dest, sizeof(rewritten_dest)) > 0) {
+    log_info("call_route: rewritten dest '%s' -> '%s'", to, rewritten_dest);
+    to = rewritten_dest;
+  }
+
   if (call_count >= MAX_CALLS) {
     log_error("call_route: max calls reached");
     return -1;
   }
-  
+
   call_t *c = calloc(1, sizeof(*c));
   c->call_id = strdup(call_id);
   c->source = strdup(from_ext);
@@ -189,11 +195,11 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
   c->source_contact = strdup(source_contact);
   c->created = time(NULL);
   c->active = 1;
-  
+
   char src_ip[64] = "0.0.0.0";
   int src_port = 0;
   parse_sdp_port(sdp, "audio", &src_port, src_ip, sizeof(src_ip));
-  
+
   rtp_session_info_t info;
   if (rtp_client_create_session(call_id, src_ip, src_port, from_ext, &info) == 0) {
     c->source_rtp_port = info.port;
@@ -202,30 +208,30 @@ int call_route_invite(const char *from_ext, const char *to, const char *call_id,
       free(info.advertise_ip);
     }
   }
-  
+
   calls[call_count++] = c;
-  
+
   *out_sdp = strdup(sdp);
   char *advertise = config_get_rtp_advertise_addr();
   rewrite_sdp_port(*out_sdp, c->source_rtp_port, advertise);
   free(advertise);
-  
+
   return 0;
 }
 
 void call_handle_bye(const char *call_id) {
   call_t *c = find_call(call_id);
   if (!c) return;
-  
+
   log_info("call_handle_bye: call_id=%s", call_id);
-  
+
   if (c->source_rtp_port > 0) {
     rtp_client_delete_session(call_id, c->source, NULL);
   }
   if (c->dest_rtp_port > 0) {
     rtp_client_delete_session(call_id, "dest", NULL);
   }
-  
+
   for (size_t i = 0; i < call_count; i++) {
     if (calls[i] == c) {
       memmove(&calls[i], &calls[i+1], (call_count - i - 1) * sizeof(call_t*));
@@ -233,7 +239,7 @@ void call_handle_bye(const char *call_id) {
       break;
     }
   }
-  
+
   free(c->call_id);
   free(c->source);
   free(c->destination);
