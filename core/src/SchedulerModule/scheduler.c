@@ -92,24 +92,6 @@ int schedmod_main() {
   int maxfd = -1;
 
   for(;;) {
-    FD_ZERO(&g_want_fds);
-
-    pt_task_t *task = pt_first;
-    while (task) {
-      task->maxfd = -1;
-      task = task->next;
-    }
-
-    task = pt_first;
-    while (task) {
-      pt_task_t *next = task->next;
-      task->is_active = PT_SCHEDULE(task->func(&task->pt, 0, task));
-      if (!task->is_active) {
-        schedmod_pt_remove(task);
-      }
-      task = next;
-    }
-
     maxfd = -1;
     for (int fd = 0; fd < FD_SETSIZE; fd++) {
       if (FD_ISSET(fd, &g_want_fds)) {
@@ -126,7 +108,9 @@ int schedmod_main() {
     int64_t timestamp = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
     g_select_result = g_want_fds;
 
-    task = pt_first;
+    FD_ZERO(&g_want_fds);
+
+    pt_task_t *task = pt_first;
     while (task) {
       pt_task_t *next = task->next;
       task->is_active = PT_SCHEDULE(task->func(&task->pt, timestamp, task));

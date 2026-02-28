@@ -534,7 +534,6 @@ PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
       PT_YIELD(pt);
     }
   }
-  /* Cleanup */
   if (fds) {
     for (int i = 1; i <= fds[0]; i++) {
       close(fds[i]);
