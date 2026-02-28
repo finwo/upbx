@@ -445,6 +445,7 @@ static int setup_leg(rtp_session_t *s, int leg) {
 PT_THREAD(rtp_session_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   rtp_session_t *s = task->udata;
 
+  log_trace("rtp_session: protothread entry call_id=%s", s->call_id ? s->call_id : "(null)");
   PT_BEGIN(pt);
 
   if (setup_leg(s, 0) < 0 || setup_leg(s, 1) < 0) {
@@ -539,6 +540,7 @@ static void spawn_session_pt(rtp_session_t *s) {
 
 PT_THREAD(rtpproxy_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   (void)timestamp;
+  log_trace("rtpproxy_server: protothread entry");
   PT_BEGIN(pt);
 
   PT_WAIT_UNTIL(pt, global_cfg);

@@ -2,6 +2,7 @@
 #include <sys/select.h>
 #include <sys/time.h>
 
+#include "rxi/log.h"
 #include "scheduler.h"
 
 #ifndef NULL
@@ -113,7 +114,9 @@ int schedmod_main() {
     pt_task_t *task = pt_first;
     while (task) {
       pt_task_t *next = task->next;
+      log_trace("scheduler: running task %p", (void*)task->func);
       task->is_active = PT_SCHEDULE(task->func(&task->pt, timestamp, task));
+      log_trace("scheduler: task %p returned, is_active=%d", (void*)task->func, task->is_active);
       if (!task->is_active) {
         schedmod_pt_remove(task);
       }

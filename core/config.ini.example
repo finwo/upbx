@@ -1,6 +1,8 @@
 [upbx]
 listen = 0.0.0.0:5060
 daemonize = 0
+# secret = <32-char-hex-for-nonce-signing>
+# registrations = /var/lib/upbx/registrations
 # locality = 4
 # emergency = 911
 # emergency = 112

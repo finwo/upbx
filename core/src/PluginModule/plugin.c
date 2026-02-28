@@ -352,6 +352,7 @@ const char *plugmod_name_at(size_t i) {
 #ifdef UPBX_BUILD
 PT_THREAD(plugin_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   plugin_state_t *p = task->udata;
+  log_trace("plugin: protothread entry name=%s", p->name ? p->name : "(null)");
   PT_BEGIN(pt);
 
   PT_INIT(&p->pt);

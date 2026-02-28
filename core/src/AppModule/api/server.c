@@ -465,6 +465,7 @@ static void handle_accept(int ready_fd) {
 
 PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   time_t loop_timestamp = 0;
+  log_trace("api_server: protothread entry");
   PT_BEGIN(pt);
 
   resp_object *api_sec = resp_map_get(global_cfg, "api");
@@ -554,6 +555,7 @@ PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
   (void)timestamp;
   api_client_t *state = task->udata;
 
+  log_trace("api_client: protothread entry fd=%d", state->fd);
   PT_BEGIN(pt);
 
   state->fds = malloc(sizeof(int) * 2);
