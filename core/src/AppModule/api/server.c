@@ -41,6 +41,7 @@ PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
 
 struct api_client_state {
   int       fd;
+  int      *fds;
   char     *username;
   char      rbuf[READ_BUF_SIZE];
   size_t    rlen;
@@ -486,20 +487,6 @@ PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
     PT_EXIT(pt);
   }
 
-  task->read_fds = malloc(sizeof(int) * (fds[0] + 1));
-  if (!task->read_fds) {
-    for (int i = 1; i <= fds[0]; i++) close(fds[i]);
-    free(fds);
-    free(current_listen);
-    current_listen = NULL;
-    PT_EXIT(pt);
-  }
-  task->read_fds[0] = fds[0];
-  for (int i = 1; i <= fds[0]; i++) {
-    task->read_fds[i] = fds[i];
-  }
-  free(fds);
-
   for (;;) {
     loop_timestamp = (time_t)(timestamp / 1000);
 
@@ -510,9 +497,9 @@ PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
       int rebind = (current_listen && (!new_str[0] || strcmp(current_listen, new_str) != 0)) ||
                    (!current_listen && new_str[0]);
       if (rebind) {
-        if (task->read_fds) {
-          for (int i = 1; i <= task->read_fds[0]; i++) {
-            close(task->read_fds[i]);
+        if (fds) {
+          for (int i = 1; i <= fds[0]; i++) {
+            close(fds[i]);
           }
         }
         free(current_listen);
@@ -520,10 +507,10 @@ PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
         if (current_listen) {
           int *new_fds = create_listen_socket(current_listen);
           if (new_fds) {
-            task->read_fds = realloc(task->read_fds, sizeof(int) * (new_fds[0] + 1));
-            task->read_fds[0] = new_fds[0];
+            fds = realloc(fds, sizeof(int) * (new_fds[0] + 1));
+            fds[0] = new_fds[0];
             for (int i = 1; i <= new_fds[0]; i++) {
-              task->read_fds[i] = new_fds[i];
+              fds[i] = new_fds[i];
             }
             free(new_fds);
           } else {
@@ -534,21 +521,25 @@ PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
       }
     }
 
-    if (task->read_fds && task->read_fds[0] > 0) {
-      int ready_fd = -1;
-      PT_WAIT_UNTIL(pt, schedmod_pt_has_data(task, &ready_fd) == 0);
-      if (ready_fd >= 0) {
-        handle_accept(ready_fd);
+    if (fds && fds[0] > 0) {
+      int *ready_fds = NULL;
+      PT_WAIT_UNTIL(pt, schedmod_has_data(fds, &ready_fds) > 0);
+      if (ready_fds && ready_fds[0] > 0) {
+        for (int i = 1; i <= ready_fds[0]; i++) {
+          handle_accept(ready_fds[i]);
+        }
       }
+      free(ready_fds);
     } else {
       PT_YIELD(pt);
     }
   }
   /* Cleanup */
-  if (task->read_fds) {
-    for (int i = 1; i <= task->read_fds[0]; i++) {
-      close(task->read_fds[i]);
+  if (fds) {
+    for (int i = 1; i <= fds[0]; i++) {
+      close(fds[i]);
     }
+    free(fds);
   }
   free(current_listen);
   current_listen = NULL;
@@ -566,18 +557,30 @@ PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
 
   PT_BEGIN(pt);
 
-  task->read_fds = malloc(sizeof(int));
-  task->read_fds = malloc(sizeof(int) * 2);
-  if (!task->read_fds) {
+  state->fds = malloc(sizeof(int) * 2);
+  if (!state->fds) {
     free(state);
     PT_EXIT(pt);
   }
-  task->read_fds[0] = 1;
-  task->read_fds[1] = state->fd;
+  state->fds[0] = 1;
+  state->fds[1] = state->fd;
 
   for (;;) {
+    int *ready_fds = NULL;
+    PT_WAIT_UNTIL(pt, schedmod_has_data(state->fds, &ready_fds) > 0);
+
     int ready_fd = -1;
-    PT_WAIT_UNTIL(pt, schedmod_pt_has_data(task, &ready_fd) == 0 && ready_fd == state->fd);
+    if (ready_fds && ready_fds[0] > 0) {
+      for (int i = 1; i <= ready_fds[0]; i++) {
+        if (ready_fds[i] == state->fd) {
+          ready_fd = state->fd;
+          break;
+        }
+      }
+    }
+    free(ready_fds);
+
+    if (ready_fd != state->fd) continue;
 
     size_t space = sizeof(state->rbuf) - state->rlen;
     if (space == 0) {
@@ -609,6 +612,7 @@ PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task))
   if (state->fd >= 0) {
     close(state->fd);
   }
+  free(state->fds);
   free(state->wbuf);
   free(state->username);
   free(state);

@@ -10,6 +10,7 @@
 
 pt_task_t *pt_first = NULL;
 fd_set g_select_result;
+static fd_set g_want_fds;
 
 int schedmod_pt_create(pt_task_fn fn, void *udata) {
   if (!fn) return 1;
@@ -19,7 +20,6 @@ int schedmod_pt_create(pt_task_fn fn, void *udata) {
   node->func           = fn;
   node->udata          = udata;
   PT_INIT(&node->pt);
-  node->read_fds   = NULL;
   node->is_active  = 1;
   pt_first = node;
 
@@ -39,7 +39,6 @@ int schedmod_pt_remove(pt_task_t *task) {
       } else {
         pt_first = curr->next;
       }
-      if (curr->read_fds) free(curr->read_fds);
       free(curr);
       return 0;
     }
@@ -50,20 +49,40 @@ int schedmod_pt_remove(pt_task_t *task) {
   return 1;
 }
 
-int schedmod_pt_has_data(pt_task_t *task, int *out_fd) {
-  if (!task || !out_fd || !task->read_fds || task->read_fds[0] == 0)
-    return -1;
+int schedmod_has_data(int *in_fds, int **out_fds) {
+  if (!in_fds || in_fds[0] == 0) return 0;
 
-  *out_fd = -1;
-
-  for (int i = 1; i <= task->read_fds[0]; i++) {
-    int fd = task->read_fds[i];
-    if (fd >= 0 && FD_ISSET(fd, &g_select_result)) {
-      *out_fd = fd;
-      return 0;
+  for (int i = 1; i <= in_fds[0]; i++) {
+    int fd = in_fds[i];
+    if (fd >= 0) {
+      FD_SET(fd, &g_want_fds);
     }
   }
-  return -1;
+
+  if (*out_fds) free(*out_fds);
+  *out_fds = NULL;
+
+  int count = 0;
+  for (int i = 1; i <= in_fds[0]; i++) {
+    if (in_fds[i] >= 0 && FD_ISSET(in_fds[i], &g_select_result)) {
+      count++;
+    }
+  }
+
+  if (count == 0) return 0;
+
+  *out_fds = malloc(sizeof(int) * (count + 1));
+  if (!*out_fds) return 0;
+
+  (*out_fds)[0] = count;
+  int idx = 1;
+  for (int i = 1; i <= in_fds[0]; i++) {
+    if (in_fds[i] >= 0 && FD_ISSET(in_fds[i], &g_select_result)) {
+      (*out_fds)[idx++] = in_fds[i];
+    }
+  }
+
+  return count;
 }
 
 int schedmod_main() {
@@ -73,33 +92,39 @@ int schedmod_main() {
   int maxfd = -1;
 
   for(;;) {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
+    FD_ZERO(&g_want_fds);
 
     pt_task_t *task = pt_first;
     while (task) {
       task->maxfd = -1;
-      if (task->read_fds) {
-        for (int i = 1; i <= task->read_fds[0]; i++) {
-          int fd = task->read_fds[i];
-          if (fd >= 0) {
-            FD_SET(fd, &read_fds);
-            if (fd > maxfd) maxfd = fd;
-            if (task->maxfd < fd) task->maxfd = fd;
-          }
-        }
-      }
       task = task->next;
+    }
+
+    task = pt_first;
+    while (task) {
+      pt_task_t *next = task->next;
+      task->is_active = PT_SCHEDULE(task->func(&task->pt, 0, task));
+      if (!task->is_active) {
+        schedmod_pt_remove(task);
+      }
+      task = next;
+    }
+
+    maxfd = -1;
+    for (int fd = 0; fd < FD_SETSIZE; fd++) {
+      if (FD_ISSET(fd, &g_want_fds)) {
+        if (fd > maxfd) maxfd = fd;
+      }
     }
 
     tv.tv_sec = 0;
     tv.tv_usec = 100000;
-    select(maxfd + 1, &read_fds, NULL, NULL, &tv);
+    select(maxfd + 1, &g_want_fds, NULL, NULL, &tv);
 
     struct timeval now;
     gettimeofday(&now, NULL);
     int64_t timestamp = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
-    g_select_result = read_fds;
+    g_select_result = g_want_fds;
 
     task = pt_first;
     while (task) {

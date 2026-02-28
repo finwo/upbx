@@ -28,6 +28,7 @@ typedef struct {
   pid_t pid;
   int fd_write;
   int fd_read;
+  int *fds;
   char **methods;
   size_t method_count;
   int stopping;
@@ -55,6 +56,7 @@ static void plugin_state_free(plugin_state_t *p) {
   free(p->exec);
   for (size_t i = 0; i < p->method_count; i++) free(p->methods[i]);
   free(p->methods);
+  free(p->fds);
   if (p->fd_read >= 0) close(p->fd_read);
   if (p->fd_write >= 0) close(p->fd_write);
 }
@@ -353,19 +355,32 @@ PT_THREAD(plugin_pt(struct pt *pt, int64_t timestamp, struct pt_task *task)) {
   PT_BEGIN(pt);
 
   PT_INIT(&p->pt);
-  task->read_fds = malloc(sizeof(int) * 2);
-  if (!task->read_fds) {
+  p->fds = malloc(sizeof(int) * 2);
+  if (!p->fds) {
     p->fd_read = p->fd_write = -1;
     PT_EXIT(pt);
   }
-  task->read_fds[0] = 1;
-  task->read_fds[1] = p->fd_read;
+  p->fds[0] = 1;
+  p->fds[1] = p->fd_read;
 
   for (;;) {
     if (p->stopping && p->pid <= 0) break;
 
+    int *ready_fds = NULL;
+    PT_WAIT_UNTIL(pt, schedmod_has_data(p->fds, &ready_fds) > 0);
+
     int ready_fd = -1;
-    PT_WAIT_UNTIL(pt, pt_task_has_data(task, &ready_fd) == 0 && ready_fd == p->fd_read);
+    if (ready_fds && ready_fds[0] > 0) {
+      for (int i = 1; i <= ready_fds[0]; i++) {
+        if (ready_fds[i] == p->fd_read) {
+          ready_fd = p->fd_read;
+          break;
+        }
+      }
+    }
+    free(ready_fds);
+
+    if (ready_fd != p->fd_read) continue;
 
     size_t space = sizeof(p->rbuf) - p->rlen;
     if (space > 0) {

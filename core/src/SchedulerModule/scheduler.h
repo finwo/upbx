@@ -15,7 +15,6 @@ typedef struct pt_task {
   struct pt_task *next;
   pt_task_fn func;
   void *udata;
-  int *read_fds;  /* int array: index 0 = count, index 1+ = fds */
   char is_active;
   int maxfd;
 } pt_task_t;
@@ -26,6 +25,6 @@ int schedmod_main();
 
 extern fd_set g_select_result;
 
-int schedmod_pt_has_data(pt_task_t *task, int *out_fd);
+int schedmod_has_data(int *in_fds, int **out_fds);
 
 #endif // __SCHEDULERMODULE_SCHEDULER_H__
