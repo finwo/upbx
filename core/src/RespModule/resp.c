@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "rxi/log.h"
 #include "RespModule/resp.h"
 
 #define MAX_BULK_LEN    (256 * 1024)

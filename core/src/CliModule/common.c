@@ -12,8 +12,6 @@
 
 struct climodule_command *climodule_commands = NULL;
 
-static const char *global_config_path = NULL;
-
 const char *cli_find_arg(int argc, const char **argv, const char *name) {
   for (int i = 0; i < argc - 1; i++)
     if (strcmp(argv[i], name) == 0)
@@ -32,14 +30,6 @@ size_t cli_collect_positional(int argc, const char **argv, int start,
     out[n++] = argv[i];
   }
   return n;
-}
-
-void cli_set_config_path(const char *path) {
-  global_config_path = path;
-}
-
-const char *cli_config_path(void) {
-  return global_config_path;
 }
 
 const char *cli_resolve_default_config(void) {

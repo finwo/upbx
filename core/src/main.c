@@ -33,26 +33,26 @@ INCTXT(License, "LICENSE.md");
 ///
 /// **Synopsis**
 ///
-/// **upbx** [global options] &lt;command&gt; [command options and arguments]  
-/// **upbx** `-h` | `--help`  
-/// **upbx** `--license`  
+/// **upbx** [global options] &lt;command&gt; [command options and arguments]
+/// **upbx** `-h` | `--help`
+/// **upbx** `--license`
 /// **upbx** `list-commands`
 ///
 /// **Options**
 ///
-/// `-h`, `--help`  
+/// `-h`, `--help`
 ///   Print the usage strings and options for this layer to stderr and exit. Shows the usages and the global options; does not list commands.
 ///
-/// `-f`, `--config` &lt;path&gt;  
+/// `-f`, `--config` &lt;path&gt;
 ///   Config file path. If omitted, the following are tried in order: **$HOME/.config/upbx.conf**, **$HOME/.upbx.conf**, **/etc/upbx/upbx.conf**, **/etc/upbx.conf**. Used by all commands that read or write config (daemon, extension, trunk, api-user, completion).
 ///
-/// `-v`, `--verbosity` &lt;level&gt;  
+/// `-v`, `--verbosity` &lt;level&gt;
 ///   Log verbosity: **fatal**, **error**, **warn**, **info**, **debug**, **trace**. Default: **info**. Applies to the daemon and any command that uses the logging subsystem.
 ///
-/// `--log` &lt;path&gt;  
+/// `--log` &lt;path&gt;
 ///   In addition to stderr, append logs to the given file. Send SIGHUP to the process to reopen the file (e.g. after logrotate). Useful when running the daemon.
 ///
-/// `--license`  
+/// `--license`
 ///   Print the full license text to stdout (paragraphs and list, wrapped to terminal width) and exit with 0. No config is loaded and no command is run.
 ///
 /// **Top-level commands**
@@ -77,10 +77,13 @@ static char *log_path;
 static volatile sig_atomic_t sighup_received;
 
 static void logfile_callback(log_Event *ev) {
-  if (sighup_received && log_path && log_file) {
+  if (sighup_received) {
     sighup_received = 0;
-    fclose(log_file);
-    log_file = fopen(log_path, "a");
+    if (log_path && log_file) {
+      fclose(log_file);
+      log_file = fopen(log_path, "a");
+    }
+    config_reload();
   }
   if (log_file) {
     char buf[64];
@@ -118,6 +121,7 @@ static void print_license_paragraph(const char *start, const char *end, int widt
   for (size_t i = 0; i < n; i++)
     if (buf[i] == '\n') buf[i] = ' ';
   cli_print_wrapped(stdout, buf, width, 0);
+  fputc('\n', stdout);
   fputc('\n', stdout);
 }
 
@@ -162,6 +166,7 @@ static void print_license_list(const char *start, const char *end, int width) {
     fputc('\n', stdout);
     p = item_end;
   }
+  fputc('\n', stdout);
 }
 
 static void cli_print_license(FILE *out, const char *text, int width) {
@@ -191,7 +196,7 @@ static void cli_print_license(FILE *out, const char *text, int width) {
       const char *r = strstr(q, "<!-- list:end -->");
       if (r)
         print_license_list(q, r, width);
-      p = r ? r + 16 : q + strlen(q);
+      p = r ? r + 17 : q + strlen(q);
       continue;
     }
     const char *close = strchr(q, '>');
@@ -233,8 +238,8 @@ int main(int argc, const char **argv) {
   /* Resolve config path: explicit -f, then default locations */
   if (!config_path || !config_path[0])
     config_path = cli_resolve_default_config();
-  cli_set_config_path(config_path);
   config_set_path(config_path);
+  config_init();
 
   int level = LOG_INFO;
   if (0) {

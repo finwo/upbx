@@ -18,6 +18,8 @@
 #ifndef __PT_H__
 #define __PT_H__
 
+#include <stddef.h>
+
 /* ==========================================================================
  * Internal: unique labels for continuation points (GCC addrlabels).
  * Not for direct use; merged into PT_BEGIN / PT_WAIT_UNTIL / PT_YIELD etc.

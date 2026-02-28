@@ -1,8 +1,6 @@
 #ifndef __APPMODULE_DAEMON_H__
 #define __APPMODULE_DAEMON_H__
 
-#include "AppModule/scheduler/daemon.h"
-
 int appmodule_cmd_daemon(int argc, const char **argv);
 
 #endif

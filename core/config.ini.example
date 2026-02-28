@@ -7,16 +7,19 @@ daemonize = 0
 
 # RTP Proxy configuration
 # mode: "builtin" (default) or "external"
-# url: socket URL for RTPP control protocol
+# address: socket URL for RTPP control protocol
 #   - unix:///path/to/socket   (Unix domain socket)
-#   - cunix:///path/to/socket  (Connection-oriented Unix socket)
-#   - tcp://host:port          (TCP socket, default port 22222)
-#   - udp://host:port          (UDP socket, default port 22222)
+#   - tcp://host:port          (TCP socket)
+#   - udp://host:port          (UDP socket)
 # ports: RTP port range for relay (default 10000-20000)
+# advertise: advertised address for SDP (useful behind NAT)
+# supports_tcp_media: 0/1 - for PBX to use when building SDP offers
 [rtpproxy]
 mode = builtin
-url = unix:///var/run/upbx-rtpproxy.sock
+address = unix:///var/run/upbx-rtpproxy.sock
 ports = 7000-7099
+# advertise = 203.0.113.1
+supports_tcp_media = 1
 
 # [plugin:myplugin]
 # exec = /usr/bin/my-plugin-binary
