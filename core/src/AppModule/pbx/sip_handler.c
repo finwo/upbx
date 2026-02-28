@@ -279,9 +279,10 @@ char *sip_handle_register(sip_message_t *msg,
         return build_401_response(msg, ext_number, response_len);
     }
     
-    HASHHEX ha1, computed_response;
-    digest_calc_ha1(NULL, ext_number, REALM, password, nonce, cnonce, ha1);
-    digest_calc_response(ha1, nonce, nc, cnonce, qop, "REGISTER", uri, NULL, computed_response);
+    HASHHEX ha1, ha2, computed_response;
+    digest_calc_ha1(ext_number, REALM, password, ha1);
+    digest_calc_ha2("REGISTER", uri, ha2);
+    digest_calc_response(ha1, nonce, ha2, computed_response);
     
     if (strcmp(response, (const char *)computed_response) != 0) {
         log_debug("sip_handler: digest mismatch for %s: expected %s got %s", 

@@ -26,6 +26,7 @@
 #include "common/socket_util.h"
 #include "config.h"
 #include "server.h"
+#include "AppModule/pbx/trunk_reg.h"
 
 struct pt_task;
 PT_THREAD(api_client_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
@@ -384,6 +385,89 @@ static char cmdCOMMAND(api_client_t *c, char **args, int nargs) {
   return 1;
 }
 
+static char cmdTRUNK_LIST(api_client_t *c, char **args, int nargs) {
+  (void)args;
+  if (nargs != 1) {
+    return api_write_err(c, "wrong number of arguments for 'trunk.list'") ? 1 : 0;
+  }
+  
+  size_t count;
+  trunk_reg_t **trunks = trunk_reg_list(&count);
+  
+  if (!api_write_array(c, count * 2)) return 0;
+  
+  for (size_t i = 0; i < count; i++) {
+    trunk_reg_t *t = trunks[i];
+    if (!t) continue;
+    
+    if (!api_write_bulk_cstr(c, "name")) return 0;
+    if (!api_write_bulk_cstr(c, t->name ? t->name : "")) return 0;
+    
+    if (!api_write_bulk_cstr(c, "address")) return 0;
+    if (!api_write_bulk_cstr(c, t->address ? t->address : "")) return 0;
+    
+    if (!api_write_bulk_cstr(c, "host")) return 0;
+    if (!api_write_bulk_cstr(c, t->host ? t->host : "")) return 0;
+    
+    if (!api_write_bulk_cstr(c, "port")) return 0;
+    if (!api_write_bulk_int(c, t->port)) return 0;
+    
+    if (!api_write_bulk_cstr(c, "username")) return 0;
+    if (!api_write_bulk_cstr(c, t->username ? t->username : "")) return 0;
+  }
+  
+  return 1;
+}
+
+static char cmdTRUNK_REGISTRATIONS(api_client_t *c, char **args, int nargs) {
+  (void)args;
+  if (nargs != 1) {
+    return api_write_err(c, "wrong number of arguments for 'trunk.registrations'") ? 1 : 0;
+  }
+  
+  size_t count;
+  trunk_reg_t **trunks = trunk_reg_list(&count);
+  
+  if (!api_write_array(c, count)) return 0;
+  
+  for (size_t i = 0; i < count; i++) {
+    trunk_reg_t *t = trunks[i];
+    if (!t) continue;
+    
+    if (!api_write_array(c, 8)) return 0;
+    
+    if (!api_write_bulk_cstr(c, "name")) return 0;
+    if (!api_write_bulk_cstr(c, t->name ? t->name : "")) return 0;
+    
+    if (!api_write_bulk_cstr(c, "registered")) return 0;
+    if (!api_write_bulk_cstr(c, t->registered ? "1" : "0")) return 0;
+    
+    if (!api_write_bulk_cstr(c, "expires_at")) return 0;
+    if (!api_write_bulk_int(c, (int)t->expires_at)) return 0;
+    
+    if (!api_write_bulk_cstr(c, "cseq")) return 0;
+    if (!api_write_bulk_int(c, (int)t->cseq)) return 0;
+  }
+  
+  return 1;
+}
+
+static char cmdTRUNK_REFRESH(api_client_t *c, char **args, int nargs) {
+  if (nargs != 2) {
+    return api_write_err(c, "wrong number of arguments for 'trunk.refresh' (trunk.refresh <name>)") ? 1 : 0;
+  }
+  
+  const char *name = args[1];
+  trunk_reg_t *t = trunk_reg_find(name);
+  
+  if (!t) {
+    return api_write_err(c, "trunk not found") ? 1 : 0;
+  }
+  
+  trunk_reg_refresh(name);
+  return api_write_ok(c) ? 1 : 0;
+}
+
 /* Command dispatch */
 
 static void init_builtins(void) {
@@ -391,6 +475,9 @@ static void init_builtins(void) {
   api_register_cmd("ping",    cmdPING);
   api_register_cmd("quit",    cmdQUIT);
   api_register_cmd("command", cmdCOMMAND);
+  api_register_cmd("trunk.list",          cmdTRUNK_LIST);
+  api_register_cmd("trunk.registrations", cmdTRUNK_REGISTRATIONS);
+  api_register_cmd("trunk.refresh",       cmdTRUNK_REFRESH);
 }
 
 /* Check if a command is a built-in that bypasses auth/permit checks */

@@ -16,7 +16,7 @@
 // #include "AppModule/plugin.h"
 #include "AppModule/rtp/server.h"
 #include "AppModule/sip/transport_udp.h"
-// #include "AppModule/pbx/trunk_reg.h"
+#include "AppModule/pbx/trunk_reg.h"
 #include "AppModule/api/server.h"
 // #include "AppModule/api/metrics.h"
 
@@ -138,6 +138,7 @@ int appmodule_cmd_daemon(int argc, const char **argv) {
   schedmod_pt_create(api_server_pt, NULL);
   schedmod_pt_create(rtpproxy_server_pt, NULL);
   schedmod_pt_create(sip_transport_udp_pt, NULL);
+  trunk_reg_start_all();
 
   // log_info("daemon starting");
   // plugin_sync();
