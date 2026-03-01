@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <pwd.h>
+#include <grp.h>
 
 int set_socket_nonblocking(int fd, int nonblock) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -277,7 +279,7 @@ int *udp_recv(const char *addr, const char *default_host, const char *default_po
   return fds;
 }
 
-int *unix_listen(const char *path, int sock_type) {
+int *unix_listen(const char *path, int sock_type, const char *owner) {
   if (!path || !path[0]) {
     log_error("unix_listen: empty path");
     return NULL;
@@ -336,9 +338,47 @@ int *unix_listen(const char *path, int sock_type) {
     return NULL;
   }
 
-  if (sock_type == SOCK_DGRAM) {
-    chmod(path_copy, 0777);
-  } else if (sock_type == SOCK_STREAM) {
+  if (owner && owner[0]) {
+    uid_t uid = -1;
+    gid_t gid = -1;
+    char *owner_copy = strdup(owner);
+    if (owner_copy) {
+      char *colon = strchr(owner_copy, ':');
+      if (colon) {
+        *colon = '\0';
+        colon++;
+        if (colon[0]) {
+          struct passwd *pw = getpwnam(owner_copy);
+          if (pw) {
+            uid = pw->pw_uid;
+            struct group *gr = getgrnam(colon);
+            if (gr) {
+              gid = gr->gr_gid;
+            }
+          }
+        }
+      } else {
+        struct passwd *pw = getpwnam(owner_copy);
+        if (pw) {
+          uid = pw->pw_uid;
+          gid = pw->pw_gid;
+        }
+      }
+      free(owner_copy);
+    }
+    if (uid != (uid_t)-1 || gid != (gid_t)-1) {
+      if (fchown(fd, uid, gid) < 0) {
+        log_error("unix_listen: fchown failed: %s", strerror(errno));
+        close(fd);
+        unlink(path_copy);
+        free(path_copy);
+        free(fds);
+        return NULL;
+      }
+    }
+  }
+
+  if (sock_type == SOCK_STREAM) {
     if (listen(fd, 8) < 0) {
       log_error("unix_listen: listen failed: %s", strerror(errno));
       close(fd);

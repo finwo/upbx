@@ -1,4 +1,3 @@
-/// <!-- path: src/main.c -->
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -12,17 +11,14 @@ extern "C" {
 #include "cofyc/argparse.h"
 #include "rxi/log.h"
 
-#include "CliModule/setup.h"
-#include "CliModule/execute_command.h"
-#include "CliModule/common.h"
-#include "config.h"
+#include "infrastructure/config.h"
+#include "interface/cli/common.h"
+#include "interface/cli/command/list_commands.h"
+#include "interface/cli/command/daemon.h"
 
 #ifdef __cplusplus
 }
 #endif
-
-/* Optional AppModule (daemon command) - call from main after climodule_setup if linked */
-extern void appmodule_setup(void);
 
 #define INCBIN_SILENCE_BITCODE_WARNING
 #include "graphitemaster/incbin.h"
@@ -71,7 +67,6 @@ static const char *const usages[] = {
   NULL,
 };
 
-/* Log file state for --log and SIGHUP re-open */
 static FILE *log_file;
 static char *log_path;
 static volatile sig_atomic_t sighup_received;
@@ -199,8 +194,7 @@ static void cli_print_license(FILE *out, const char *text, int width) {
       p = r ? r + 17 : q + strlen(q);
       continue;
     }
-    const char *close = strchr(q, '>');
-    p = close ? close + 1 : q + strlen(q);
+    p = q;
   }
 }
 
@@ -210,8 +204,17 @@ int main(int argc, const char **argv) {
   const char *config_path = NULL;
   static int license_flag = 0;
 
-  climodule_setup();
-  appmodule_setup();
+  cli_register_command(
+    "list-commands",
+    "Displays known commands and their descriptions",
+    cli_cmd_list_commands
+  );
+
+  cli_register_command(
+    "daemon",
+    "Run the SIP PBX server",
+    cli_cmd_daemon
+  );
 
   struct argparse argparse;
   struct argparse_option options[] = {
@@ -235,7 +238,6 @@ int main(int argc, const char **argv) {
     return 1;
   }
 
-  /* Resolve config path: explicit -f, then default locations */
   if (!config_path || !config_path[0])
     config_path = cli_resolve_default_config();
   config_set_path(config_path);
@@ -261,7 +263,7 @@ int main(int argc, const char **argv) {
     return 1;
   }
   log_set_level(level);
-  setvbuf(stderr, NULL, _IOLBF, 0); /* line-buffered so daemon startup lines appear immediately */
+  setvbuf(stderr, NULL, _IOLBF, 0);
 
   log_file = NULL;
   log_path = NULL;
@@ -280,5 +282,5 @@ int main(int argc, const char **argv) {
     }
   }
 
-  return climodule_execute_command(argc, argv);
+  return cli_execute_command(argc, argv);
 }

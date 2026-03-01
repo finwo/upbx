@@ -7,8 +7,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "finwo/assert.h"
-#include "config.h"
-#include "RespModule/resp.h"
+#include "infrastructure/config.h"
+#include "common/resp.h"
 
 /* Write a temporary config file and return its path (caller frees). */
 static char *write_temp_config(const char *content) {

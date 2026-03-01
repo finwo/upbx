@@ -4,7 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "finwo/assert.h"
-#include "AppModule/sip_parse.h"
+#include "domain/pbx/sip/sip_message.h"
 
 /* A minimal INVITE request for testing. */
 static const char *INVITE_REQ =

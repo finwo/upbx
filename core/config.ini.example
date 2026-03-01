@@ -1,5 +1,5 @@
 [upbx]
-listen = 0.0.0.0:5060
+address = :5060
 daemonize = 0
 # secret = <32-char-hex-for-nonce-signing>
 # registrations = /var/lib/upbx/registrations
@@ -7,21 +7,18 @@ daemonize = 0
 # emergency = 911
 # emergency = 112
 
-# RTP Proxy configuration
-# mode: "builtin" (default) or "external"
-# address: socket URL for RTPP control protocol
-#   - unix:///path/to/socket   (Unix domain socket)
-#   - tcp://host:port          (TCP socket)
-#   - udp://host:port          (UDP socket)
-# ports: RTP port range for relay (default 10000-20000)
-# advertise: advertised address for SDP (useful behind NAT)
-# supports_tcp_media: 0/1 - for PBX to use when building SDP offers
+# API server (RESP protocol)
+[api]
+address = :6379
+# socket_owner = user:group
+
+# RTP Proxy configuration (requires running udphole instance)
+# address: udphole socket address (unix:// or tcp://)
+# username/password: optional authentication
 [rtpproxy]
-mode = builtin
-address = unix:///var/run/upbx-rtpproxy.sock
-ports = 7000-7099
-# advertise = 203.0.113.1
-supports_tcp_media = 1
+address = unix:///var/run/udphole.sock
+username = myuser
+password = mypass
 
 # [plugin:myplugin]
 # exec = /usr/bin/my-plugin-binary

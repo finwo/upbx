@@ -6,7 +6,7 @@ A standalone minimalist SIP PBX daemon: extension and trunk registration, call r
 
 ## Building
 
-Requirements: [dep](https://github.com/finwo/dep), C compiler.
+Requirements: [dep](https://github.com/finwo/dep), C compiler, and a running [udphole](https://github.com/finwo/udphole) instance for RTP relay.
 
 ```bash
 make
@@ -57,7 +57,7 @@ Daemonize behaviour:
 - It goes to the **background** only if `daemonize=1` is set in `[upbx]` **or** you pass `-d`/`--daemonize`.
 - `-D`/`--no-daemonize` always forces foreground.
 
-After starting, the daemon loads config, starts the built-in RTP relay, spawns any configured plugins, binds the SIP UDP and TCP sockets, and handles REGISTER (extensions and trunk registration) and INVITE (routing). Logging goes to stderr (and optionally to a file if you use global `--log`).
+After starting, the daemon loads config, connects to the configured udphole instance for RTP relay, spawns any configured plugins, binds the SIP UDP and TCP sockets, and handles REGISTER (extensions and trunk registration) and INVITE (routing). Logging goes to stderr (and optionally to a file if you use global `--log`).
 
 ---
 
@@ -131,8 +131,7 @@ Full example with every option listed (optional ones commented). Minimal setups 
 
 ```ini
 [upbx]
-listen = 0.0.0.0:5060
-rtp_ports = 10000-20000
+address = :5060
 daemonize = 0
 # locality = 4
 # cross_group_calls = 1
@@ -170,7 +169,7 @@ secret = my-secret
 secret = trunk-secret
 
 [api]
-listen = 127.0.0.1:6380
+address = :6379
 
 [api:admin]
 secret = my-password
@@ -189,12 +188,11 @@ permit = metrics.get
 
 ### `[upbx]`
 
-There is **no** `advertise` (or similar) option. The address used in Via/SDP is learned per extension from that extension's REGISTER; `listen` is used as fallback. Do not add an advertise option.
+There is **no** `advertise` (or similar) option. The address used in Via/SDP is learned per extension from that extension's REGISTER; `address` is used as fallback. Do not add an advertise option.
 
 | Option | Description |
 |--------|-------------|
-| `listen` | SIP UDP bind address (e.g. `0.0.0.0:5060` or `192.168.1.1:5060`). Fallback for Via/SDP when not yet learned from REGISTER. |
-| `rtp_ports` | Port range for the built-in RTP relay, as `low-high` (e.g. `10000-20000`). Default 10000–20000. |
+| `address` | SIP UDP bind address (e.g. `:5060`, `0.0.0.0:5060` or `192.168.1.1:5060`). Fallback for Via/SDP when not yet learned from REGISTER. |
 | `daemonize` | `1` = run in background when started without `-d`/`-D`; `0` = foreground. |
 | `locality` | Number of short-dial digits and locality group selector. `0` (default) = disabled, all trunks form one big group. When `> 0`, trunks with the same `group` prefix form a locality group, and extensions whose number starts with that prefix belong to the group. Dialing exactly `locality` digits triggers **short-dialing**: the caller’s group prefix is prepended automatically (e.g. `locality = 4`, prefix `1234`, dial `1001` expands to `12341001`). |
 | `cross_group_calls` | `1` (default) = allow direct ext-to-ext calls across locality groups. `0` = block cross-group ext-to-ext calls with 403. Only meaningful when `locality > 0`. |
@@ -251,11 +249,12 @@ Extensions register using their extension number (e.g. `100`). Trunk assignment 
 
 ### `[api]`
 
-Optional section. When `listen` is set, a TCP server starts speaking the RESP2 (Redis) protocol. Connect with `redis-cli` or any Redis client library. Other modules register their commands with this API server (e.g. metrics exposes `metrics.*` commands).
+Optional section. When `address` is set, a TCP server starts speaking the RESP2 (Redis) protocol. Connect with `redis-cli` or any Redis client library. Other modules register their commands with this API server (e.g. metrics exposes `metrics.*` commands).
 
 | Option | Description |
 |--------|-------------|
-| `listen` | TCP listen address (e.g. `127.0.0.1:6380`). Required to enable the API server. |
+| `address` | TCP listen address (e.g. `:6379`, `127.0.0.1:6379`, `unix:///path/to/socket`). Required to enable the API server. |
+| `socket_owner` | Optional. Set ownership of unix socket (e.g. `user:group`). |
 
 ### `[api:username]`
 

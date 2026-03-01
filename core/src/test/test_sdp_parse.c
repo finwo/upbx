@@ -3,7 +3,7 @@
  */
 #include <string.h>
 #include "finwo/assert.h"
-#include "AppModule/util/sdp_parse.h"
+#include "domain/pbx/sip/sdp_parse.h"
 
 static const char *SIMPLE_SDP =
   "v=0\r\n"

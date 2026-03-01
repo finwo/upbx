@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "finwo/assert.h"
-#include "RespModule/resp.h"
+#include "common/resp.h"
 
 /* Write encoded buf to pipe, read back one RESP value. Caller resp_frees result. */
 static resp_object *round_trip(const char *buf, size_t len) {

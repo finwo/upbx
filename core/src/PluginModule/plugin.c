@@ -15,9 +15,9 @@
 
 #include "common/socket_util.h"
 #include "rxi/log.h"
-#include "SchedulerModule/protothreads.h"
+#include "domain/protothreads.h"
 #include "PluginModule/plugin.h"
-#include "RespModule/resp.h"
+#include "common/resp.h"
 
 #ifdef UPBX_BUILD
 #include "AppModule/scheduler/daemon.h"

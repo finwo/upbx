@@ -6,7 +6,7 @@
 #define PLUGINMODULE_PLUGIN_H
 
 #include <stddef.h>
-#include "RespModule/resp.h"
+#include "common/resp.h"
 
 /* Callback invoked after discovery (and when config is resent without restart). */
 typedef void (*plugmod_after_discovery_fn)(const char *plugin_name, void *user);
