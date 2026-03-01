@@ -1,6 +1,6 @@
 # UPBX
 
-A standalone minimalist SIP PBX daemon: extension and trunk registration, call routing
+A standalone minimalist SIP PBX daemon: extension and trunk registration, call routing via a remote udphole instance for RTP relay.
 
 ---
 
@@ -61,58 +61,17 @@ After starting, the daemon loads config, connects to the configured udphole inst
 
 ---
 
-## Managing extensions, trunks, and API users
-
-Extensions, trunks, and API users can be managed from the CLI without manually editing the config file. The `-f` flag is a global option (see above); if omitted, the default config locations are searched.
+## Running
 
 ```bash
-# List extensions
-./upbx extension list
+# Run in foreground
+./upbx daemon
 
-# Add an extension (number and secret are positional)
-./upbx extension add --name "Reception" 200 mypass
+# Run in background
+./upbx daemon -d
 
-# Remove an extension
-./upbx extension remove 200
-# or: ./upbx extension rm 200
-
-# List trunks
-./upbx trunk list
-
-# Add a trunk (name is positional, flags for connection details)
-./upbx trunk add --address udp://sip.example.com:5060 \
-  --username user --password pass --did 15551234567 --cid 15551234567 mycarrier
-
-# Remove a trunk
-./upbx trunk remove mycarrier
-# or: ./upbx trunk rm mycarrier
-
-# List API users
-./upbx api-user list
-
-# Add an API user (username and secret are positional, --permit can repeat)
-./upbx api-user add --permit "metrics.*" --permit "ping" monitoring mon-pass
-
-# Remove an API user
-./upbx api-user remove monitoring
-# or: ./upbx api-user rm monitoring
-
-# Explicit config file
-./upbx -f /etc/upbx.conf extension list
-```
-
----
-
-## Shell completion
-
-Enable tab completion for bash or zsh. The completion scripts are context-aware and will offer extension numbers, trunk names, and API usernames from the config when completing `remove`/`rm` arguments.
-
-```bash
-# Bash
-eval "$(./upbx completion bash)"
-
-# Zsh
-eval "$(./upbx completion zsh)"
+# List available commands
+./upbx list-commands
 ```
 
 ---
