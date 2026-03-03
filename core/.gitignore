@@ -10,3 +10,4 @@
 /data/*
 /.cache/
 *.sock
+/compile_commands.json

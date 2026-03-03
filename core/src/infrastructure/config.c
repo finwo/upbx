@@ -1,11 +1,13 @@
+#include "infrastructure/config.h"
+
 #include <stdlib.h>
 #include <string.h>
-#include "benhoyt/inih.h"
-#include "rxi/log.h"
-#include "infrastructure/config.h"
-#include "common/resp.h"
 
-resp_object *global_cfg = NULL;
+#include "benhoyt/inih.h"
+#include "common/resp.h"
+#include "domain/config.h"
+#include "rxi/log.h"
+
 resp_object *pending_cfg = NULL;
 
 static const char *stored_config_path = NULL;
@@ -25,35 +27,41 @@ static int config_handler(void *user, const char *section, const char *name, con
 }
 
 void config_init(void) {
-  global_cfg = resp_array_init();
-  config_load(global_cfg, config_get_path());
+  if (pending_cfg) resp_free(pending_cfg);
+  pending_cfg = resp_array_init();
+  config_load(NULL, config_get_path());
+  resp_object *old = domain_cfg;
+  domain_cfg       = pending_cfg;
+  pending_cfg      = NULL;
+  if (old) resp_free(old);
 }
 
 int config_load(resp_object *cfg, const char *path) {
-  return ini_parse(path, config_handler, cfg);
+  resp_object *load_cfg = cfg;
+  if (!load_cfg) {
+    load_cfg = pending_cfg;
+  }
+  return ini_parse(path, config_handler, load_cfg);
 }
 
 void config_pending_init(void) {
+  if (pending_cfg) resp_free(pending_cfg);
   pending_cfg = resp_array_init();
-}
-
-void config_swap(void) {
-  resp_object *old = global_cfg;
-  global_cfg = pending_cfg;
-  pending_cfg = old;
-  if (old) resp_free(old);
 }
 
 int config_reload(void) {
   config_pending_init();
-  int r = config_load(pending_cfg, config_get_path());
+  int r = config_load(NULL, config_get_path());
   if (r < 0) return -1;
-  config_swap();
+  resp_object *old = domain_cfg;
+  domain_cfg       = pending_cfg;
+  pending_cfg      = NULL;
+  if (old) resp_free(old);
   return 0;
 }
 
 void config_set_path(const char *path) {
-  if (stored_config_path) free((void*)stored_config_path);
+  if (stored_config_path) free((void *)stored_config_path);
   stored_config_path = path ? strdup(path) : NULL;
 }
 

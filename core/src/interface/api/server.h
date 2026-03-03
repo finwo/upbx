@@ -1,18 +1,19 @@
 #ifndef UPBX_API_SERVER_H
 #define UPBX_API_SERVER_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
-#include "domain/scheduler.h"
 #include "common/resp.h"
+#include "common/scheduler.h"
 
 struct api_client_state;
 typedef struct api_client_state api_client_t;
 
 typedef resp_object *(*domain_cmd_fn)(const char *cmd, resp_object *args);
 
-PT_THREAD(api_server_pt(struct pt *pt, int64_t timestamp, struct pt_task *task));
+int api_server_pt(int64_t timestamp, struct pt_task *task);
+int api_client_pt(int64_t timestamp, struct pt_task *task);
 
 void api_register_cmd(const char *name, char (*func)(api_client_t *, char **, int));
 

@@ -8,8 +8,8 @@
 #include <stddef.h>
 
 typedef struct {
-  unsigned int state[4];
-  unsigned int count[2];
+  unsigned int  state[4];
+  unsigned int  count[2];
   unsigned char buf[64];
 } MD5_CTX;
 

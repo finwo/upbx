@@ -4,17 +4,17 @@
  */
 #include <stdio.h>
 #include <string.h>
-#include "finwo/assert.h"
+
 #include "common/md5.h"
+#include "finwo/assert.h"
 
 static void md5_hex(const char *input, size_t len, char hex[33]) {
-  MD5_CTX ctx;
+  MD5_CTX       ctx;
   unsigned char digest[16];
   MD5_Init(&ctx);
   MD5_Update(&ctx, input, len);
   MD5_Final(digest, &ctx);
-  for (int i = 0; i < 16; i++)
-    sprintf(hex + i * 2, "%02x", digest[i]);
+  for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", digest[i]);
   hex[32] = '\0';
 }
 

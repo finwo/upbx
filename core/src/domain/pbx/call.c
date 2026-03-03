@@ -1,19 +1,20 @@
+#include "domain/pbx/call.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <time.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <time.h>
 #include <unistd.h>
-#include <errno.h>
 
-#include "rxi/log.h"
-#include "tidwall/hashmap.h"
-#include "domain/pbx/call.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sdp_parse.h"
 #include "domain/pbx/sip/udphole_client.h"
+#include "rxi/log.h"
+#include "tidwall/hashmap.h"
 
 #define CALL_TIMEOUT_SEC 3600
 #define RING_TIMEOUT_SEC 60
@@ -32,9 +33,9 @@ static int call_compare(const void *a, const void *b, void *udata) {
   return strcmp(ca->call_id, cb->call_id);
 }
 
-static call_t *find_call(const char *call_id) {
+static const call_t *find_call(const char *call_id) {
   if (!calls || !call_id) return NULL;
-  call_t key = { .call_id = (char *)call_id };
+  call_t key = {.call_id = (char *)call_id};
   return hashmap_get(calls, &key);
 }
 
@@ -44,16 +45,16 @@ static const char *get_advertise_ip(void) {
   return NULL;
 }
 
-static void free_call(call_t *c) {
+static void free_call(const call_t *c) {
   if (!c) return;
-  free(c->call_id);
-  free(c->source_ext);
-  free(c->dest_ext);
-  free(c->source_contact);
-  free(c->dest_contact);
-  free(c->from_tag);
-  free(c->to_tag);
-  free(c);
+  free((void*)c->call_id);
+  free((void*)c->source_ext);
+  free((void*)c->dest_ext);
+  free((void*)c->source_contact);
+  free((void*)c->dest_contact);
+  free((void*)c->from_tag);
+  free((void*)c->to_tag);
+  free((void*)c);
 }
 
 void call_init(void) {
@@ -61,13 +62,13 @@ void call_init(void) {
   calls = hashmap_new(sizeof(call_t), 64, 0, 0, call_hash, call_compare, NULL, NULL);
 }
 
-call_t *call_find(const char *call_id) {
+const call_t *call_find(const char *call_id) {
   return find_call(call_id);
 }
 
 static int parse_sdp_port(const char *sdp, size_t sdp_len, int *port, char *ip, size_t ip_len) {
   sdp_media_t media[SDP_MAX_MEDIA];
-  size_t n_out = 0;
+  size_t      n_out = 0;
 
   if (sdp_parse_media(sdp, sdp_len, media, SDP_MAX_MEDIA, &n_out) != 0 || n_out == 0) {
     return -1;
@@ -75,17 +76,15 @@ static int parse_sdp_port(const char *sdp, size_t sdp_len, int *port, char *ip, 
 
   if (port) *port = media[0].port;
   if (ip && ip_len > 0) {
-    strncpy(ip, media[0].ip, ip_len - 1);
-    ip[ip_len - 1] = '\0';
+    snprintf(ip, ip_len, "%s", media[0].ip);
   }
 
   return 0;
 }
 
-int call_route_invite(const char *from_ext, const char *to_ext, const char *call_id,
-                      const char *from_tag, const char *sdp, size_t sdp_len,
-                      const char *source_ip, int source_port,
-                      char **out_sdp, size_t *out_sdp_len) {
+int call_route_invite(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
+                      const char *sdp, size_t sdp_len, const char *source_ip, int source_port, char **out_sdp,
+                      size_t *out_sdp_len) {
   log_info("call: %s -> %s, call_id=%s, from_tag=%s", from_ext, to_ext, call_id, from_tag);
 
   registration_t *source_reg = registration_find(from_ext);
@@ -95,7 +94,7 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
   }
 
   char source_reg_ip[INET6_ADDRSTRLEN] = {0};
-  int source_reg_port = 0;
+  int  source_reg_port                 = 0;
   if (source_reg->remote_addr.ss_family == AF_INET) {
     struct sockaddr_in *sin = (struct sockaddr_in *)&source_reg->remote_addr;
     inet_ntop(AF_INET, &sin->sin_addr, source_reg_ip, sizeof(source_reg_ip));
@@ -107,8 +106,8 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
   }
 
   if (strcmp(source_ip, source_reg_ip) != 0 || source_port != source_reg_port) {
-    log_error("call: source IP mismatch: expected %s:%d, got %s:%d",
-              source_reg_ip, source_reg_port, source_ip, source_port);
+    log_error("call: source IP mismatch: expected %s:%d, got %s:%d", source_reg_ip, source_reg_port, source_ip,
+              source_port);
     return -1;
   }
 
@@ -136,7 +135,7 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     return -1;
   }
 
-  char dest_tag[] = "dest";
+  char                  dest_tag[] = "dest";
   udphole_socket_info_t dest_info;
   if (udphole_socket_create_listen(udphole, call_id, dest_tag, &dest_info) != 0) {
     log_error("call: failed to create dest socket");
@@ -162,17 +161,17 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     return -1;
   }
 
-  call_t *c = calloc(1, sizeof(*c));
-  c->call_id = strdup(call_id);
-  c->source_ext = strdup(from_ext);
-  c->dest_ext = strdup(to_ext);
+  call_t *c         = calloc(1, sizeof(*c));
+  c->call_id        = strdup(call_id);
+  c->source_ext     = strdup(from_ext);
+  c->dest_ext       = strdup(to_ext);
   c->source_contact = strdup(source_reg->contact ? source_reg->contact : "");
-  c->dest_contact = strdup(dest_reg->contact ? dest_reg->contact : "");
+  c->dest_contact   = strdup(dest_reg->contact ? dest_reg->contact : "");
   memcpy(&c->source_addr, &source_reg->remote_addr, sizeof(c->source_addr));
   memcpy(&c->dest_addr, &dest_reg->remote_addr, sizeof(c->dest_addr));
   c->from_tag = strdup(from_tag);
-  c->to_tag = strdup(dest_tag);
-  c->created = time(NULL);
+  c->to_tag   = strdup(dest_tag);
+  c->created  = time(NULL);
 
   if (source_info.advertise_ip && source_info.advertise_ip[0]) {
     strncpy(c->source_rtp_ip, source_info.advertise_ip, sizeof(c->source_rtp_ip) - 1);
@@ -200,7 +199,7 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
   hashmap_set(calls, c);
 
   char sdp_ip[64] = {0};
-  int sdp_port = 0;
+  int  sdp_port   = 0;
   parse_sdp_port(sdp, sdp_len, &sdp_port, sdp_ip, sizeof(sdp_ip));
 
   *out_sdp = malloc(4096);
@@ -209,10 +208,8 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     return -1;
   }
 
-  int len = sdp_rewrite_addr(sdp, sdp_len,
-                              c->dest_rtp_ip[0] ? c->dest_rtp_ip : "0.0.0.0",
-                              c->dest_rtp_port,
-                              *out_sdp, 4096);
+  int len =
+      sdp_rewrite_addr(sdp, sdp_len, c->dest_rtp_ip[0] ? c->dest_rtp_ip : "0.0.0.0", c->dest_rtp_port, *out_sdp, 4096);
   if (len < 0) {
     free(*out_sdp);
     *out_sdp = NULL;
@@ -222,15 +219,14 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
 
   *out_sdp_len = (size_t)len;
 
-  log_info("call: session created: source_rtp=%s:%d, dest_rtp=%s:%d",
-           c->source_rtp_ip, c->source_rtp_port,
+  log_info("call: session created: source_rtp=%s:%d, dest_rtp=%s:%d", c->source_rtp_ip, c->source_rtp_port,
            c->dest_rtp_ip, c->dest_rtp_port);
 
   return 0;
 }
 
 void call_handle_bye(const char *call_id) {
-  call_t *c = find_call(call_id);
+  const call_t *c = find_call(call_id);
   if (!c) {
     log_warn("call_bye: call not found: %s", call_id);
     return;

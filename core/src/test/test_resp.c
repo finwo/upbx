@@ -2,11 +2,12 @@
  * RESP encoding and decoding tests using finwo/assert.
  */
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include "finwo/assert.h"
+
 #include "common/resp.h"
+#include "finwo/assert.h"
 
 /* Write encoded buf to pipe, read back one RESP value. Caller resp_frees result. */
 static resp_object *round_trip(const char *buf, size_t len) {
@@ -14,17 +15,20 @@ static resp_object *round_trip(const char *buf, size_t len) {
   if (pipe(fd) != 0) return NULL;
   ssize_t n = write(fd[1], buf, len);
   close(fd[1]);
-  if (n != (ssize_t)len) { close(fd[0]); return NULL; }
+  if (n != (ssize_t)len) {
+    close(fd[0]);
+    return NULL;
+  }
   resp_object *o = resp_read(fd[0]);
   close(fd[0]);
   return o;
 }
 
 void test_resp_encode_decode_bulk(void) {
-  resp_object bulk = { .type = RESPT_BULK, .u = { .s = strdup("hello") } };
-  const resp_object *av[] = { &bulk };
-  char *buf = NULL;
-  size_t len = 0;
+  resp_object        bulk = {.type = RESPT_BULK, .u = {.s = strdup("hello")}};
+  const resp_object *av[] = {&bulk};
+  char              *buf  = NULL;
+  size_t             len  = 0;
   ASSERT_EQUALS(0, resp_encode_array(1, av, &buf, &len));
   ASSERT("encoded", buf != NULL && len > 0);
   resp_object *dec = round_trip(buf, len);
@@ -39,10 +43,10 @@ void test_resp_encode_decode_bulk(void) {
 }
 
 void test_resp_encode_decode_int(void) {
-  resp_object iobj = { .type = RESPT_INT, .u = { .i = -42 } };
-  const resp_object *av[] = { &iobj };
-  char *buf = NULL;
-  size_t len = 0;
+  resp_object        iobj = {.type = RESPT_INT, .u = {.i = -42}};
+  const resp_object *av[] = {&iobj};
+  char              *buf  = NULL;
+  size_t             len  = 0;
   ASSERT_EQUALS(0, resp_encode_array(1, av, &buf, &len));
   resp_object *dec = round_trip(buf, len);
   ASSERT("decode non-NULL", dec != NULL);
@@ -55,11 +59,11 @@ void test_resp_encode_decode_int(void) {
 }
 
 void test_resp_encode_decode_array_of_strings(void) {
-  resp_object k = { .type = RESPT_BULK, .u = { .s = strdup("key") } };
-  resp_object v = { .type = RESPT_BULK, .u = { .s = strdup("value") } };
-  const resp_object *av[] = { &k, &v };
-  char *buf = NULL;
-  size_t len = 0;
+  resp_object        k    = {.type = RESPT_BULK, .u = {.s = strdup("key")}};
+  resp_object        v    = {.type = RESPT_BULK, .u = {.s = strdup("value")}};
+  const resp_object *av[] = {&k, &v};
+  char              *buf  = NULL;
+  size_t             len  = 0;
   ASSERT_EQUALS(0, resp_encode_array(2, av, &buf, &len));
   resp_object *dec = round_trip(buf, len);
   ASSERT("decode non-NULL", dec != NULL);
@@ -76,15 +80,15 @@ void test_resp_encode_decode_array_of_strings(void) {
 }
 
 void test_resp_map_get_string(void) {
-  resp_object k1 = { .type = RESPT_BULK, .u = { .s = strdup("a") } };
-  resp_object v1 = { .type = RESPT_BULK, .u = { .s = strdup("1") } };
-  resp_object k2 = { .type = RESPT_BULK, .u = { .s = strdup("b") } };
-  resp_object v2 = { .type = RESPT_BULK, .u = { .s = strdup("2") } };
+  resp_object  k1  = {.type = RESPT_BULK, .u = {.s = strdup("a")}};
+  resp_object  v1  = {.type = RESPT_BULK, .u = {.s = strdup("1")}};
+  resp_object  k2  = {.type = RESPT_BULK, .u = {.s = strdup("b")}};
+  resp_object  v2  = {.type = RESPT_BULK, .u = {.s = strdup("2")}};
   resp_object *map = calloc(1, sizeof(resp_object));
   ASSERT("map alloc", map != NULL);
-  map->type = RESPT_ARRAY;
-  map->u.arr.n = 4;
-  map->u.arr.elem = calloc(4, sizeof(resp_object));
+  map->type          = RESPT_ARRAY;
+  map->u.arr.n       = 4;
+  map->u.arr.elem    = calloc(4, sizeof(resp_object));
   map->u.arr.elem[0] = k1;
   map->u.arr.elem[1] = v1;
   map->u.arr.elem[2] = k2;
@@ -106,7 +110,11 @@ void test_resp_map_get_missing_key(void) {
 void test_resp_read_invalid_returns_null(void) {
   int fd[2];
   ASSERT_EQUALS(0, pipe(fd));
-  if (write(fd[1], "X\r\n", 3) != 3) { close(fd[0]); close(fd[1]); return; }
+  if (write(fd[1], "X\r\n", 3) != 3) {
+    close(fd[0]);
+    close(fd[1]);
+    return;
+  }
   close(fd[1]);
   resp_object *o = resp_read(fd[0]);
   close(fd[0]);

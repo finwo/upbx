@@ -1,26 +1,24 @@
+#include "interface/cli/common.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
-
-#include "interface/cli/common.h"
+#include <unistd.h>
 
 #ifndef NULL
-#define NULL (void*)0
+#define NULL (void *)0
 #endif
 
 struct cli_command *cli_commands = NULL;
 
 const char *cli_find_arg(int argc, const char **argv, const char *name) {
   for (int i = 0; i < argc - 1; i++)
-    if (strcmp(argv[i], name) == 0)
-      return argv[i + 1];
+    if (strcmp(argv[i], name) == 0) return argv[i + 1];
   return NULL;
 }
 
-size_t cli_collect_positional(int argc, const char **argv, int start,
-    const char **out, size_t max_out) {
+size_t cli_collect_positional(int argc, const char **argv, int start, const char **out, size_t max_out) {
   size_t n = 0;
   for (int i = start; i < argc && n < max_out; i++) {
     if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] != '\0') {
@@ -49,7 +47,7 @@ const char *cli_resolve_default_config(void) {
 }
 
 void cli_set_config_path(const char *path) {
-  if (stored_config_path) free((void*)stored_config_path);
+  if (stored_config_path) free((void *)stored_config_path);
   stored_config_path = path ? strdup(path) : NULL;
 }
 
@@ -58,21 +56,17 @@ const char *cli_config_path(void) {
 }
 
 int cli_get_output_width(int default_width) {
-  if (!isatty(STDOUT_FILENO))
-    return default_width;
+  if (!isatty(STDOUT_FILENO)) return default_width;
   struct winsize w;
-  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) < 0 || w.ws_col <= 0)
-    return default_width;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) < 0 || w.ws_col <= 0) return default_width;
   return (int)w.ws_col;
 }
 
 void cli_print_wrapped(FILE *out, const char *text, int width, int left_col_width) {
-  if (!text || width <= left_col_width)
-    return;
+  if (!text || width <= left_col_width) return;
   char *copy = strdup(text);
-  if (!copy)
-    return;
-  int len = left_col_width;
+  if (!copy) return;
+  int   len = left_col_width;
   char *tok = strtok(copy, " ");
   while (tok) {
     int toklen = (int)strlen(tok);
@@ -80,8 +74,7 @@ void cli_print_wrapped(FILE *out, const char *text, int width, int left_col_widt
       fprintf(out, "\n%*s", left_col_width, "");
       len = left_col_width;
     }
-    if (len > left_col_width)
-      fputc(' ', out);
+    if (len > left_col_width) fputc(' ', out);
     fputs(tok, out);
     len += (len > left_col_width ? 1 : 0) + toklen;
     tok = strtok(NULL, " ");
@@ -91,17 +84,17 @@ void cli_print_wrapped(FILE *out, const char *text, int width, int left_col_widt
 
 void cli_register_command(const char *name, const char *description, int (*fn)(int, const char **)) {
   struct cli_command *cmd = malloc(sizeof(*cmd));
-  cmd->cmd = name;
-  cmd->desc = description;
-  cmd->fn = fn;
-  cmd->next = cli_commands;
-  cli_commands = cmd;
+  cmd->cmd                = name;
+  cmd->desc               = description;
+  cmd->fn                 = fn;
+  cmd->next               = cli_commands;
+  cli_commands            = cmd;
 }
 
 int cli_execute_command(int argc, const char **argv) {
   struct cli_command *cmd = cli_commands;
 
-  while(cmd) {
+  while (cmd) {
     if (!strcmp(cmd->cmd, argv[0])) return cmd->fn(argc, argv);
     cmd = cmd->next;
   }

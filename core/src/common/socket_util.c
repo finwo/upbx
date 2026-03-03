@@ -1,19 +1,21 @@
 #include "common/socket_util.h"
-#include "rxi/log.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
+#include <grp.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <errno.h>
-#include <sys/un.h>
 #include <sys/stat.h>
-#include <pwd.h>
-#include <grp.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "rxi/log.h"
 
 int set_socket_nonblocking(int fd, int nonblock) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -27,7 +29,7 @@ int set_socket_nonblocking(int fd, int nonblock) {
 
 int *tcp_listen(const char *addr, const char *default_host, const char *default_port) {
   char host[256] = "";
-  char port[32] = "";
+  char port[32]  = "";
 
   if (default_host && default_host[0]) {
     snprintf(host, sizeof(host), "%s", default_host);
@@ -61,11 +63,14 @@ int *tcp_listen(const char *addr, const char *default_host, const char *default_
       return NULL;
     }
   } else {
-    int leading_colon = (addr[0] == ':');
-    const char *p = leading_colon ? addr + 1 : addr;
-    int is_port_only = 1;
+    int         leading_colon = (addr[0] == ':');
+    const char *p             = leading_colon ? addr + 1 : addr;
+    int         is_port_only  = 1;
     for (const char *q = p; *q; q++) {
-      if (*q < '0' || *q > '9') { is_port_only = 0; break; }
+      if (*q < '0' || *q > '9') {
+        is_port_only = 0;
+        break;
+      }
     }
 
     const char *colon = strrchr(addr, ':');
@@ -96,9 +101,9 @@ int *tcp_listen(const char *addr, const char *default_host, const char *default_
 
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
+  hints.ai_family   = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
+  hints.ai_flags    = AI_PASSIVE;
   if (getaddrinfo(host[0] ? host : NULL, port, &hints, &res) != 0 || !res) {
     log_error("tcp_listen: getaddrinfo failed for %s:%s", host, port);
     return NULL;
@@ -111,7 +116,7 @@ int *tcp_listen(const char *addr, const char *default_host, const char *default_
   }
   fds[0] = 0;
 
-  int listen_all = (host[0] == '\0');
+  int              listen_all = (host[0] == '\0');
   struct addrinfo *p;
 
   for (p = res; p; p = p->ai_next) {
@@ -154,7 +159,7 @@ int *tcp_listen(const char *addr, const char *default_host, const char *default_
 
 int *udp_recv(const char *addr, const char *default_host, const char *default_port) {
   char host[256] = "";
-  char port[32] = "";
+  char port[32]  = "";
 
   if (default_host && default_host[0]) {
     snprintf(host, sizeof(host), "%s", default_host);
@@ -188,11 +193,14 @@ int *udp_recv(const char *addr, const char *default_host, const char *default_po
       return NULL;
     }
   } else {
-    int leading_colon = (addr[0] == ':');
-    const char *p = leading_colon ? addr + 1 : addr;
-    int is_port_only = 1;
+    int         leading_colon = (addr[0] == ':');
+    const char *p             = leading_colon ? addr + 1 : addr;
+    int         is_port_only  = 1;
     for (const char *q = p; *q; q++) {
-      if (*q < '0' || *q > '9') { is_port_only = 0; break; }
+      if (*q < '0' || *q > '9') {
+        is_port_only = 0;
+        break;
+      }
     }
 
     const char *colon = strrchr(addr, ':');
@@ -223,9 +231,9 @@ int *udp_recv(const char *addr, const char *default_host, const char *default_po
 
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
+  hints.ai_family   = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
-  hints.ai_flags = AI_PASSIVE;
+  hints.ai_flags    = AI_PASSIVE;
   if (getaddrinfo(host[0] ? host : NULL, port, &hints, &res) != 0 || !res) {
     log_error("udp_recv: getaddrinfo failed for %s:%s", host, port);
     return NULL;
@@ -238,7 +246,7 @@ int *udp_recv(const char *addr, const char *default_host, const char *default_po
   }
   fds[0] = 0;
 
-  int listen_all = (host[0] == '\0');
+  int              listen_all = (host[0] == '\0');
   struct addrinfo *p;
 
   for (p = res; p; p = p->ai_next) {
@@ -339,8 +347,8 @@ int *unix_listen(const char *path, int sock_type, const char *owner) {
   }
 
   if (owner && owner[0]) {
-    uid_t uid = -1;
-    gid_t gid = -1;
+    uid_t uid        = -1;
+    gid_t gid        = -1;
     char *owner_copy = strdup(owner);
     if (owner_copy) {
       char *colon = strchr(owner_copy, ':');
@@ -350,7 +358,7 @@ int *unix_listen(const char *path, int sock_type, const char *owner) {
         if (colon[0]) {
           struct passwd *pw = getpwnam(owner_copy);
           if (pw) {
-            uid = pw->pw_uid;
+            uid              = pw->pw_uid;
             struct group *gr = getgrnam(colon);
             if (gr) {
               gid = gr->gr_gid;
