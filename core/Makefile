@@ -16,6 +16,8 @@ FIND=$(shell which gfind find | head -1)
 SRC+=$(shell $(FIND) src/ -type f -name '*.c')
 # Exclude standalone test programs from main binary
 SRC:=$(filter-out $(wildcard src/test/test_*.c),$(SRC))
+# Exclude plugin module (not compatible with new scheduler)
+SRC:=$(filter-out src/PluginModule/plugin.c,$(SRC))
 
 INCLUDES:=
 
@@ -139,3 +141,7 @@ clean:
 	rm -rf $(patsubst %,src/test/%.o,$(TEST_BINS:test_%=test_%))
 	rm -rf src/test/*.o
 	rm -rf doc/cli_doc.md doc/cli_doc.man doc/license.man
+
+.PHONY: format
+format:
+	$(FIND) src/ -type f \( -name '*.c' -o -name '*.h' \) -exec clang-format -i {} +

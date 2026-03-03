@@ -8,3 +8,5 @@
 /upbx.1
 /doc/license.man
 /data/*
+/.cache/
+*.sock
