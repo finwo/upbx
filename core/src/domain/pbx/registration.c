@@ -1,6 +1,5 @@
 #include "domain/pbx/registration.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -10,6 +9,7 @@
 #include <unistd.h>
 
 #include "common/resp.h"
+#include "common/socket_util.h"
 #include "rxi/log.h"
 
 #define MAX_REGISTRATIONS    1024
@@ -26,61 +26,6 @@ void registration_set_dir(const char *path) {
 
 const char *registration_get_dir(void) {
   return registrations_dir;
-}
-
-static void sockaddr_to_string(const struct sockaddr *addr, char *buf, size_t buf_size) {
-  if (!addr || !buf || buf_size == 0) return;
-
-  if (addr->sa_family == AF_INET) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    inet_ntop(AF_INET, &sin->sin_addr, buf, buf_size);
-    size_t len = strlen(buf);
-    if (buf_size - len > 6) {
-      snprintf(buf + len, buf_size - len, ":%d", ntohs(sin->sin_port));
-    }
-  } else if (addr->sa_family == AF_INET6) {
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-    buf[0]                    = '[';
-    inet_ntop(AF_INET6, &sin6->sin6_addr, buf + 1, (socklen_t)(buf_size - 1));
-    size_t len = strlen(buf);
-    if (buf_size - len > 6) {
-      snprintf(buf + len, buf_size - len, "]:%d", ntohs(sin6->sin6_port));
-    }
-  } else {
-    buf[0] = '\0';
-  }
-}
-
-static int string_to_sockaddr(const char *str, struct sockaddr_storage *addr) {
-  if (!str || !addr) return -1;
-  memset(addr, 0, sizeof(*addr));
-
-  const char *port_str = strrchr(str, ':');
-  if (!port_str) return -1;
-
-  char   host[256];
-  size_t host_len = (size_t)(port_str - str);
-  if (host_len >= sizeof(host)) return -1;
-  memcpy(host, str, host_len);
-  host[host_len] = '\0';
-
-  int port = atoi(port_str + 1);
-  if (port <= 0 || port > 65535) return -1;
-
-  if (host[0] == '[' && host[host_len - 1] == ']') {
-    host[host_len - 1]        = '\0';
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-    sin6->sin6_family         = AF_INET6;
-    sin6->sin6_port           = htons((uint16_t)port);
-    if (inet_pton(AF_INET6, host + 1, &sin6->sin6_addr) != 1) return -1;
-  } else {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    sin->sin_family         = AF_INET;
-    sin->sin_port           = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &sin->sin_addr) != 1) return -1;
-  }
-
-  return 0;
 }
 
 static int save_registration_to_file(const registration_t *reg) {
@@ -104,6 +49,8 @@ static int save_registration_to_file(const registration_t *reg) {
   resp_array_append_bulk(obj, reg->number);
   resp_array_append_bulk(obj, "contact");
   resp_array_append_bulk(obj, reg->contact ? reg->contact : "");
+  resp_array_append_bulk(obj, "group");
+  resp_array_append_bulk(obj, reg->group ? reg->group : "");
   resp_array_append_bulk(obj, "remote_addr");
   resp_array_append_bulk(obj, addr_str);
   resp_array_append_bulk(obj, "expires_at");
@@ -186,6 +133,11 @@ static registration_t *load_registration_from_file(const char *number) {
   reg->number  = strdup(num);
   reg->contact = strdup(resp_map_get_string(obj, "contact") ? resp_map_get_string(obj, "contact") : "");
 
+  const char *grp = resp_map_get_string(obj, "group");
+  if (grp && grp[0]) {
+    reg->group = strdup(grp);
+  }
+
   const char *addr_str = resp_map_get_string(obj, "remote_addr");
   if (addr_str && addr_str[0]) {
     string_to_sockaddr(addr_str, &reg->remote_addr);
@@ -244,7 +196,156 @@ registration_t *registration_find(const char *number) {
   return NULL;
 }
 
-int registration_add(const char *number, const char *contact, const struct sockaddr *remote_addr, int expires_seconds) {
+registration_t *registration_find_by_addr(const struct sockaddr *remote_addr) {
+  if (!remote_addr) return NULL;
+
+  for (size_t i = 0; i < registration_count; i++) {
+    if (registrations[i] && sockaddr_equal(remote_addr, (const struct sockaddr *)&registrations[i]->remote_addr)) {
+      if (registrations[i]->expires_at > 0 && registrations[i]->expires_at < time(NULL)) {
+        continue;
+      }
+      return registrations[i];
+    }
+  }
+  return NULL;
+}
+
+int registration_is_pattern(const char *extension) {
+  if (!extension) return 0;
+  const char *p = extension;
+  while (*p) {
+    if (*p == 'x' || *p == 'z' || *p == 'n' || *p == '.' || *p == '!') {
+      return 1;
+    }
+    p++;
+  }
+  return 0;
+}
+
+static int token_specificity(char c) {
+  switch (c) {
+    case '0':
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+    case '6':
+    case '7':
+    case '8':
+    case '9':
+      return 5;
+    case 'n':
+      return 4;
+    case 'z':
+      return 3;
+    case 'x':
+      return 2;
+    case '.':
+      return 1;
+    case '!':
+      return 0;
+    default:
+      return -1;
+  }
+}
+
+int registration_match_pattern(const char *pattern, const char *extension) {
+  if (!pattern || !extension) return 0;
+
+  size_t pat_len = strlen(pattern);
+  size_t ext_len = strlen(extension);
+
+  if (pat_len == 0) return 0;
+  if (ext_len > 0 && extension[ext_len - 1] == '!') {
+    ext_len--;
+  }
+
+  for (size_t i = 0; i < pat_len && i < ext_len; i++) {
+    char pc = pattern[i];
+    char ec = extension[i];
+
+    if (pc == 'x') {
+      if (ec < '0' || ec > '9') return 0;
+    } else if (pc == 'z') {
+      if (ec < '1' || ec > '9') return 0;
+    } else if (pc == 'n') {
+      if (ec < '2' || ec > '9') return 0;
+    } else if (pc == '.') {
+      return 1;
+    } else if (pc == '!') {
+      return 1;
+    } else if (pc != ec) {
+      return 0;
+    }
+  }
+
+  if (pat_len == ext_len) return 1;
+  if (pat_len > ext_len) {
+    if (pat_len > 0 && pattern[pat_len - 1] == '!') return 1;
+    return 0;
+  }
+  if (pat_len > 0 && pattern[pat_len - 1] == '.') return 1;
+  if (pat_len > 0 && pattern[pat_len - 1] == '!') return 1;
+
+  return 0;
+}
+
+int pattern_specificity_cmp(const char *a, const char *b) {
+  size_t len_a = strlen(a);
+  size_t len_b = strlen(b);
+  size_t max_len = len_a > len_b ? len_a : len_b;
+
+  for (size_t i = 0; i < max_len; i++) {
+    char ca = i < len_a ? a[i] : '\0';
+    char cb = i < len_b ? b[i] : '\0';
+
+    if (ca == '\0' && cb == '\0') return 0;
+    if (ca == '\0') return -1;
+    if (cb == '\0') return 1;
+
+    int sa = token_specificity(ca);
+    int sb = token_specificity(cb);
+
+    if (sa != sb) return sb - sa;
+    if (ca != cb) return cb - ca;
+  }
+
+  return 0;
+}
+
+const char *registration_pattern_best_match(const char *extension) {
+  if (!extension) return NULL;
+
+  const char *best_pattern = NULL;
+
+  for (size_t i = 0; i < registration_count; i++) {
+    if (!registrations[i] || !registrations[i]->number) continue;
+    if (!registration_is_pattern(registrations[i]->number)) continue;
+
+    if (registration_match_pattern(registrations[i]->number, extension)) {
+      if (!best_pattern || pattern_specificity_cmp(registrations[i]->number, best_pattern) > 0) {
+        best_pattern = registrations[i]->number;
+      }
+    }
+  }
+
+  registration_t *reg = load_registration_from_file(extension);
+  if (reg) {
+    if (reg->number && registration_is_pattern(reg->number)) {
+      if (registration_match_pattern(reg->number, extension)) {
+        if (!best_pattern || pattern_specificity_cmp(reg->number, best_pattern) > 0) {
+          best_pattern = reg->number;
+        }
+      }
+    }
+    registration_free(reg);
+  }
+
+  return best_pattern;
+}
+
+int registration_add(const char *number, const char *contact, const char *group, const struct sockaddr *remote_addr, int expires_seconds) {
   if (!number) return -1;
 
   registration_t *reg = registration_find(number);
@@ -262,6 +363,9 @@ int registration_add(const char *number, const char *contact, const struct socka
   if (reg->contact) free(reg->contact);
   reg->contact = contact ? strdup(contact) : strdup("");
 
+  if (reg->group) free(reg->group);
+  reg->group = group ? strdup(group) : NULL;
+
   if (remote_addr) {
     memcpy(&reg->remote_addr, remote_addr, sizeof(reg->remote_addr));
   }
@@ -275,6 +379,10 @@ int registration_add(const char *number, const char *contact, const struct socka
     if (reg->contact) {
       free(reg->contact);
       reg->contact = NULL;
+    }
+    if (reg->group) {
+      free(reg->group);
+      reg->group = NULL;
     }
     reg->expires_at    = 0;
     reg->registered_at = 0;
@@ -316,6 +424,7 @@ void registration_free(registration_t *reg) {
   if (!reg) return;
   free(reg->number);
   free(reg->contact);
+  free(reg->group);
   free(reg);
 }
 

@@ -15,6 +15,7 @@
 #include "common/socket_util.h"
 #include "domain/config.h"
 #include "domain/pbx/call.h"
+#include "domain/pbx/group.h"
 #include "domain/pbx/nonce.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sdp_parse.h"
@@ -418,6 +419,7 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
     }
     registration_init();
     call_init();
+    group_config_init();
 
     if (addr_arr && addr_arr->type == RESPT_ARRAY && addr_arr->u.arr.n > 0) {
       int **fd_arrays = malloc(sizeof(int *) * addr_arr->u.arr.n);
@@ -543,67 +545,172 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
           if (!from_ext[0] || !to_ext[0] || !call_id[0] || !from_tag[0]) {
             resp = build_response(&udata->sip_msg, 400, "Bad Request", &resp_len);
           } else {
-            const char *sdp     = udata->sip_msg.body;
-            size_t      sdp_len = udata->sip_msg.body_len;
-
-            char  *out_sdp         = NULL;
-            size_t out_sdp_len     = 0;
-            char  *out_dest_sdp    = NULL;
-            size_t out_dest_sdp_len = 0;
-
-            int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
-                                      &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
-
-            if (r == -1) {
+            registration_t *src_reg = registration_find_by_addr((const struct sockaddr *)&udata->src_addr);
+            if (!src_reg) {
+              log_error("transport_udp: INVITE from unregistered source %s:%d", src_ip, src_port);
               resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-            } else if (r == -2) {
-              resp = build_response(&udata->sip_msg, 404, "Not Found", &resp_len);
-            } else {
-              resp = build_response_with_sdp(&udata->sip_msg, 100, "Trying", out_sdp, out_sdp_len, &resp_len);
-              if (out_sdp) free(out_sdp);
+            } else if (registration_is_pattern(src_reg->number)) {
+              if (!registration_match_pattern(src_reg->number, from_ext)) {
+                log_error("transport_udp: INVITE from %s does not match pattern %s", from_ext, src_reg->number);
+                resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
+              } else {
+                const char *sdp     = udata->sip_msg.body;
+                size_t      sdp_len = udata->sip_msg.body_len;
 
-              call_t *c = call_find(call_id);
-              if (c) {
-                char dest_ip[INET6_ADDRSTRLEN] = {0};
-                int  dest_port                 = 5060;
-                if (c->dest_addr.ss_family == AF_INET) {
-                  struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
-                  inet_ntop(AF_INET, &sin->sin_addr, dest_ip, sizeof(dest_ip));
-                  dest_port = ntohs(sin->sin_port);
-                } else if (c->dest_addr.ss_family == AF_INET6) {
-                  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
-                  inet_ntop(AF_INET6, &sin6->sin6_addr, dest_ip, sizeof(dest_ip));
-                  dest_port = ntohs(sin6->sin6_port);
-                }
+                char  *out_sdp         = NULL;
+                size_t out_sdp_len     = 0;
+                char  *out_dest_sdp    = NULL;
+                size_t out_dest_sdp_len = 0;
 
-                char         pbx_addr[64] = "0.0.0.0";
-                resp_object *upbx_sec     = resp_map_get(domain_cfg, "upbx");
-                const char  *listen_str2  = upbx_sec ? resp_map_get_string(upbx_sec, "address") : NULL;
-                if (listen_str2) {
-                  const char *colon = strrchr(listen_str2, ':');
-                  if (colon) {
-                    size_t len = (size_t)(colon - listen_str2);
-                    if (len < sizeof(pbx_addr)) {
-                      memcpy(pbx_addr, listen_str2, len);
-                      pbx_addr[len] = '\0';
+                int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
+                                          &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
+
+                if (r == -1) {
+                  resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
+                } else if (r == -2) {
+                  resp = build_response(&udata->sip_msg, 404, "Not Found", &resp_len);
+                } else {
+                  resp = build_response_with_sdp(&udata->sip_msg, 100, "Trying", out_sdp, out_sdp_len, &resp_len);
+                  if (out_sdp) free(out_sdp);
+
+                  call_t *c = call_find(call_id);
+                  if (c) {
+                    char dest_contact_host[256] = {0};
+                    int  dest_contact_port = 5060;
+
+                    if (c->dest_contact && c->dest_contact[0]) {
+                      const char *at = strchr(c->dest_contact, '@');
+                      if (at) {
+                        const char *host_start = at + 1;
+                        const char *colon = strchr(host_start, ':');
+                        if (colon) {
+                          size_t host_len = (size_t)(colon - host_start);
+                          if (host_len < sizeof(dest_contact_host)) {
+                            memcpy(dest_contact_host, host_start, host_len);
+                            dest_contact_host[host_len] = '\0';
+                          }
+                          dest_contact_port = atoi(colon + 1);
+                        } else {
+                          size_t host_len = strlen(host_start);
+                          if (host_len < sizeof(dest_contact_host)) {
+                            memcpy(dest_contact_host, host_start, host_len);
+                            dest_contact_host[host_len] = '\0';
+                          }
+                        }
+                      }
+                    }
+
+                    if (!dest_contact_host[0]) {
+                      if (c->dest_addr.ss_family == AF_INET) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
+                        inet_ntop(AF_INET, &sin->sin_addr, dest_contact_host, sizeof(dest_contact_host));
+                        dest_contact_port = ntohs(sin->sin_port);
+                      } else if (c->dest_addr.ss_family == AF_INET6) {
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
+                        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_contact_host, sizeof(dest_contact_host));
+                        dest_contact_port = ntohs(sin6->sin6_port);
+                      }
+                    }
+
+                    char  *inv     = NULL;
+                    size_t inv_len = 0;
+                    inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag,
+                                                      dest_contact_host, dest_contact_port,
+                                                      out_dest_sdp, out_dest_sdp_len, dest_contact_host, &inv_len);
+                    if (out_dest_sdp) free(out_dest_sdp);
+                    if (inv) {
+                      int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
+                      if (fd >= 0) {
+                        socklen_t dst_len =
+                            (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+                        sendto(fd, inv, inv_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
+                        close(fd);
+                      }
+                      free(inv);
                     }
                   }
                 }
+              }
+            } else {
+              if (strcmp(from_ext, src_reg->number) != 0) {
+                log_error("transport_udp: INVITE from %s does not match registered %s", from_ext, src_reg->number);
+                resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
+              } else {
+                const char *sdp     = udata->sip_msg.body;
+                size_t      sdp_len = udata->sip_msg.body_len;
 
-                char  *inv     = NULL;
-                size_t inv_len = 0;
-                inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag, dest_ip, dest_port,
-                                                  out_dest_sdp, out_dest_sdp_len, pbx_addr, &inv_len);
-                if (out_dest_sdp) free(out_dest_sdp);
-                if (inv) {
-                  int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
-                  if (fd >= 0) {
-                    socklen_t dst_len =
-                        (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-                    sendto(fd, inv, inv_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
-                    close(fd);
+                char  *out_sdp         = NULL;
+                size_t out_sdp_len     = 0;
+                char  *out_dest_sdp    = NULL;
+                size_t out_dest_sdp_len = 0;
+
+                int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
+                                          &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
+
+                if (r == -1) {
+                  resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
+                } else if (r == -2) {
+                  resp = build_response(&udata->sip_msg, 404, "Not Found", &resp_len);
+                } else {
+                  resp = build_response_with_sdp(&udata->sip_msg, 100, "Trying", out_sdp, out_sdp_len, &resp_len);
+                  if (out_sdp) free(out_sdp);
+
+                  call_t *c = call_find(call_id);
+                  if (c) {
+                    char dest_contact_host[256] = {0};
+                    int  dest_contact_port = 5060;
+
+                    if (c->dest_contact && c->dest_contact[0]) {
+                      const char *at = strchr(c->dest_contact, '@');
+                      if (at) {
+                        const char *host_start = at + 1;
+                        const char *colon = strchr(host_start, ':');
+                        if (colon) {
+                          size_t host_len = (size_t)(colon - host_start);
+                          if (host_len < sizeof(dest_contact_host)) {
+                            memcpy(dest_contact_host, host_start, host_len);
+                            dest_contact_host[host_len] = '\0';
+                          }
+                          dest_contact_port = atoi(colon + 1);
+                        } else {
+                          size_t host_len = strlen(host_start);
+                          if (host_len < sizeof(dest_contact_host)) {
+                            memcpy(dest_contact_host, host_start, host_len);
+                            dest_contact_host[host_len] = '\0';
+                          }
+                        }
+                      }
+                    }
+
+                    if (!dest_contact_host[0]) {
+                      if (c->dest_addr.ss_family == AF_INET) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
+                        inet_ntop(AF_INET, &sin->sin_addr, dest_contact_host, sizeof(dest_contact_host));
+                        dest_contact_port = ntohs(sin->sin_port);
+                      } else if (c->dest_addr.ss_family == AF_INET6) {
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
+                        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_contact_host, sizeof(dest_contact_host));
+                        dest_contact_port = ntohs(sin6->sin6_port);
+                      }
+                    }
+
+                    char  *inv     = NULL;
+                    size_t inv_len = 0;
+                    inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag,
+                                                      dest_contact_host, dest_contact_port,
+                                                      out_dest_sdp, out_dest_sdp_len, dest_contact_host, &inv_len);
+                    if (out_dest_sdp) free(out_dest_sdp);
+                    if (inv) {
+                      int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
+                      if (fd >= 0) {
+                        socklen_t dst_len =
+                            (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+                        sendto(fd, inv, inv_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
+                        close(fd);
+                      }
+                      free(inv);
+                    }
                   }
-                  free(inv);
                 }
               }
             }

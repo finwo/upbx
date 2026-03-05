@@ -1,53 +1,40 @@
 [upbx]
 address = :5060
 daemonize = 0
-# secret = <32-char-hex-for-nonce-signing>
-# locality = 4
-# emergency = 911
-# emergency = 112
+secret = <32-char-hex-for-nonce-signing>
 
-# Multiple addresses supported (comma-separated or repeatable)
-# address = :5060
-# address = udp://192.168.1.1:5060
-
-# RTP Proxy configuration (requires running udphole instance)
-# Multiple rtpproxy entries supported for failover/clustering
-# rtpproxy = unix:///var/run/udphole.sock
-# rtpproxy = tcp://udphole-cluster:6379
-# rtpproxy = tcp://user:pass@udphole2:6379
-
-# API server (RESP protocol) - multiple addresses supported
 [api]
 address = :6379
-# socket_owner = user:group
 
-# API authentication (repeatable for multiple users)
-# [api:admin]
-# permit = *
-# secret = supers3cret
+[rtpproxy]
+address = unix:///var/run/udphole.sock
 
-# [plugin:myplugin]
-# exec = /usr/bin/my-plugin-binary
+[group:2]
+allow_outgoing_cross_group = true
+allow_incoming_cross_group = true
+
+[group:3]
+allow_outgoing_cross_group = false
+allow_incoming_cross_group = true
+
+[group:08540]
+allow_outgoing_cross_group = false
+allow_incoming_cross_group = false
+
+[ext:200]
+name = Front desk
+secret = my-secret
+
+[ext:201]
+secret = my-secret
+
+[ext:2XX]
+secret = pattern-secret
 
 [trunk:mycarrier]
 address = udp://sip.example.com:5060
 username = myuser
 password = mypass
 did = 15559876543
-# did = 15551234567
 cid = 15559876543
-# cid_name = My Company
-# pattern = ^00(.*)
-# replace = \1
-# pattern = ^0
-# replace = 31
-# overflow_timeout = 30
-# overflow_strategy = none
-# overflow_target =
-# user_agent = upbx/0.1.0
-# group = 1234
-# filter_incoming = 0
-
-[ext:100]
-# name = Front desk
-secret = my-secret
+group = 08540

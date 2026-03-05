@@ -109,24 +109,18 @@ $(BIN): $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
 # ---- Test targets (finwo/assert) ----
-TEST_BINS:=test_md5 test_sdp_parse test_sip_parse test_config test_resp test_digest_auth
+TEST_BINS:=test_md5 test_resp test_pattern test_group
 
 test_md5: src/test/test_md5.o src/common/md5.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_sdp_parse: src/test/test_sdp_parse.o src/domain/pbx/sip/sdp_parse.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_sip_parse: src/test/test_sip_parse.o src/domain/pbx/sip/sip_message.o src/domain/pbx/registration.o src/infrastructure/config.o src/common/resp.o src/PluginModule/plugin.o lib/benhoyt/inih/ini.o lib/cofyc/argparse/argparse.o lib/rxi/log/src/log.o src/common/socket_util.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_config: src/test/test_config.o src/infrastructure/config.o src/common/resp.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_resp: src/test/test_resp.o src/common/resp.o
 	$(CC) $^ $(CFLAGS) -o $@
 
-test_digest_auth: src/test/test_digest_auth.o src/common/digest_auth.o src/common/md5.o
+test_pattern: test/test_pattern.o src/domain/pbx/registration.o src/common/resp.o src/common/socket_util.o lib/rxi/log/src/log.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_group: test/test_group.o src/domain/pbx/group.o src/infrastructure/config.o src/domain/config.o src/common/resp.o src/common/socket_util.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 .PHONY: test
@@ -140,6 +134,7 @@ clean:
 	rm -rf $(OBJ)
 	rm -rf $(patsubst %,src/test/%.o,$(TEST_BINS:test_%=test_%))
 	rm -rf src/test/*.o
+	rm -rf test/*.o
 	rm -rf doc/cli_doc.md doc/cli_doc.man doc/license.man
 
 .PHONY: format

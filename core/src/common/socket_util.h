@@ -1,6 +1,8 @@
 #ifndef UDPHOLE_SOCKET_UTIL_H
 #define UDPHOLE_SOCKET_UTIL_H
 
+#include <sys/socket.h>
+
 /* Set socket blocking (0) or non-blocking (1). Returns 0 on success, -1 on
  * error. */
 int set_socket_nonblocking(int fd, int nonblock);
@@ -25,5 +27,14 @@ int *unix_listen(const char *path, int sock_type, const char *owner);
  * Returns merged array (index 0 = total count), or NULL on error.
  * Caller must free. All input arrays are freed. */
 int *merge_fd_arrays(int **arrays, int count);
+
+/* Convert sockaddr to string (IP:port). Buffer should be at least INET6_ADDRSTRLEN + 8 bytes. */
+void sockaddr_to_string(const struct sockaddr *addr, char *buf, size_t buf_size);
+
+/* Convert string (IP:port or [IPv6]:port) to sockaddr_storage. Returns 0 on success, -1 on error. */
+int string_to_sockaddr(const char *str, struct sockaddr_storage *addr);
+
+/* Compare two sockaddrs (family, address, port). Returns 1 if equal, 0 if not. */
+int sockaddr_equal(const struct sockaddr *a, const struct sockaddr *b);
 
 #endif

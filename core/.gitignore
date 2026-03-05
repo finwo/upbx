@@ -11,3 +11,8 @@
 /.cache/
 *.sock
 /compile_commands.json
+/test_group
+/test_md5
+/test_pattern
+/test_resp
+/test_sdp_parse

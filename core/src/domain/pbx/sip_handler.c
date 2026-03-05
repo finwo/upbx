@@ -8,6 +8,7 @@
 #include "common/digest_auth.h"
 #include "common/resp.h"
 #include "domain/config.h"
+#include "domain/pbx/group.h"
 #include "domain/pbx/nonce.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sip_message.h"
@@ -339,15 +340,17 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
   char contact[512] = "";
   sip_message_header_copy(msg, "Contact", contact, sizeof(contact));
 
-  log_info("sip_handler: REGISTER from %s, Contact: %s, Expires: %d", ext_number,
-           contact[0] ? contact : "(none)", expires);
+  const char *group = group_find_for_extension(ext_number);
+
+  log_info("sip_handler: REGISTER from %s, Contact: %s, Expires: %d, group: %s", ext_number,
+           contact[0] ? contact : "(none)", expires, group ? group : "(none)");
 
   if (expires == 0 || contact[0] == '\0') {
     registration_remove(ext_number);
     return build_response(200, "OK", msg, NULL, NULL, response_len);
   }
 
-  if (registration_add(ext_number, contact, (const struct sockaddr *)remote_addr, expires) != 0) {
+  if (registration_add(ext_number, contact, group, (const struct sockaddr *)remote_addr, expires) != 0) {
     return build_response(500, "Server Internal Error", msg, NULL, NULL, response_len);
   }
 

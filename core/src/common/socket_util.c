@@ -447,3 +447,73 @@ int *merge_fd_arrays(int **arrays, int count) {
 
   return merged;
 }
+
+void sockaddr_to_string(const struct sockaddr *addr, char *buf, size_t buf_size) {
+  if (!addr || !buf || buf_size == 0) return;
+
+  if (addr->sa_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    inet_ntop(AF_INET, &sin->sin_addr, buf, buf_size);
+    size_t len = strlen(buf);
+    if (buf_size - len > 6) {
+      snprintf(buf + len, buf_size - len, ":%d", ntohs(sin->sin_port));
+    }
+  } else if (addr->sa_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+    buf[0]                    = '[';
+    inet_ntop(AF_INET6, &sin6->sin6_addr, buf + 1, (socklen_t)(buf_size - 1));
+    size_t len = strlen(buf);
+    if (buf_size - len > 6) {
+      snprintf(buf + len, buf_size - len, "]:%d", ntohs(sin6->sin6_port));
+    }
+  } else {
+    buf[0] = '\0';
+  }
+}
+
+int string_to_sockaddr(const char *str, struct sockaddr_storage *addr) {
+  if (!str || !addr) return -1;
+  memset(addr, 0, sizeof(*addr));
+
+  const char *port_str = strrchr(str, ':');
+  if (!port_str) return -1;
+
+  char   host[256];
+  size_t host_len = (size_t)(port_str - str);
+  if (host_len >= sizeof(host)) return -1;
+  memcpy(host, str, host_len);
+  host[host_len] = '\0';
+
+  int port = atoi(port_str + 1);
+  if (port <= 0 || port > 65535) return -1;
+
+  if (host[0] == '[' && host[host_len - 1] == ']') {
+    host[host_len - 1]        = '\0';
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+    sin6->sin6_family         = AF_INET6;
+    sin6->sin6_port           = htons((uint16_t)port);
+    if (inet_pton(AF_INET6, host + 1, &sin6->sin6_addr) != 1) return -1;
+  } else {
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    sin->sin_family         = AF_INET;
+    sin->sin_port           = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sin->sin_addr) != 1) return -1;
+  }
+
+  return 0;
+}
+
+int sockaddr_equal(const struct sockaddr *a, const struct sockaddr *b) {
+  if (!a || !b || a->sa_family != b->sa_family) return 0;
+
+  if (a->sa_family == AF_INET) {
+    struct sockaddr_in *sin_a = (struct sockaddr_in *)a;
+    struct sockaddr_in *sin_b = (struct sockaddr_in *)b;
+    return sin_a->sin_addr.s_addr == sin_b->sin_addr.s_addr && sin_a->sin_port == sin_b->sin_port;
+  } else if (a->sa_family == AF_INET6) {
+    struct sockaddr_in6 *sin6_a = (struct sockaddr_in6 *)a;
+    struct sockaddr_in6 *sin6_b = (struct sockaddr_in6 *)b;
+    return memcmp(&sin6_a->sin6_addr, &sin6_b->sin6_addr, sizeof(sin6_a->sin6_addr)) == 0 && sin6_a->sin6_port == sin6_b->sin6_port;
+  }
+  return 0;
+}

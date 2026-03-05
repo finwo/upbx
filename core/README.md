@@ -201,12 +201,48 @@ All config values (every section) support escape sequences: `\\` → `\`, `\@` �
 | `group` | **Group prefix for locality.** Trunks with the same `group` value form a locality group. Extensions whose number starts with this prefix and has at least `len(group) + locality` digits belong to this group. Incoming DID calls ring all extensions in the group. Outgoing calls use the first available trunk in the group (config order), with fallback. E.g. `group = 1234`, `locality = 4`: extension `12341000` belongs to this group. |
 | `filter_incoming` | `0` (default) = accept any incoming number that matches a registered extension (exact or pattern). `1` = only accept incoming calls to registered DIDs on this trunk. Set to `1` if you want to restrict a trunk to only its configured DIDs. Cross-group restrictions (`cross_group_calls`) still apply. |
 
+### `[group:prefix]`
+
+Defines a group for call routing and cross-group permissions. Groups are identified by their prefix (e.g., `group:2`, `group:08540`). Extensions are automatically assigned to groups based on the longest matching group prefix.
+
+| Option | Description |
+|--------|-------------|
+| `allow_incoming_cross_group` | `true` (default) = allow calls from other groups to reach extensions in this group. `false` = block incoming cross-group calls. |
+| `allow_outgoing_cross_group` | `false` (default) = extensions in this group cannot call other groups. `true` = allow outgoing cross-group calls. |
+
+**Cross-group call rules:**
+- A call between two different groups is allowed only if:
+  - The source group's `allow_outgoing_cross_group` is `true`
+  - The destination group's `allow_incoming_cross_group` is `true`
+- If either condition fails, the call is rejected with 404.
+
+**Extension group assignment:**
+- Extensions are automatically assigned to groups based on the longest matching prefix.
+- Example: If groups `2` and `08540` exist:
+  - Extension `200` belongs to group `2`
+  - Extension `08540100` belongs to group `08540` (longest match)
+- If no group matches the extension prefix, the extension is removed from config at load time.
+
 ### `[ext:number]`
 
 | Option | Description |
 |--------|-------------|
 | `name` | Optional display name. |
 | `secret` | Password for extension digest auth. |
+
+**Pattern extensions:** Extensions can use pattern matching syntax similar to Asterisk:
+- `x` matches any single digit (0-9)
+- `z` matches any single digit (1-9)
+- `n` matches any single digit (2-9)
+- `.` matches one or more digits
+- `!` matches zero or more digits
+
+Examples:
+- `[ext:2XX]` matches 200-299
+- `[ext:NXX]` matches 200-999 (first digit 2-9, rest any)
+- `[ext:1!]` matches 1, 10, 100, 1000, etc.
+
+When multiple patterns match, the most specific pattern wins (literal digits > n > z > x > . > !).
 
 Extensions register using their extension number (e.g. `100`). Trunk assignment is automatic based on `locality` and `group` settings — no `@trunk` syntax needed.
 

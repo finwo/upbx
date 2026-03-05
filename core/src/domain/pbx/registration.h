@@ -10,6 +10,7 @@
 typedef struct {
   char                   *number;
   char                   *contact;
+  char                   *group;
   struct sockaddr_storage remote_addr;
   time_t                  expires_at;
   time_t                  registered_at;
@@ -23,7 +24,17 @@ const char *registration_get_dir(void);
 
 registration_t *registration_find(const char *number);
 
-int registration_add(const char *number, const char *contact, const struct sockaddr *remote_addr, int expires_seconds);
+registration_t *registration_find_by_addr(const struct sockaddr *remote_addr);
+
+int registration_is_pattern(const char *extension);
+
+int registration_match_pattern(const char *pattern, const char *extension);
+
+int pattern_specificity_cmp(const char *a, const char *b);
+
+const char *registration_pattern_best_match(const char *extension);
+
+int registration_add(const char *number, const char *contact, const char *group, const struct sockaddr *remote_addr, int expires_seconds);
 
 void registration_remove(const char *number);
 

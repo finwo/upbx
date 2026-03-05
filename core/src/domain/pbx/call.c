@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "domain/pbx/group.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sdp_parse.h"
 #include "domain/pbx/sip/udphole_client.h"
@@ -99,10 +100,54 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     return -1;
   }
 
-  registration_t *dest_reg = registration_find(to_ext);
+  const char *source_group = source_reg->group;
+
+  char group_candidate[128] = {0};
+  if (source_group) {
+    snprintf(group_candidate, sizeof(group_candidate), "%s%s", source_group, to_ext);
+  }
+
+  registration_t *dest_reg = NULL;
+
+  if (group_candidate[0]) {
+    dest_reg = registration_find(group_candidate);
+  }
+
   if (!dest_reg) {
-    log_error("call: destination extension %s not registered", to_ext);
+    dest_reg = registration_find(to_ext);
+  }
+
+  if (!dest_reg && group_candidate[0]) {
+    const char *best_pattern = registration_pattern_best_match(group_candidate);
+    if (best_pattern) {
+      dest_reg = registration_find(best_pattern);
+    }
+  }
+
+  if (!dest_reg) {
+    const char *best_pattern = registration_pattern_best_match(to_ext);
+    if (best_pattern) {
+      dest_reg = registration_find(best_pattern);
+    }
+  }
+
+  if (!dest_reg) {
+    log_error("call: destination extension %s not found (tried: %s, %s)", to_ext,
+              group_candidate[0] ? group_candidate : "(none)", to_ext);
     return -2;
+  }
+
+  const char *dest_group = dest_reg->group;
+
+  if (source_group && dest_group && strcmp(source_group, dest_group) != 0) {
+    int src_outgoing = group_get_allow_outgoing_cross_group(source_group);
+    int dest_incoming = group_get_allow_incoming_cross_group(dest_group);
+
+    if (!src_outgoing || !dest_incoming) {
+      log_error("call: cross-group call denied: source_group=%s, dest_group=%s, src_outgoing=%d, dest_incoming=%d",
+                source_group ? source_group : "(none)", dest_group ? dest_group : "(none)", src_outgoing, dest_incoming);
+      return -2;
+    }
   }
 
   udphole_client_t *udphole = udphole_get_client();
