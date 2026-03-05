@@ -100,8 +100,8 @@ int sdp_rewrite_addr_with_transport(const char *body, size_t body_len, const cha
       *o++ = '\r';
       *o++ = '\n';
       remain -= need;
-    } else if (ll >= 8 && ls[0] == 'm' && ls[1] == '=' && strncmp(ls + 2, "audio ", 6) == 0) {
-      const char *q = ls + 8;
+    } else if (ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
+      const char *q = ls + 2;
       while (q < le && *q >= '0' && *q <= '9') q++;
       char   port_buf[16];
       snprintf(port_buf, sizeof(port_buf), "%d", new_port);
@@ -149,6 +149,79 @@ int sdp_rewrite_addr_with_transport(const char *body, size_t body_len, const cha
       memcpy(o, dir_str, dlen);
       o += dlen;
     }
+  }
+
+  *o = '\0';
+  return (int)(o - out);
+}
+
+int sdp_rewrite_all_media(const char *body, size_t body_len, const char new_ip[][64], const int *new_port,
+                          int num_streams, char *out, size_t out_cap) {
+  const char *p = body, *end = body + body_len;
+  char       *o      = out;
+  size_t      remain = out_cap;
+  int         stream_idx = 0;
+
+  while (p < end && stream_idx < num_streams) {
+    const char *ls = p;
+    const char *le = line_end(p, end);
+    size_t      ll = (size_t)(le - ls);
+
+    if (ll >= 9 && strncmp(ls, "c=IN IP4 ", 9) == 0) {
+      size_t need = 9 + strlen(new_ip[stream_idx]) + 2;
+      if (need > remain) return -1;
+      memcpy(o, "c=IN IP4 ", 9);
+      memcpy(o + 9, new_ip[stream_idx], strlen(new_ip[stream_idx]));
+      o += need - 2;
+      *o++ = '\r';
+      *o++ = '\n';
+      remain -= need;
+    } else if (ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
+      const char *q = ls + 2;
+      while (q < le && *q >= '0' && *q <= '9') q++;
+      char   port_buf[16];
+      snprintf(port_buf, sizeof(port_buf), "%d", new_port[stream_idx]);
+      size_t new_port_len = strlen(port_buf);
+
+      size_t need = 2 + new_port_len + (size_t)(le - q) + 2;
+      if (need > remain) return -1;
+
+      memcpy(o, ls, 2);
+      memcpy(o + 2, port_buf, new_port_len);
+      memcpy(o + 2 + new_port_len, q, (size_t)(le - q));
+      o += need - 2;
+      *o++ = '\r';
+      *o++ = '\n';
+      remain -= need;
+
+      stream_idx++;
+    } else {
+      size_t need = ll + 2;
+      if (need > remain) return -1;
+      memcpy(o, ls, ll);
+      o += ll;
+      *o++ = '\r';
+      *o++ = '\n';
+      remain -= need;
+    }
+
+    p = le;
+    skip_eol(&p, end);
+  }
+
+  while (p < end) {
+    const char *ls = p;
+    const char *le = line_end(p, end);
+    size_t      ll  = (size_t)(le - ls);
+    size_t      need = ll + 2;
+    if (need > remain) break;
+    memcpy(o, ls, ll);
+    o += ll;
+    *o++ = '\r';
+    *o++ = '\n';
+    remain -= need;
+    p = le;
+    skip_eol(&p, end);
   }
 
   *o = '\0';

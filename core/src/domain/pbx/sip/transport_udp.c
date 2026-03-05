@@ -493,8 +493,14 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
 
         log_trace("sip_udp: received %zd bytes from %s:%d", n, src_ip, src_port);
 
+        if (n == 4 && memcmp(udata->buf, "\r\n\r\n", 4) == 0) {
+          log_trace("sip_udp: ignoring CRLF keepalive from %s:%d", src_ip, src_port);
+          return SCHED_RUNNING;
+        }
+
         if (sip_message_parse(udata->buf, (size_t)n, &udata->sip_msg) != 0) {
           log_warn("sip_udp: failed to parse SIP message from %s:%d", src_ip, src_port);
+          log_hexdump_trace(udata->buf, (size_t)n);
           return SCHED_RUNNING;
         }
 
@@ -540,11 +546,13 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
             const char *sdp     = udata->sip_msg.body;
             size_t      sdp_len = udata->sip_msg.body_len;
 
-            char  *out_sdp     = NULL;
-            size_t out_sdp_len = 0;
+            char  *out_sdp         = NULL;
+            size_t out_sdp_len     = 0;
+            char  *out_dest_sdp    = NULL;
+            size_t out_dest_sdp_len = 0;
 
             int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
-                                      &out_sdp_len);
+                                      &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
 
             if (r == -1) {
               resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
@@ -585,7 +593,8 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
                 char  *inv     = NULL;
                 size_t inv_len = 0;
                 inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag, dest_ip, dest_port,
-                                                  c->dest_rtp_ip, strlen(c->dest_rtp_ip), pbx_addr, &inv_len);
+                                                  out_dest_sdp, out_dest_sdp_len, pbx_addr, &inv_len);
+                if (out_dest_sdp) free(out_dest_sdp);
                 if (inv) {
                   int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
                   if (fd >= 0) {

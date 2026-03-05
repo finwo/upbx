@@ -18,4 +18,7 @@ int sdp_rewrite_addr(const char *body, size_t body_len, const char *new_ip, int 
 int sdp_rewrite_addr_with_transport(const char *body, size_t body_len, const char *new_ip, int new_port, int use_tcp,
                                     int direction, char *out, size_t out_cap);
 
+int sdp_rewrite_all_media(const char *body, size_t body_len, const char new_ip[][64], const int *new_port,
+                          int num_streams, char *out, size_t out_cap);
+
 #endif

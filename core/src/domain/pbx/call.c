@@ -54,6 +54,10 @@ static void free_call(const call_t *c) {
   free((void*)c->dest_contact);
   free((void*)c->from_tag);
   free((void*)c->to_tag);
+  for (int i = 0; i < c->num_media_streams; i++) {
+    free(c->source_socket_ids[i]);
+    free(c->dest_socket_ids[i]);
+  }
   free((void*)c);
 }
 
@@ -66,25 +70,9 @@ const call_t *call_find(const char *call_id) {
   return find_call(call_id);
 }
 
-static int parse_sdp_port(const char *sdp, size_t sdp_len, int *port, char *ip, size_t ip_len) {
-  sdp_media_t media[SDP_MAX_MEDIA];
-  size_t      n_out = 0;
-
-  if (sdp_parse_media(sdp, sdp_len, media, SDP_MAX_MEDIA, &n_out) != 0 || n_out == 0) {
-    return -1;
-  }
-
-  if (port) *port = media[0].port;
-  if (ip && ip_len > 0) {
-    snprintf(ip, ip_len, "%s", media[0].ip);
-  }
-
-  return 0;
-}
-
 int call_route_invite(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
                       const char *sdp, size_t sdp_len, const char *source_ip, int source_port, char **out_sdp,
-                      size_t *out_sdp_len) {
+                      size_t *out_sdp_len, char **out_dest_sdp, size_t *out_dest_sdp_len) {
   log_info("call: %s -> %s, call_id=%s, from_tag=%s", from_ext, to_ext, call_id, from_tag);
 
   registration_t *source_reg = registration_find(from_ext);
@@ -123,42 +111,91 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     return -1;
   }
 
+  sdp_media_t source_media[SDP_MAX_MEDIA];
+  size_t      n_source_media = 0;
+  if (sdp_parse_media(sdp, sdp_len, source_media, SDP_MAX_MEDIA, &n_source_media) != 0 || n_source_media == 0) {
+    log_error("call: failed to parse source SDP");
+    return -1;
+  }
+
   if (udphole_session_create(udphole, call_id, CALL_TIMEOUT_SEC) != 0) {
     log_error("call: failed to create udphole session");
     return -1;
   }
 
-  udphole_socket_info_t source_info;
-  if (udphole_socket_create_listen(udphole, call_id, from_tag, &source_info) != 0) {
-    log_error("call: failed to create source socket");
-    udphole_session_destroy(udphole, call_id);
-    return -1;
-  }
+  char dest_tag[] = "dest";
+  udphole_socket_info_t source_info[MAX_MEDIA_STREAMS];
+  udphole_socket_info_t dest_info[MAX_MEDIA_STREAMS];
+  char                  *source_socket_ids[MAX_MEDIA_STREAMS];
+  char                  *dest_socket_ids[MAX_MEDIA_STREAMS];
 
-  char                  dest_tag[] = "dest";
-  udphole_socket_info_t dest_info;
-  if (udphole_socket_create_listen(udphole, call_id, dest_tag, &dest_info) != 0) {
-    log_error("call: failed to create dest socket");
-    udphole_socket_destroy(udphole, call_id, from_tag);
-    udphole_session_destroy(udphole, call_id);
-    return -1;
-  }
+  for (size_t i = 0; i < n_source_media; i++) {
+    source_socket_ids[i] = malloc(64);
+    snprintf(source_socket_ids[i], 64, "%s_%zu", from_tag, i);
+    if (udphole_socket_create_listen(udphole, call_id, source_socket_ids[i], &source_info[i]) != 0) {
+      log_error("call: failed to create source socket %zu", i);
+      for (size_t j = 0; j < i; j++) {
+        udphole_socket_destroy(udphole, call_id, source_socket_ids[j]);
+        free(source_socket_ids[j]);
+        free(dest_socket_ids[j]);
+      }
+      udphole_session_destroy(udphole, call_id);
+      return -1;
+    }
 
-  if (udphole_forward_create(udphole, call_id, from_tag, dest_tag) != 0) {
-    log_error("call: failed to create forward source->dest");
-    udphole_socket_destroy(udphole, call_id, dest_tag);
-    udphole_socket_destroy(udphole, call_id, from_tag);
-    udphole_session_destroy(udphole, call_id);
-    return -1;
-  }
+    dest_socket_ids[i] = malloc(64);
+    snprintf(dest_socket_ids[i], 64, "dest_%zu", i);
+    if (udphole_socket_create_listen(udphole, call_id, dest_socket_ids[i], &dest_info[i]) != 0) {
+      log_error("call: failed to create dest socket %zu", i);
+      udphole_socket_destroy(udphole, call_id, source_socket_ids[i]);
+      for (size_t j = 0; j < i; j++) {
+        udphole_socket_destroy(udphole, call_id, source_socket_ids[j]);
+        udphole_socket_destroy(udphole, call_id, dest_socket_ids[j]);
+        free(source_socket_ids[j]);
+        free(dest_socket_ids[j]);
+      }
+      free(source_socket_ids[i]);
+      free(dest_socket_ids[i]);
+      udphole_session_destroy(udphole, call_id);
+      return -1;
+    }
 
-  if (udphole_forward_create(udphole, call_id, dest_tag, from_tag) != 0) {
-    log_error("call: failed to create forward dest->source");
-    udphole_forward_destroy(udphole, call_id, from_tag, dest_tag);
-    udphole_socket_destroy(udphole, call_id, dest_tag);
-    udphole_socket_destroy(udphole, call_id, from_tag);
-    udphole_session_destroy(udphole, call_id);
-    return -1;
+    if (udphole_forward_create(udphole, call_id, source_socket_ids[i], dest_socket_ids[i]) != 0) {
+      log_error("call: failed to create forward source->dest %zu", i);
+      udphole_socket_destroy(udphole, call_id, dest_socket_ids[i]);
+      udphole_socket_destroy(udphole, call_id, source_socket_ids[i]);
+      for (size_t j = 0; j < i; j++) {
+        udphole_forward_destroy(udphole, call_id, source_socket_ids[j], dest_socket_ids[j]);
+        udphole_forward_destroy(udphole, call_id, dest_socket_ids[j], source_socket_ids[j]);
+        udphole_socket_destroy(udphole, call_id, source_socket_ids[j]);
+        udphole_socket_destroy(udphole, call_id, dest_socket_ids[j]);
+        free(source_socket_ids[j]);
+        free(dest_socket_ids[j]);
+      }
+      free(source_socket_ids[i]);
+      free(dest_socket_ids[i]);
+      udphole_session_destroy(udphole, call_id);
+      return -1;
+    }
+
+    if (udphole_forward_create(udphole, call_id, dest_socket_ids[i], source_socket_ids[i]) != 0) {
+      log_error("call: failed to create forward dest->source %zu", i);
+      udphole_forward_destroy(udphole, call_id, source_socket_ids[i], dest_socket_ids[i]);
+      udphole_socket_destroy(udphole, call_id, dest_socket_ids[i]);
+      udphole_socket_destroy(udphole, call_id, source_socket_ids[i]);
+      for (size_t j = 0; j < i; j++) {
+        udphole_forward_destroy(udphole, call_id, source_socket_ids[j], dest_socket_ids[j]);
+        udphole_forward_destroy(udphole, call_id, dest_socket_ids[j], source_socket_ids[j]);
+        udphole_socket_destroy(udphole, call_id, source_socket_ids[j]);
+        udphole_socket_destroy(udphole, call_id, dest_socket_ids[j]);
+        free(source_socket_ids[j]);
+        free(dest_socket_ids[j]);
+      }
+      free(source_socket_ids[i]);
+      free(dest_socket_ids[i]);
+      udphole_session_destroy(udphole, call_id);
+      return -1;
+    }
   }
 
   call_t *c         = calloc(1, sizeof(*c));
@@ -172,55 +209,72 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
   c->from_tag = strdup(from_tag);
   c->to_tag   = strdup(dest_tag);
   c->created  = time(NULL);
+  c->num_media_streams = (int)n_source_media;
 
-  if (source_info.advertise_ip && source_info.advertise_ip[0]) {
-    strncpy(c->source_rtp_ip, source_info.advertise_ip, sizeof(c->source_rtp_ip) - 1);
-  } else {
-    const char *adv = get_advertise_ip();
-    if (adv) {
-      strncpy(c->source_rtp_ip, adv, sizeof(c->source_rtp_ip) - 1);
+  const char *adv = get_advertise_ip();
+
+  for (size_t i = 0; i < n_source_media; i++) {
+    if (source_info[i].advertise_ip && source_info[i].advertise_ip[0]) {
+      strncpy(c->source_rtp_ip[i], source_info[i].advertise_ip, sizeof(c->source_rtp_ip[i]) - 1);
+    } else if (adv) {
+      strncpy(c->source_rtp_ip[i], adv, sizeof(c->source_rtp_ip[i]) - 1);
     }
-  }
-  c->source_rtp_port = source_info.port;
+    c->source_rtp_port[i] = source_info[i].port;
+    c->source_socket_ids[i] = source_socket_ids[i];
 
-  if (dest_info.advertise_ip && dest_info.advertise_ip[0]) {
-    strncpy(c->dest_rtp_ip, dest_info.advertise_ip, sizeof(c->dest_rtp_ip) - 1);
-  } else {
-    const char *adv = get_advertise_ip();
-    if (adv) {
-      strncpy(c->dest_rtp_ip, adv, sizeof(c->dest_rtp_ip) - 1);
+    if (dest_info[i].advertise_ip && dest_info[i].advertise_ip[0]) {
+      strncpy(c->dest_rtp_ip[i], dest_info[i].advertise_ip, sizeof(c->dest_rtp_ip[i]) - 1);
+    } else if (adv) {
+      strncpy(c->dest_rtp_ip[i], adv, sizeof(c->dest_rtp_ip[i]) - 1);
     }
-  }
-  c->dest_rtp_port = dest_info.port;
+    c->dest_rtp_port[i] = dest_info[i].port;
+    c->dest_socket_ids[i] = dest_socket_ids[i];
 
-  free(source_info.advertise_ip);
-  free(dest_info.advertise_ip);
+    free(source_info[i].advertise_ip);
+    free(dest_info[i].advertise_ip);
+  }
 
   hashmap_set(calls, c);
 
-  char sdp_ip[64] = {0};
-  int  sdp_port   = 0;
-  parse_sdp_port(sdp, sdp_len, &sdp_port, sdp_ip, sizeof(sdp_ip));
-
   *out_sdp = malloc(4096);
-  if (!*out_sdp) {
+  *out_dest_sdp = malloc(4096);
+  if (!*out_sdp || !*out_dest_sdp) {
+    free(*out_sdp);
+    free(*out_dest_sdp);
+    *out_sdp = NULL;
+    *out_dest_sdp = NULL;
     free_call(c);
     return -1;
   }
 
-  int len =
-      sdp_rewrite_addr(sdp, sdp_len, c->dest_rtp_ip[0] ? c->dest_rtp_ip : "0.0.0.0", c->dest_rtp_port, *out_sdp, 4096);
+  int len = sdp_rewrite_all_media(sdp, sdp_len, c->dest_rtp_ip, c->dest_rtp_port, (int)n_source_media, *out_sdp, 4096);
   if (len < 0) {
     free(*out_sdp);
+    free(*out_dest_sdp);
     *out_sdp = NULL;
+    *out_dest_sdp = NULL;
     free_call(c);
     return -1;
   }
-
   *out_sdp_len = (size_t)len;
 
-  log_info("call: session created: source_rtp=%s:%d, dest_rtp=%s:%d", c->source_rtp_ip, c->source_rtp_port,
-           c->dest_rtp_ip, c->dest_rtp_port);
+  len = sdp_rewrite_all_media(sdp, sdp_len, c->source_rtp_ip, c->source_rtp_port, (int)n_source_media, *out_dest_sdp, 4096);
+  if (len < 0) {
+    free(*out_sdp);
+    free(*out_dest_sdp);
+    *out_sdp = NULL;
+    *out_dest_sdp = NULL;
+    free_call(c);
+    return -1;
+  }
+  *out_dest_sdp_len = (size_t)len;
+
+  log_info("call: session created with %zu media streams", n_source_media);
+  for (size_t i = 0; i < n_source_media; i++) {
+    log_info("call:   stream %zu: source_rtp=%s:%d, dest_rtp=%s:%d", i,
+             c->source_rtp_ip[i], c->source_rtp_port[i],
+             c->dest_rtp_ip[i], c->dest_rtp_port[i]);
+  }
 
   return 0;
 }
@@ -236,10 +290,14 @@ void call_handle_bye(const char *call_id) {
 
   udphole_client_t *udphole = udphole_get_client();
   if (udphole) {
-    udphole_forward_destroy(udphole, call_id, c->from_tag, c->to_tag);
-    udphole_forward_destroy(udphole, call_id, c->to_tag, c->from_tag);
-    udphole_socket_destroy(udphole, call_id, c->from_tag);
-    udphole_socket_destroy(udphole, call_id, c->to_tag);
+    for (int i = 0; i < c->num_media_streams; i++) {
+      if (c->source_socket_ids[i]) {
+        udphole_forward_destroy(udphole, call_id, c->source_socket_ids[i], c->dest_socket_ids[i]);
+        udphole_forward_destroy(udphole, call_id, c->dest_socket_ids[i], c->source_socket_ids[i]);
+        udphole_socket_destroy(udphole, call_id, c->source_socket_ids[i]);
+        udphole_socket_destroy(udphole, call_id, c->dest_socket_ids[i]);
+      }
+    }
     udphole_session_destroy(udphole, call_id);
   }
 
