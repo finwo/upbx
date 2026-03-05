@@ -14,7 +14,8 @@
 #include "rxi/log.h"
 
 #define REALM           "upbx"
-#define DEFAULT_EXPIRES 3600
+#define DEFAULT_EXPIRES 300
+#define MAX_EXPIRES     3600
 
 static void normalize_ext_number(const char *username, size_t len, char *out, size_t out_size) {
   if (!username || !out || out_size == 0) return;
@@ -320,10 +321,26 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
     return build_401_response(msg, ext_number, response_len);
   }
 
+  registration_t *existing_reg = registration_find(ext_number);
+  if (existing_reg) {
+    time_t now = time(NULL);
+    if (existing_reg->expires_at > 0 && existing_reg->expires_at < now) {
+      log_warn("sip_handler: %s sending traffic with expired registration (expired %ld seconds ago)",
+               ext_number, (long)(now - existing_reg->expires_at));
+    }
+  }
+
   int expires = parse_expires_header(msg);
+  if (expires > MAX_EXPIRES) {
+    log_info("sip_handler: %s requested Expires=%d, capping to MAX_EXPIRES=%d", ext_number, expires, MAX_EXPIRES);
+    expires = MAX_EXPIRES;
+  }
 
   char contact[512] = "";
   sip_message_header_copy(msg, "Contact", contact, sizeof(contact));
+
+  log_info("sip_handler: REGISTER from %s, Contact: %s, Expires: %d", ext_number,
+           contact[0] ? contact : "(none)", expires);
 
   if (expires == 0 || contact[0] == '\0') {
     registration_remove(ext_number);
@@ -334,12 +351,34 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
     return build_response(500, "Server Internal Error", msg, NULL, NULL, response_len);
   }
 
+  char expires_header[64];
+  if (expires > 0) {
+    snprintf(expires_header, sizeof(expires_header), "Expires: %d\r\n", expires);
+  } else {
+    expires_header[0] = '\0';
+  }
+
   char contact_resp[600];
   if (contact[0]) {
-    snprintf(contact_resp, sizeof(contact_resp), "<%s>", contact);
+    snprintf(contact_resp, sizeof(contact_resp), "<%s>;expires=%d", contact, expires);
   } else {
     contact_resp[0] = '\0';
   }
 
-  return build_response(200, "OK", msg, NULL, contact_resp[0] ? contact_resp : NULL, response_len);
+  char *resp = build_response(200, "OK", msg, NULL, contact_resp[0] ? contact_resp : NULL, response_len);
+
+  if (resp && expires > 0) {
+    size_t new_len = *response_len + strlen(expires_header);
+    char  *new_resp = realloc(resp, new_len + 1);
+    if (new_resp) {
+      memcpy(new_resp + *response_len, expires_header, strlen(expires_header));
+      new_resp[new_len] = '\0';
+      *response_len = new_len;
+      resp = new_resp;
+    }
+  }
+
+  log_info("sip_handler: 200 OK to %s, Expires: %d", ext_number, expires);
+
+  return resp;
 }
