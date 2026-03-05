@@ -404,3 +404,46 @@ int *unix_listen(const char *path, int sock_type, const char *owner) {
   free(path_copy);
   return fds;
 }
+
+int *merge_fd_arrays(int **arrays, int count) {
+  if (!arrays || count <= 0) {
+    return NULL;
+  }
+
+  int total_count = 0;
+  for (int i = 0; i < count; i++) {
+    if (arrays[i] && arrays[i][0] > 0) {
+      total_count += arrays[i][0];
+    }
+  }
+
+  if (total_count == 0) {
+    for (int i = 0; i < count; i++) {
+      free(arrays[i]);
+    }
+    return NULL;
+  }
+
+  int *merged = malloc(sizeof(int) * (total_count + 1));
+  if (!merged) {
+    for (int i = 0; i < count; i++) {
+      free(arrays[i]);
+    }
+    return NULL;
+  }
+
+  merged[0] = 0;
+  int idx = 1;
+
+  for (int i = 0; i < count; i++) {
+    if (arrays[i] && arrays[i][0] > 0) {
+      for (int j = 1; j <= arrays[i][0]; j++) {
+        merged[idx++] = arrays[i][j];
+      }
+      merged[0] += arrays[i][0];
+    }
+    free(arrays[i]);
+  }
+
+  return merged;
+}

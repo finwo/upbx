@@ -383,9 +383,16 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
       return SCHED_RUNNING;
     }
 
-    resp_object *upbx_sec   = resp_map_get(domain_cfg, "upbx");
-    const char  *listen_str = upbx_sec ? resp_map_get_string(upbx_sec, "address") : NULL;
-    if (!listen_str || !listen_str[0]) {
+    resp_object *upbx_sec = resp_map_get(domain_cfg, "upbx");
+    resp_object *addr_arr = upbx_sec ? resp_map_get(upbx_sec, "address") : NULL;
+
+    const char *listen_str = NULL;
+    if (addr_arr && addr_arr->type == RESPT_ARRAY && addr_arr->u.arr.n > 0) {
+      listen_str = addr_arr->u.arr.elem[0].u.s;
+      if (!listen_str || !listen_str[0]) {
+        listen_str = ":5060";
+      }
+    } else {
       listen_str = ":5060";
     }
     if (strncmp(listen_str, "udp://", 6) == 0) {
@@ -412,13 +419,52 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
     registration_init();
     call_init();
 
-    sip_fds = udp_recv(listen_str, NULL, "5060");
+    if (addr_arr && addr_arr->type == RESPT_ARRAY && addr_arr->u.arr.n > 0) {
+      int **fd_arrays = malloc(sizeof(int *) * addr_arr->u.arr.n);
+      int valid_count = 0;
+
+      for (size_t i = 0; i < addr_arr->u.arr.n; i++) {
+        const char *addr = addr_arr->u.arr.elem[i].u.s;
+        if (!addr || !addr[0]) {
+          fd_arrays[i] = NULL;
+          continue;
+        }
+        const char *clean_addr = addr;
+        if (strncmp(clean_addr, "udp://", 6) == 0) {
+          clean_addr = clean_addr + 6;
+        }
+        fd_arrays[i] = udp_recv(clean_addr, NULL, "5060");
+        if (fd_arrays[i] && fd_arrays[i][0] > 0) {
+          valid_count++;
+          log_info("sip_udp: listening on %s", clean_addr);
+        }
+      }
+
+      if (valid_count > 0) {
+        sip_fds = merge_fd_arrays(fd_arrays, addr_arr->u.arr.n);
+      } else {
+        for (size_t i = 0; i < addr_arr->u.arr.n; i++) {
+          free(fd_arrays[i]);
+        }
+        free(fd_arrays);
+        log_error("sip_udp: failed to create sockets on any address");
+        return SCHED_ERROR;
+      }
+      free(fd_arrays);
+    } else {
+      sip_fds = udp_recv(listen_str, NULL, "5060");
+      if (!sip_fds || sip_fds[0] == 0) {
+        log_error("sip_udp: failed to create socket on %s", listen_str);
+        return SCHED_ERROR;
+      }
+      log_info("sip_udp: listening on %s", listen_str);
+    }
+
     if (!sip_fds || sip_fds[0] == 0) {
-      log_error("sip_udp: failed to create socket on %s", listen_str);
+      log_error("sip_udp: failed to create sockets");
       return SCHED_ERROR;
     }
 
-    log_info("sip_udp: listening on %s", listen_str);
     udata->state          = 1;
     udata->current_fd_idx = 1;
   }

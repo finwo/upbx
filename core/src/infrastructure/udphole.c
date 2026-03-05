@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,119 +13,113 @@
 #include <unistd.h>
 
 #include "common/resp.h"
+#include "finwo/url-parser.h"
 #include "infrastructure/config.h"
 #include "rxi/log.h"
 
 typedef struct {
   int   fd;
-  char *address;
+  char *url;
   int   connected;
-  char *auth_username;
-  char *auth_password;
 } udphole_impl_t;
 
-static int impl_parse_url(udphole_impl_t *impl, const char *url) {
-  if (!impl || !url) return -1;
+static void impl_parse_url(udphole_impl_t *impl, const char *url);
+static void impl_disconnect(void *self);
+static int impl_send(void *self, const char *cmd, size_t cmd_len);
+static resp_object *impl_recv(void *self);
+static int impl_encode_and_send(udphole_impl_t *impl, int argc, const char **argv);
 
-  impl->address = strdup(url);
-  if (!impl->address) return -1;
-
-  return 0;
-}
-
-static int impl_connect_tcp(udphole_impl_t *impl) {
-  const char *url = impl->address;
-  if (!url) return -1;
-
-  if (strncmp(url, "tcp://", 6) == 0) {
-    const char *path  = url + 6;
-    const char *colon = strchr(path, ':');
-    if (!colon) {
-      log_error("udphole: invalid tcp url, missing port");
-      return -1;
-    }
-
-    char *host = strndup(path, colon - path);
-    if (!host) return -1;
-
-    int port = atoi(colon + 1);
-    if (port <= 0) port = 12345;
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-      free(host);
-      return -1;
-    }
-
-    struct sockaddr_in srv = {0};
-    srv.sin_family         = AF_INET;
-    srv.sin_port           = htons((uint16_t)port);
-
-    struct in_addr addr;
-    if (inet_pton(AF_INET, host, &addr) > 0) {
-      srv.sin_addr = addr;
-    } else {
-      struct hostent *he = gethostbyname(host);
-      if (!he) {
-        free(host);
-        close(sock);
-        return -1;
-      }
-      memcpy(&srv.sin_addr, he->h_addr_list[0], he->h_length);
-    }
-
-    free(host);
-
-    if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
-      close(sock);
-      return -1;
-    }
-
-    impl->fd        = sock;
-    impl->connected = 1;
-    return 0;
-  }
-
-  log_error("udphole: unsupported url scheme: %s", url);
-  return -1;
-}
-
-static int impl_connect_unix(udphole_impl_t *impl) {
-  const char *url = impl->address;
-  if (!url) return -1;
-
-  if (strncmp(url, "unix://", 7) == 0) {
-    const char *path = url + 7;
-
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-
-    struct sockaddr_un addr = {0};
-    addr.sun_family         = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-      close(sock);
-      return -1;
-    }
-
-    impl->fd        = sock;
-    impl->connected = 1;
-    return 0;
-  }
-
-  log_error("udphole: unsupported url scheme: %s", url);
-  return -1;
+static void impl_parse_url(udphole_impl_t *impl, const char *url) {
+  free(impl->url);
+  impl->url = url ? strdup(url) : NULL;
 }
 
 static int impl_connect(void *self) {
   udphole_impl_t *impl = (udphole_impl_t *)self;
-  if (!impl || impl->connected) return 0;
+  if (!impl || impl->connected || !impl->url) return 0;
 
-  if (strncmp(impl->address, "unix://", 7) == 0) {
-    return impl_connect_unix(impl);
+  struct parsed_url *parsed = parse_url(impl->url);
+  if (!parsed || !parsed->scheme) {
+    if (parsed) parsed_url_free(parsed);
+    return -1;
   }
-  return impl_connect_tcp(impl);
+
+  int sock;
+  if (strcmp(parsed->scheme, "unix") == 0) {
+    if (!parsed->path) {
+      parsed_url_free(parsed);
+      return -1;
+    }
+    sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+      parsed_url_free(parsed);
+      return -1;
+    }
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, parsed->path, sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+      close(sock);
+      parsed_url_free(parsed);
+      return -1;
+    }
+  } else {
+    if (!parsed->host) {
+      parsed_url_free(parsed);
+      return -1;
+    }
+    const char *port = parsed->port ? parsed->port : "12345";
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+      parsed_url_free(parsed);
+      return -1;
+    }
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    struct sockaddr_in srv = {0};
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons((uint16_t)atoi(port));
+    struct in_addr addr;
+    if (inet_pton(AF_INET, parsed->host, &addr) > 0) {
+      srv.sin_addr = addr;
+    } else {
+      struct hostent *he = gethostbyname(parsed->host);
+      if (!he) {
+        close(sock);
+        parsed_url_free(parsed);
+        return -1;
+      }
+      memcpy(&srv.sin_addr, he->h_addr_list[0], he->h_length);
+    }
+    if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+      close(sock);
+      parsed_url_free(parsed);
+      return -1;
+    }
+  }
+
+  impl->fd = sock;
+  impl->connected = 1;
+
+  if (parsed->username && parsed->password) {
+    const char *argv[3] = {"auth", parsed->username, parsed->password};
+    if (impl_encode_and_send(impl, 3, argv) < 0) {
+      impl_disconnect(impl);
+      parsed_url_free(parsed);
+      return -1;
+    }
+    resp_object *resp = impl_recv(impl);
+    if (!resp || resp->type != RESPT_SIMPLE || !resp->u.s || strcmp(resp->u.s, "OK") != 0) {
+      if (resp) resp_free(resp);
+      impl_disconnect(impl);
+      parsed_url_free(parsed);
+      return -1;
+    }
+    resp_free(resp);
+  }
+
+  parsed_url_free(parsed);
+  return 0;
 }
 
 static void impl_disconnect(void *self) {
@@ -182,29 +177,11 @@ static int impl_encode_and_send(udphole_impl_t *impl, int argc, const char **arg
   return ret;
 }
 
-static int impl_auth(void *self, const char *user, const char *pass) {
-  udphole_impl_t *impl = (udphole_impl_t *)self;
-  if (!impl || !impl->connected) return -1;
-
-  const char *argv[3] = {"auth", user, pass};
-  if (impl_encode_and_send(impl, 3, argv) < 0) return -1;
-
-  resp_object *resp = impl_recv(impl);
-  if (!resp) return -1;
-
-  int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
-  resp_free(resp);
-
-  return ok ? 0 : -1;
-}
-
 static void impl_cleanup(udphole_impl_t *impl) {
   if (!impl) return;
 
   impl_disconnect(impl);
-  free(impl->address);
-  free(impl->auth_username);
-  free(impl->auth_password);
+  free(impl->url);
 
   memset(impl, 0, sizeof(*impl));
   impl->fd = -1;
@@ -215,86 +192,171 @@ static const udphole_transport_vtable impl_vtable = {
     .disconnect = impl_disconnect,
     .send       = impl_send,
     .recv       = impl_recv,
-    .auth       = impl_auth,
 };
 
-static udphole_client_t *global_client  = NULL;
 static char             *advertise_addr = NULL;
+static rtpproxy_pool_t  *global_pool    = NULL;
 
 int infrastructure_udphole_init_global(void) {
-  if (global_client) return 0;
+  if (global_pool) return 0;
 
-  const char *address   = "tcp://127.0.0.1:12345";
-  const char *auth_user = NULL;
-  const char *auth_pass = NULL;
+  resp_object *upbx_sec = resp_map_get(domain_cfg, "upbx");
+  resp_object *rtp_arr = upbx_sec ? resp_map_get(upbx_sec, "rtpproxy") : NULL;
 
-  resp_object *udphole_sec = resp_map_get(domain_cfg, "udphole");
-  if (udphole_sec) {
-    const char *addr_cfg = resp_map_get_string(udphole_sec, "address");
-    if (addr_cfg && addr_cfg[0]) {
-      address = addr_cfg;
-    }
-
-    const char *adv_cfg = resp_map_get_string(udphole_sec, "advertise");
-    if (adv_cfg && adv_cfg[0]) {
-      advertise_addr = strdup(adv_cfg);
-    }
-
-    const char *user_cfg = resp_map_get_string(udphole_sec, "username");
-    if (user_cfg && user_cfg[0]) {
-      auth_user = user_cfg;
-    }
-
-    const char *pass_cfg = resp_map_get_string(udphole_sec, "password");
-    if (pass_cfg && pass_cfg[0]) {
-      auth_pass = pass_cfg;
-    }
-  }
-
-  global_client = infrastructure_udphole_create(address, auth_user, auth_pass);
-  if (!global_client) return -1;
-
-  if (udphole_client_connect(global_client) < 0) {
-    log_error("udphole: failed to connect");
-    infrastructure_udphole_destroy(global_client);
-    global_client = NULL;
+  if (!rtp_arr || rtp_arr->type != RESPT_ARRAY || rtp_arr->u.arr.n == 0) {
+    log_fatal("udphole: no rtpproxy configured");
     return -1;
   }
 
-  if (auth_user && auth_pass) {
-    log_info("udphole: authenticating as %s", auth_user);
-    if (global_client->transport.vtable->auth(global_client->transport.impl, auth_user, auth_pass) < 0) {
-      log_error("udphole: authentication failed");
-      infrastructure_udphole_destroy(global_client);
-      global_client = NULL;
-      return -1;
+  rtpproxy_node_t *head = NULL;
+  rtpproxy_node_t *prev = NULL;
+
+  for (size_t i = 0; i < rtp_arr->u.arr.n; i++) {
+    const char *url = rtp_arr->u.arr.elem[i].u.s;
+    if (!url || !url[0]) continue;
+
+    udphole_client_t *client = infrastructure_udphole_create(url, NULL, NULL);
+    if (!client) continue;
+
+    rtpproxy_node_t *node = malloc(sizeof(rtpproxy_node_t));
+    if (!node) {
+      infrastructure_udphole_destroy(client);
+      continue;
     }
-    log_info("udphole: authenticated successfully");
+    node->client = client;
+    node->next = NULL;
+
+    if (!head) {
+      head = node;
+    } else {
+      prev->next = node;
+    }
+    prev = node;
   }
 
-  log_info("udphole: initialized with address %s", address);
+  if (!head) {
+    log_fatal("udphole: could not create any rtpproxy client");
+    return -1;
+  }
+
+  prev->next = head;
+
+  global_pool = malloc(sizeof(rtpproxy_pool_t));
+  if (!global_pool) {
+    rtpproxy_node_t *node = head;
+    while (node) {
+      rtpproxy_node_t *next = node->next;
+      infrastructure_udphole_destroy(node->client);
+      free(node);
+      if (node == head) break;
+      node = next;
+    }
+    log_fatal("udphole: could not allocate rtpproxy pool");
+    return -1;
+  }
+
+  global_pool->head = head;
+  global_pool->current = head;
+  global_pool->count = 0;
+
+  rtpproxy_node_t *start = head;
+  do {
+    if (udphole_client_connect(global_pool->current->client) == 0) {
+      log_info("udphole: connected to %s", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
+      global_pool->count++;
+      break;
+    }
+    log_warn("udphole: failed to connect to %s, trying next", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
+    global_pool->current = global_pool->current->next;
+  } while (global_pool->current != start);
+
+  if (global_pool->count == 0) {
+    log_fatal("udphole: could not connect to any rtp proxy");
+    return -1;
+  }
+
+  log_info("udphole: initialized with %d rtpproxy(s)", global_pool->count);
 
   return 0;
 }
 
 void infrastructure_udphole_cleanup_global(void) {
-  if (global_client) {
-    infrastructure_udphole_destroy(global_client);
-    global_client = NULL;
+  if (global_pool) {
+    rtpproxy_node_t *node = global_pool->head;
+    do {
+      rtpproxy_node_t *next = node->next;
+      infrastructure_udphole_destroy(node->client);
+      free(node);
+      if (node == global_pool->head) break;
+      node = next;
+    } while (node);
+    free(global_pool);
+    global_pool = NULL;
   }
   free(advertise_addr);
   advertise_addr = NULL;
 }
 
+static int pool_advance(void) {
+  if (!global_pool || global_pool->count <= 1) return -1;
+
+  rtpproxy_node_t *start = global_pool->current;
+  global_pool->current = global_pool->current->next;
+
+  do {
+    udphole_client_t *client = global_pool->current->client;
+    if (((udphole_impl_t *)client->transport.impl)->connected ||
+        udphole_client_connect(client) == 0) {
+      return 0;
+    }
+    log_warn("udphole: failed to use %s, trying next", ((udphole_impl_t *)client->transport.impl)->url);
+    global_pool->current = global_pool->current->next;
+  } while (global_pool->current != start);
+
+  return -1;
+}
+
+static resp_object *pool_execute(resp_object *cmd) {
+  if (!global_pool || !cmd) return NULL;
+
+  for (int i = 0; i < global_pool->count; i++) {
+    udphole_client_t *client = global_pool->current->client;
+    udphole_impl_t *impl = client->transport.impl;
+
+    if (!impl->connected) {
+      if (udphole_client_connect(client) < 0) {
+        pool_advance();
+        continue;
+      }
+    }
+
+    if (impl_encode_and_send(impl, cmd->u.arr.n, (const char **)cmd->u.arr.elem) < 0) {
+      udphole_client_disconnect(client);
+      pool_advance();
+      continue;
+    }
+
+    resp_object *resp = impl_recv(impl);
+    if (!resp) {
+      udphole_client_disconnect(client);
+      pool_advance();
+      continue;
+    }
+
+    return resp;
+  }
+
+  return NULL;
+}
+
 udphole_client_t *infrastructure_udphole_create(const char *address, const char *auth_user, const char *auth_pass) {
+  (void)auth_user;
+  (void)auth_pass;
   udphole_impl_t *impl = calloc(1, sizeof(udphole_impl_t));
   if (!impl) return NULL;
 
   impl->fd = -1;
   impl_parse_url(impl, address);
-
-  if (auth_user) impl->auth_username = strdup(auth_user);
-  if (auth_pass) impl->auth_password = strdup(auth_pass);
 
   udphole_client_t *client = calloc(1, sizeof(udphole_client_t));
   if (!client) {
@@ -333,17 +395,13 @@ void udphole_client_disconnect(udphole_client_t *client) {
 }
 
 int udphole_ping(udphole_client_t *client) {
-  if (!client) return -1;
+  (void)client;
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "ping");
 
-  if (!((udphole_impl_t *)client->transport.impl)->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
 
-  const char     *argv[1] = {"ping"};
-  udphole_impl_t *impl    = client->transport.impl;
-  if (impl_encode_and_send(impl, 1, argv) < 0) return -1;
-
-  resp_object *resp = impl_recv(impl);
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "PONG") == 0);
@@ -353,20 +411,20 @@ int udphole_ping(udphole_client_t *client) {
 }
 
 int udphole_session_create(udphole_client_t *client, const char *session_id, int idle_expiry) {
-  if (!client || !session_id) return -1;
-
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  (void)client;
+  if (!session_id) return -1;
 
   char expiry_str[32];
   snprintf(expiry_str, sizeof(expiry_str), "%d", idle_expiry);
 
-  const char *argv[3] = {"session.create", session_id, expiry_str};
-  if (impl_encode_and_send(impl, 3, argv) < 0) return -1;
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.create");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, expiry_str);
 
-  resp_object *resp = impl_recv(impl);
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
+
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
@@ -376,17 +434,16 @@ int udphole_session_create(udphole_client_t *client, const char *session_id, int
 }
 
 int udphole_session_destroy(udphole_client_t *client, const char *session_id) {
-  if (!client || !session_id) return -1;
+  (void)client;
+  if (!session_id) return -1;
 
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.destroy");
+  resp_array_append_simple(cmd, session_id);
 
-  const char *argv[2] = {"session.destroy", session_id};
-  if (impl_encode_and_send(impl, 2, argv) < 0) return -1;
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
 
-  resp_object *resp = impl_recv(impl);
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
@@ -397,19 +454,19 @@ int udphole_session_destroy(udphole_client_t *client, const char *session_id) {
 
 int udphole_socket_create_listen(udphole_client_t *client, const char *session_id, const char *socket_id,
                                  udphole_socket_info_t *info) {
-  if (!client || !session_id || !socket_id || !info) return -1;
-
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  (void)client;
+  if (!session_id || !socket_id || !info) return -1;
 
   memset(info, 0, sizeof(*info));
 
-  const char *argv[3] = {"session.socket.create.listen", session_id, socket_id};
-  if (impl_encode_and_send(impl, 3, argv) < 0) return -1;
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.socket.create.listen");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, socket_id);
 
-  resp_object *resp = impl_recv(impl);
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
+
   if (!resp) return -1;
 
   if (resp->type != RESPT_ARRAY || resp->u.arr.n != 2) {
@@ -435,22 +492,24 @@ int udphole_socket_create_listen(udphole_client_t *client, const char *session_i
 
 int udphole_socket_create_connect(udphole_client_t *client, const char *session_id, const char *socket_id,
                                   const char *ip, int port, udphole_socket_info_t *info) {
-  if (!client || !session_id || !socket_id || !ip || !info) return -1;
-
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  (void)client;
+  if (!session_id || !socket_id || !ip || !info) return -1;
 
   memset(info, 0, sizeof(*info));
 
   char port_str[16];
   snprintf(port_str, sizeof(port_str), "%d", port);
 
-  const char *argv[5] = {"session.socket.create.connect", session_id, socket_id, ip, port_str};
-  if (impl_encode_and_send(impl, 5, argv) < 0) return -1;
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.socket.create.connect");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, socket_id);
+  resp_array_append_simple(cmd, ip);
+  resp_array_append_simple(cmd, port_str);
 
-  resp_object *resp = impl_recv(impl);
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
+
   if (!resp) return -1;
 
   if (resp->type != RESPT_ARRAY || resp->u.arr.n != 2) {
@@ -475,17 +534,17 @@ int udphole_socket_create_connect(udphole_client_t *client, const char *session_
 }
 
 int udphole_socket_destroy(udphole_client_t *client, const char *session_id, const char *socket_id) {
-  if (!client || !session_id || !socket_id) return -1;
+  (void)client;
+  if (!session_id || !socket_id) return -1;
 
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.socket.destroy");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, socket_id);
 
-  const char *argv[3] = {"session.socket.destroy", session_id, socket_id};
-  if (impl_encode_and_send(impl, 3, argv) < 0) return -1;
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
 
-  resp_object *resp = impl_recv(impl);
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
@@ -496,17 +555,18 @@ int udphole_socket_destroy(udphole_client_t *client, const char *session_id, con
 
 int udphole_forward_create(udphole_client_t *client, const char *session_id, const char *src_socket_id,
                            const char *dst_socket_id) {
-  if (!client || !session_id || !src_socket_id || !dst_socket_id) return -1;
+  (void)client;
+  if (!session_id || !src_socket_id || !dst_socket_id) return -1;
 
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.forward.create");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, src_socket_id);
+  resp_array_append_simple(cmd, dst_socket_id);
 
-  const char *argv[4] = {"session.forward.create", session_id, src_socket_id, dst_socket_id};
-  if (impl_encode_and_send(impl, 4, argv) < 0) return -1;
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
 
-  resp_object *resp = impl_recv(impl);
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
@@ -517,17 +577,18 @@ int udphole_forward_create(udphole_client_t *client, const char *session_id, con
 
 int udphole_forward_destroy(udphole_client_t *client, const char *session_id, const char *src_socket_id,
                             const char *dst_socket_id) {
-  if (!client || !session_id || !src_socket_id || !dst_socket_id) return -1;
+  (void)client;
+  if (!session_id || !src_socket_id || !dst_socket_id) return -1;
 
-  udphole_impl_t *impl = client->transport.impl;
-  if (!impl->connected) {
-    if (udphole_client_connect(client) < 0) return -1;
-  }
+  resp_object *cmd = resp_array_init();
+  resp_array_append_simple(cmd, "session.forward.destroy");
+  resp_array_append_simple(cmd, session_id);
+  resp_array_append_simple(cmd, src_socket_id);
+  resp_array_append_simple(cmd, dst_socket_id);
 
-  const char *argv[4] = {"session.forward.destroy", session_id, src_socket_id, dst_socket_id};
-  if (impl_encode_and_send(impl, 4, argv) < 0) return -1;
+  resp_object *resp = pool_execute(cmd);
+  resp_free(cmd);
 
-  resp_object *resp = impl_recv(impl);
   if (!resp) return -1;
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "OK") == 0);
@@ -545,7 +606,8 @@ void udphole_client_cleanup_global(void) {
 }
 
 udphole_client_t *udphole_get_client(void) {
-  return global_client;
+  if (!global_pool || !global_pool->current) return NULL;
+  return global_pool->current->client;
 }
 
 const char *udphole_get_advertise_addr(void) {

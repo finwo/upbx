@@ -1,0 +1,10 @@
+**/*.o
+*.a
+*.so
+*.so.*
+upbx
+upbx.1
+doc/cli_doc.md
+doc/cli_doc.man
+doc/license.man
+lib/.dep

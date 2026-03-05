@@ -14,7 +14,6 @@ typedef struct {
   void (*disconnect)(void *self);
   int (*send)(void *self, const char *cmd, size_t cmd_len);
   resp_object *(*recv)(void *self);
-  int (*auth)(void *self, const char *user, const char *pass);
 } udphole_transport_vtable;
 
 struct udphole_transport {
@@ -31,6 +30,17 @@ typedef struct {
   int   port;
   char *advertise_ip;
 } udphole_socket_info_t;
+
+typedef struct rtpproxy_node {
+  udphole_client_t       *client;
+  struct rtpproxy_node *next;
+} rtpproxy_node_t;
+
+typedef struct {
+  rtpproxy_node_t *head;
+  rtpproxy_node_t *current;
+  int              count;
+} rtpproxy_pool_t;
 
 void udphole_client_init_global(void);
 void udphole_client_cleanup_global(void);

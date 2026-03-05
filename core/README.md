@@ -90,8 +90,18 @@ Full example with every option listed (optional ones commented). Minimal setups 
 
 ```ini
 [upbx]
+# Multiple addresses supported (bind to multiple interfaces/ports)
 address = :5060
+# address = udp://192.168.1.1:5060
+
 daemonize = 0
+
+# RTP Proxy: multiple entries for failover
+# Auth can be in URL: tcp://user:pass@host:port
+rtpproxy = unix:///var/run/udphole.sock
+# rtpproxy = tcp://192.168.1.100:6379
+# rtpproxy = tcp://user:pass@192.168.1.101:6379
+
 # locality = 4
 # cross_group_calls = 1
 # emergency = 911
@@ -151,8 +161,9 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 
 | Option | Description |
 |--------|-------------|
-| `address` | SIP UDP bind address (e.g. `:5060`, `0.0.0.0:5060` or `192.168.1.1:5060`). Fallback for Via/SDP when not yet learned from REGISTER. |
+| `address` | **Repeatable.** SIP UDP bind address (e.g. `:5060`, `0.0.0.0:5060` or `192.168.1.1:5060`). Multiple addresses bind to multiple interfaces/ports. Fallback for Via/SDP when not yet learned from REGISTER. |
 | `daemonize` | `1` = run in background when started without `-d`/`-D`; `0` = foreground. |
+| `rtpproxy` | **Repeatable.** URL of udphole instance for RTP relay (e.g. `unix:///var/run/udphole.sock`, `tcp://host:6379`, `tcp://user:pass@host:6379`). Multiple entries for failover. If auth is in URL, it's sent automatically on connect. |
 | `locality` | Number of short-dial digits and locality group selector. `0` (default) = disabled, all trunks form one big group. When `> 0`, trunks with the same `group` prefix form a locality group, and extensions whose number starts with that prefix belong to the group. Dialing exactly `locality` digits triggers **short-dialing**: the caller’s group prefix is prepended automatically (e.g. `locality = 4`, prefix `1234`, dial `1001` expands to `12341001`). |
 | `cross_group_calls` | `1` (default) = allow direct ext-to-ext calls across locality groups. `0` = block cross-group ext-to-ext calls with 403. Only meaningful when `locality > 0`. |
 | `emergency` | Repeatable. Numbers listed here always route externally via the caller’s trunk, bypassing short-dialing and ext-to-ext routing (e.g. `emergency = 911`). |

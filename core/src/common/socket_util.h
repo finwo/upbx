@@ -20,4 +20,10 @@ int *udp_recv(const char *addr, const char *default_host, const char *default_po
  * Caller must free. On error returns NULL. */
 int *unix_listen(const char *path, int sock_type, const char *owner);
 
+/* Merge multiple fd arrays into one. arrays is array of pointers to fd arrays,
+ * each fd array has index 0 = count, index 1+ = fds. count is number of arrays.
+ * Returns merged array (index 0 = total count), or NULL on error.
+ * Caller must free. All input arrays are freed. */
+int *merge_fd_arrays(int **arrays, int count);
+
 #endif

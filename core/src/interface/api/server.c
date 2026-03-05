@@ -482,23 +482,38 @@ int api_server_pt(int64_t timestamp, struct pt_task *task) {
   }
 
   if (udata->server_fds == NULL) {
-    resp_object *api_sec    = resp_map_get(domain_cfg, "api");
-    const char  *listen_str = api_sec ? resp_map_get_string(api_sec, "listen") : NULL;
+    resp_object *api_sec  = resp_map_get(domain_cfg, "api");
+    resp_object *addr_arr = api_sec ? resp_map_get(api_sec, "address") : NULL;
 
-    if (!listen_str || !listen_str[0]) {
+    if (!addr_arr || addr_arr->type != RESPT_ARRAY || addr_arr->u.arr.n == 0) {
       return SCHED_RUNNING;
     }
 
-    current_listen = strdup(listen_str);
-    if (!current_listen) {
-      return SCHED_ERROR;
-    }
     init_builtins();
-    udata->server_fds = create_listen_socket(current_listen);
-    if (!udata->server_fds) {
-      log_fatal("api: failed to listen on %s", current_listen);
-      free(current_listen);
-      current_listen = NULL;
+
+    int **fd_arrays = malloc(sizeof(int *) * addr_arr->u.arr.n);
+    int valid_count = 0;
+
+    for (size_t i = 0; i < addr_arr->u.arr.n; i++) {
+      const char *addr = addr_arr->u.arr.elem[i].u.s;
+      if (!addr || !addr[0]) {
+        fd_arrays[i] = NULL;
+        continue;
+      }
+      fd_arrays[i] = create_listen_socket(addr);
+      if (fd_arrays[i] && fd_arrays[i][0] > 0) {
+        valid_count++;
+      }
+    }
+
+    if (valid_count > 0) {
+      udata->server_fds = merge_fd_arrays(fd_arrays, addr_arr->u.arr.n);
+    }
+
+    free(fd_arrays);
+
+    if (!udata->server_fds || udata->server_fds[0] == 0) {
+      log_fatal("api: failed to listen on any address");
       return SCHED_ERROR;
     }
   }

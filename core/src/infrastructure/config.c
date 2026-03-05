@@ -21,8 +21,25 @@ static int config_handler(void *user, const char *section, const char *name, con
     resp_map_set(cfg, section, sec);
     sec = resp_map_get(cfg, section);
   }
-  resp_array_append_bulk(sec, name);
-  resp_array_append_bulk(sec, value);
+
+  if (strcmp(name, "listen") == 0 ||
+      strcmp(name, "address") == 0 ||
+      strcmp(name, "rtpproxy") == 0) {
+    resp_object *arr = resp_map_get(sec, name);
+    if (!arr) {
+      arr = resp_array_init();
+      resp_map_set(sec, name, arr);
+      arr = resp_map_get(sec, name);
+    }
+    if (!arr || arr->type != RESPT_ARRAY) {
+      log_error("config: '%s' key already exists as non-array", name);
+      return 0;
+    }
+    resp_array_append_bulk(arr, value);
+  } else {
+    resp_array_append_bulk(sec, name);
+    resp_array_append_bulk(sec, value);
+  }
   return 1;
 }
 

@@ -2,23 +2,29 @@
 address = :5060
 daemonize = 0
 # secret = <32-char-hex-for-nonce-signing>
-# registrations = /var/lib/upbx/registrations
 # locality = 4
 # emergency = 911
 # emergency = 112
 
-# API server (RESP protocol)
+# Multiple addresses supported (comma-separated or repeatable)
+# address = :5060
+# address = udp://192.168.1.1:5060
+
+# RTP Proxy configuration (requires running udphole instance)
+# Multiple rtpproxy entries supported for failover/clustering
+# rtpproxy = unix:///var/run/udphole.sock
+# rtpproxy = tcp://udphole-cluster:6379
+# rtpproxy = tcp://user:pass@udphole2:6379
+
+# API server (RESP protocol) - multiple addresses supported
 [api]
 address = :6379
 # socket_owner = user:group
 
-# RTP Proxy configuration (requires running udphole instance)
-# address: udphole socket address (unix:// or tcp://)
-# username/password: optional authentication
-[rtpproxy]
-address = unix:///var/run/udphole.sock
-username = myuser
-password = mypass
+# API authentication (repeatable for multiple users)
+# [api:admin]
+# permit = *
+# secret = supers3cret
 
 # [plugin:myplugin]
 # exec = /usr/bin/my-plugin-binary
