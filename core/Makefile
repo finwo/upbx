@@ -109,7 +109,7 @@ $(BIN): $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
 # ---- Test targets (finwo/assert) ----
-TEST_BINS:=test_md5 test_resp test_pattern test_group
+TEST_BINS:=test_md5 test_resp test_pattern test_group test_config
 
 test_md5: src/test/test_md5.o src/common/md5.o
 	$(CC) $^ $(CFLAGS) -o $@
@@ -121,6 +121,9 @@ test_pattern: test/test_pattern.o src/domain/pbx/registration.o src/common/resp.
 	$(CC) $^ $(CFLAGS) -o $@
 
 test_group: test/test_group.o src/domain/pbx/group.o src/infrastructure/config.o src/domain/config.o src/common/resp.o src/common/socket_util.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
+	$(CC) $^ $(CFLAGS) -o $@
+
+test_config: test/test_config.o src/infrastructure/config.o src/domain/config.o src/common/resp.o src/common/socket_util.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
 	$(CC) $^ $(CFLAGS) -o $@
 
 .PHONY: test
