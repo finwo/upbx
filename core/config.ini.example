@@ -3,12 +3,10 @@ address = :5060
 daemonize = 0
 secret = <32-char-hex-for-nonce-signing>
 data_dir = /var/lib/upbx
+rtpproxy = unix:///var/run/udphole.sock
 
 [api]
 address = :6379
-
-[rtpproxy]
-address = unix:///var/run/udphole.sock
 
 [group:2]
 allow_outgoing_cross_group = true
