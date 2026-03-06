@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,10 +160,20 @@ void registration_init(void) {
     registrations_dir = strdup("/var/lib/upbx/registrations");
   }
 
-  if (mkdir(registrations_dir, 0755) != 0 && errno != EEXIST) {
-    log_warn("registration: could not create directory %s: %s", registrations_dir, strerror(errno));
-    return;
+  char *path = strdup(registrations_dir);
+  for (char *p = path + 1; *p; p++) {
+    if (*p == '/') {
+      *p = '\0';
+      if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        log_warn("registration: could not create directory %s: %s", path, strerror(errno));
+      }
+      *p = '/';
+    }
   }
+  if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+    log_warn("registration: could not create directory %s: %s", path, strerror(errno));
+  }
+  free(path);
 
   log_info("registration: loading from %s", registrations_dir);
 }

@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <libgen.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #include "domain/pbx/sip/sdp_parse.h"
 #include "domain/pbx/sip/sip_message.h"
 #include "domain/pbx/sip_handler.h"
+#include "infrastructure/config.h"
 #include "rxi/log.h"
 
 #define UDP_BUF_SIZE 8192
@@ -413,9 +415,19 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
       log_info("sip_udp: auto-generated secret (add 'secret = %s' to [upbx] section)", auto_secret);
     }
 
-    const char *reg_dir = upbx_sec ? resp_map_get_string(upbx_sec, "registrations") : NULL;
-    if (reg_dir) {
+    const char *data_dir = upbx_sec ? resp_map_get_string(upbx_sec, "data_dir") : NULL;
+    if (data_dir) {
+      char *reg_dir = NULL;
+      if (data_dir[0] == '/') {
+        asprintf(&reg_dir, "%s/registrations", data_dir);
+      } else {
+        const char *config_path = config_get_path();
+        char *config_dir = dirname(config_path ? strdup(config_path) : strdup("."));
+        asprintf(&reg_dir, "%s/%s/registrations", config_dir, data_dir);
+        free(config_dir);
+      }
       registration_set_dir(reg_dir);
+      free(reg_dir);
     }
     registration_init();
     call_init();

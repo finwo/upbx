@@ -8,10 +8,11 @@ services:
         - linux/arm64/v8
         - linux/riscv64
     ports:
-      - "5060:5060"
+      - "5060:5060/udp"
       - "6379:6379"
     volumes:
       - ./core/data:/var/lib/upbx:rw
+      - ./core/config.ini:/etc/upbx.conf
     environment:
       - RTPPROXY=unix:///var/run/udphole.sock
       - API_ADMIN_USER=admin

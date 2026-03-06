@@ -167,6 +167,7 @@ There is **no** `advertise` (or similar) option. The address used in Via/SDP is 
 | `locality` | Number of short-dial digits and locality group selector. `0` (default) = disabled, all trunks form one big group. When `> 0`, trunks with the same `group` prefix form a locality group, and extensions whose number starts with that prefix belong to the group. Dialing exactly `locality` digits triggers **short-dialing**: the caller’s group prefix is prepended automatically (e.g. `locality = 4`, prefix `1234`, dial `1001` expands to `12341001`). |
 | `cross_group_calls` | `1` (default) = allow direct ext-to-ext calls across locality groups. `0` = block cross-group ext-to-ext calls with 403. Only meaningful when `locality > 0`. |
 | `emergency` | Repeatable. Numbers listed here always route externally via the caller’s trunk, bypassing short-dialing and ext-to-ext routing (e.g. `emergency = 911`). |
+| `data_dir` | Base directory for persistent data (registrations). Defaults to `/var/lib/upbx`. Registrations are stored in `<data_dir>/registrations`. Can be an absolute path (e.g. `/var/lib/upbx`) or relative to the config file directory (e.g. `data`). |
 
 ### `[plugin:name]`
 
