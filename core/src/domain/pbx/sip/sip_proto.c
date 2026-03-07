@@ -3,8 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "domain/pbx/sip/sip_message.h"
+
+static void generate_branch(char *branch_out, size_t branch_out_size) {
+  snprintf(branch_out, branch_out_size, "z9hG4bK%lx%lx", (unsigned long)time(NULL), (unsigned long)rand());
+}
 
 char *sip_proto_build_response(
   const sip_message_t *req,
@@ -151,7 +156,8 @@ char *sip_proto_build_request(
   const char *content_type,
   const char *body,
   size_t body_len,
-  size_t *out_len
+  size_t *out_len,
+  const char *branch
 ) {
   if (!method || !uri || !out_len) return NULL;
 
@@ -169,7 +175,13 @@ char *sip_proto_build_request(
   }
   used += (size_t)n;
 
-  n = snprintf(req + used, cap - used, "Via: SIP/2.0/UDP %s\r\n", via_host ? via_host : "127.0.0.1");
+  char branch_buf[64];
+  if (!branch) {
+    generate_branch(branch_buf, sizeof(branch_buf));
+    branch = branch_buf;
+  }
+
+  n = snprintf(req + used, cap - used, "Via: SIP/2.0/UDP %s;branch=%s\r\n", via_host ? via_host : "127.0.0.1", branch);
   if (n < 0 || (size_t)n >= cap - used) {
     free(req);
     return NULL;

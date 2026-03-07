@@ -39,7 +39,8 @@ char *sip_proto_build_request(
   const char *content_type,
   const char *body,
   size_t body_len,
-  size_t *out_len
+  size_t *out_len,
+  const char *branch
 );
 
 #endif

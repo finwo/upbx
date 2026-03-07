@@ -27,9 +27,11 @@ typedef struct {
   int                     num_media_streams;
   char                   *from_tag;
   char                   *to_tag;
+  char                   *dest_branch;
   time_t                  created;
   time_t                  answered;
-  int                     ringing;
+  time_t                  ringing;
+  time_t                  cancelling;
 } call_t;
 
 char *call_handle_invite(

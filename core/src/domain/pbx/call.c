@@ -59,6 +59,7 @@ static void free_call(const call_t *c) {
   free((void*)c->dest_contact);
   free((void*)c->from_tag);
   free((void*)c->to_tag);
+  free((void*)c->dest_branch);
   for (int i = 0; i < c->num_media_streams; i++) {
     free(c->source_socket_ids[i]);
     free(c->dest_socket_ids[i]);
@@ -184,7 +185,7 @@ char *call_handle_invite(
     return sip_proto_build_response(msg, 480, "Temporarily Unavailable", NULL, NULL, 0, response_len, NULL);
   }
 
-  char *resp = sip_proto_build_response(msg, 100, "Trying", NULL, out_sdp, out_sdp_len, response_len, NULL);
+  char *resp = sip_proto_build_response(msg, 100, "Trying", NULL, NULL, 0, response_len, NULL);
   free(out_sdp);
 
   log_trace("call_handle_invite: resp=%p, out_dest_sdp=%p", (void*)resp, (void*)out_dest_sdp);
@@ -280,6 +281,10 @@ char *call_handle_invite(
 
       log_trace("call_handle_invite: building INVITE to %s:%d via %s", dest_contact_host, dest_contact_port, pbx_addr);
 
+      char dest_branch[64];
+      snprintf(dest_branch, sizeof(dest_branch), "z9hG4bK%lx%lx", (unsigned long)time(NULL), (unsigned long)rand());
+      c->dest_branch = strdup(dest_branch);
+
       char *inv = sip_proto_build_request(
         "INVITE",
         request_uri,
@@ -292,7 +297,8 @@ char *call_handle_invite(
         "application/sdp",
         out_dest_sdp,
         out_dest_sdp_len,
-        &out_dest_sdp_len
+        &out_dest_sdp_len,
+        dest_branch
       );
       free(out_dest_sdp);
 
@@ -417,7 +423,8 @@ char *call_handle_bye(
         NULL,
         NULL,
         0,
-        &fwd_len
+        &fwd_len,
+        NULL
       );
 
       if (fwd_req) {
@@ -458,7 +465,7 @@ char *call_handle_cancel(
     char src_ext[64] = {0};
     sip_header_uri_extract_user(msg, "From", src_ext, sizeof(src_ext));
 
-    const call_t *c = find_call(call_id);
+    call_t *c = (call_t *)find_call(call_id);
     if (c) {
       int authorized = (strcmp(src_ext, c->source_ext) == 0 || strcmp(src_ext, c->dest_ext) == 0);
       if (authorized) {
@@ -490,7 +497,13 @@ char *call_handle_cancel(
 
           char from_header[256], to_header[256];
           snprintf(from_header, sizeof(from_header), "<sip:%s@%s>", src_ext, target_ip);
-          snprintf(to_header, sizeof(to_header), "<sip:%s@%s>", from_source ? c->dest_ext : c->source_ext, target_ip);
+
+          const char *to_tag = c->to_tag ? c->to_tag : "";
+          snprintf(to_header, sizeof(to_header), "<sip:%s@%s>%s%s", 
+                   from_source ? c->dest_ext : c->source_ext, 
+                   target_ip,
+                   to_tag[0] ? ";tag=" : "",
+                   to_tag);
 
           size_t fwd_len = 0;
           char *fwd_req = sip_proto_build_request(
@@ -505,7 +518,8 @@ char *call_handle_cancel(
             NULL,
             NULL,
             0,
-            &fwd_len
+            &fwd_len,
+            c->dest_branch
           );
 
           if (fwd_req) {
@@ -513,13 +527,14 @@ char *call_handle_cancel(
             if (send_fd >= 0) {
               socklen_t dst_len = (target_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
               sendto(send_fd, fwd_req, fwd_len, 0, (struct sockaddr *)&target_addr, dst_len);
-              log_trace("call_handle_cancel: forwarded CANCEL to %s", target_ip);
+              log_trace("call_handle_cancel: forwarded CANCEL to %s with to_tag=%s", target_ip, to_tag);
             }
             free(fwd_req);
           }
-        }
 
-        call_handle_cancel_internal(call_id);
+          c->cancelling = time(NULL);
+          log_trace("call_handle_cancel: call marked as cancelling at %ld", (long)c->cancelling);
+        }
       }
     }
   }
@@ -548,7 +563,7 @@ char *call_handle_response(
     return NULL;
   }
 
-  const call_t *c = find_call(call_id);
+  call_t *c = (call_t *)find_call(call_id);
   if (!c) {
     return NULL;
   }
@@ -585,6 +600,43 @@ char *call_handle_response(
     struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
     struct sockaddr_in6 *call_src = (struct sockaddr_in6 *)&c->source_addr;
     from_source = (memcmp(&src->sin6_addr, &call_src->sin6_addr, sizeof(src->sin6_addr)) == 0);
+  }
+
+  if (!from_source && (status_code == 180 || status_code == 200)) {
+    const char *to_header = sip_message_header_get(msg, "To", NULL);
+    if (to_header) {
+      const char *tag = strstr(to_header, ";tag=");
+      if (tag) {
+        tag += 5;
+        const char *end = tag;
+        while (*end && *end != ';' && *end != '>' && *end != '\r' && *end != '\n') end++;
+        size_t tag_len = (size_t)(end - tag);
+        if (tag_len > 0 && tag_len < 128) {
+          char new_tag[128] = {0};
+          memcpy(new_tag, tag, tag_len);
+          new_tag[tag_len] = '\0';
+          if (!c->to_tag || strcmp(c->to_tag, new_tag) != 0) {
+            free((void*)c->to_tag);
+            c->to_tag = strdup(new_tag);
+            log_trace("call_handle_response: updated to_tag=%s", new_tag);
+          }
+        }
+      }
+    }
+
+    if (status_code == 180) {
+      c->ringing = time(NULL);
+      log_trace("call_handle_response: call is ringing at %ld", (long)c->ringing);
+    } else if (status_code == 200) {
+      c->answered = time(NULL);
+      log_trace("call_handle_response: call answered at %ld", (long)c->answered);
+    }
+  }
+
+  if (c->cancelling && !from_source) {
+    log_trace("call_handle_response: received response %d after CANCEL, cleaning up call", status_code);
+    call_handle_bye_internal(call_id, NULL);
+    return NULL;
   }
 
   struct sockaddr_storage target_addr;
@@ -632,14 +684,26 @@ char *call_handle_response(
     }
   }
 
+  const char *body_to_send = NULL;
+  size_t body_len_to_send = 0;
+
+  if (status_code == 180 && !from_source) {
+    log_trace("call_handle_response: stripping SDP from 180 to enable local ringing");
+    body_to_send = NULL;
+    body_len_to_send = 0;
+  } else {
+    body_to_send = sdp_body ? sdp_body : msg->body;
+    body_len_to_send = sdp_body ? sdp_body_len : msg->body_len;
+  }
+
   size_t fwd_len = 0;
   char *fwd_resp = sip_proto_build_response(
     msg,
     status_code,
     msg->reason,
     NULL,
-    sdp_body ? sdp_body : msg->body,
-    sdp_body ? sdp_body_len : msg->body_len,
+    body_to_send,
+    body_len_to_send,
     &fwd_len,
     via_header
   );
@@ -965,7 +1029,8 @@ void call_handle_bye_internal(const char *call_id, const char *sender_ext) {
       NULL,
       NULL,
       0,
-      &bye_len
+      &bye_len,
+      NULL
     );
 
     if (bye && bye_len > 0) {
