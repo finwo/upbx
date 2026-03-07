@@ -42,6 +42,8 @@ void registration_remove(const char *number);
 
 void registration_free(registration_t *reg);
 
+int registration_update_pbx_addr(const char *number, const char *pbx_addr);
+
 int registration_cleanup_pt(int64_t timestamp, struct pt_task *task);
 
 #endif

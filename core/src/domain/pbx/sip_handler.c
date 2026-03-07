@@ -133,7 +133,7 @@ static char *build_401_response(const sip_message_t *req, const char *ext_number
   snprintf(www_auth, sizeof(www_auth), "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\", algorithm=MD5", REALM,
            nonce);
 
-  return sip_proto_build_response(req, 401, "Unauthorized", www_auth, NULL, 0, out_len);
+  return sip_proto_build_response(req, 401, "Unauthorized", www_auth, NULL, 0, out_len, NULL);
 }
 
 static resp_object *get_extension_config(const char *number) {
@@ -158,11 +158,11 @@ char *sip_handle_register(
   (void)registration;
 
   if (!msg || !sip_is_request(msg)) {
-    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len, NULL);
   }
 
   if (msg->method_len != 8 || strncasecmp(msg->method, "REGISTER", 8) != 0) {
-    return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len, NULL);
   }
 
   char ext_number[128] = "";
@@ -212,11 +212,11 @@ char *sip_handle_register(
 
   if (ext_number[0] != '\0' && to_username[0] != '\0' && strcmp(ext_number, to_username) != 0) {
     log_warn("sip_handler: username mismatch - Authorization: %s, To: %s", ext_number, to_username);
-    return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len, NULL);
   }
 
   if (ext_number[0] == '\0') {
-    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len, NULL);
   }
 
   if (nonce_validate(nonce, ext_number) != 0) {
@@ -276,11 +276,11 @@ char *sip_handle_register(
 
   if (expires == 0 || contact[0] == '\0') {
     registration_remove(ext_number);
-    return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len, NULL);
   }
 
   if (registration_add(ext_number, contact, group, pbx_addr[0] ? pbx_addr : NULL, (const struct sockaddr *)remote_addr, listen_fd, expires) != 0) {
-    return sip_proto_build_response(msg, 500, "Server Internal Error", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 500, "Server Internal Error", NULL, NULL, 0, response_len, NULL);
   }
 
   char contact_resp[600];
@@ -290,7 +290,7 @@ char *sip_handle_register(
     contact_resp[0] = '\0';
   }
 
-  char *resp = sip_proto_build_response(msg, 200, "OK", contact_resp[0] ? contact_resp : NULL, NULL, 0, response_len);
+  char *resp = sip_proto_build_response(msg, 200, "OK", contact_resp[0] ? contact_resp : NULL, NULL, 0, response_len, NULL);
 
   log_info("sip_handler: 200 OK to %s, Expires: %d", ext_number, expires);
 

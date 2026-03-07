@@ -245,26 +245,27 @@ int main(int argc, const char **argv) {
   config_set_path(config_path);
   config_init();
 
-  int level = LOG_INFO;
-  if (0) {
-    (void)0;
-  } else if (!strcasecmp(loglevel, "trace")) {
-    level = LOG_TRACE;
-  } else if (!strcasecmp(loglevel, "debug")) {
-    level = LOG_DEBUG;
-  } else if (!strcasecmp(loglevel, "info")) {
-    level = LOG_INFO;
-  } else if (!strcasecmp(loglevel, "warn")) {
-    level = LOG_WARN;
-  } else if (!strcasecmp(loglevel, "error")) {
-    level = LOG_ERROR;
-  } else if (!strcasecmp(loglevel, "fatal")) {
-    level = LOG_FATAL;
-  } else {
-    fprintf(stderr, "Unknown log level: %s\n", loglevel);
-    return 1;
-  }
+  int level = LOG_TRACE;
+  // if (0) {
+  //   (void)0;
+  // } else if (!strcasecmp(loglevel, "trace")) {
+  //   level = LOG_TRACE;
+  // } else if (!strcasecmp(loglevel, "debug")) {
+  //   level = LOG_DEBUG;
+  // } else if (!strcasecmp(loglevel, "info")) {
+  //   level = LOG_INFO;
+  // } else if (!strcasecmp(loglevel, "warn")) {
+  //   level = LOG_WARN;
+  // } else if (!strcasecmp(loglevel, "error")) {
+  //   level = LOG_ERROR;
+  // } else if (!strcasecmp(loglevel, "fatal")) {
+  //   level = LOG_FATAL;
+  // } else {
+  //   fprintf(stderr, "Unknown log level: %s\n", loglevel);
+  //   return 1;
+  // }
   log_set_level(level);
+  setvbuf(stdout, NULL, _IOLBF, 0);
   setvbuf(stderr, NULL, _IOLBF, 0);
 
   log_file        = NULL;

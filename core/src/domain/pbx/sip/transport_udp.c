@@ -27,7 +27,7 @@
 
 #define UDP_BUF_SIZE 8192
 
-static int *sip_fds = NULL;
+int *sip_fds = NULL;
 
 typedef struct {
   int                     state;
@@ -59,7 +59,7 @@ void sip_transport_udp_set_fds(int *fds) {
 
 static char *sip_dispatch(sip_message_t *msg, const struct sockaddr_storage *remote_addr, int listen_fd, size_t *response_len) {
   if (!msg || !sip_is_request(msg) || !response_len) {
-    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len, NULL);
   }
 
   for (size_t i = 0; i < sizeof(sip_handlers) / sizeof(sip_handlers[0]); i++) {
@@ -78,14 +78,14 @@ static char *sip_dispatch(sip_message_t *msg, const struct sockaddr_storage *rem
       }
 
       if (msg->method_len == 7 && strncasecmp(msg->method, "OPTIONS", 7) == 0) {
-        return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
+        return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len, NULL);
       }
 
-      return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
+      return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len, NULL);
     }
   }
 
-  return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
+  return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len, NULL);
 }
 
 int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
@@ -261,11 +261,35 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
           return SCHED_RUNNING;
         }
 
+        // Extract pbx_addr from request-URI and update registration
+        if (udata->sip_msg.uri && udata->sip_msg.uri_len > 0) {
+          char pbx_host[256] = "";
+          char pbx_port[32]  = "";
+
+          sip_uri_extract_host_port(udata->sip_msg.uri, udata->sip_msg.uri_len, pbx_host, sizeof(pbx_host), pbx_port,
+                                    sizeof(pbx_port));
+
+          if (pbx_host[0]) {
+            char pbx_addr_full[300];
+            if (pbx_port[0] && strcmp(pbx_port, "5060") != 0) {
+              snprintf(pbx_addr_full, sizeof(pbx_addr_full), "%s:%s", pbx_host, pbx_port);
+            } else {
+              snprintf(pbx_addr_full, sizeof(pbx_addr_full), "%s", pbx_host);
+            }
+
+            registration_t *reg = registration_find_by_addr((const struct sockaddr *)&udata->src_addr);
+            if (reg && reg->number) {
+              registration_update_pbx_addr(reg->number, pbx_addr_full);
+            }
+          }
+        }
+
         resp = sip_dispatch(&udata->sip_msg, &udata->src_addr, ready_fd, &resp_len);
 
         sip_message_free(&udata->sip_msg);
 
         if (resp) {
+          log_hexdump_trace(resp, resp_len);
           socklen_t dst_len =
               (udata->src_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
           ssize_t sent = sendto(ready_fd, resp, resp_len, 0, (struct sockaddr *)&udata->src_addr, dst_len);

@@ -23,7 +23,8 @@ char *sip_proto_build_response(
   const char *extra_headers,
   const char *body,
   size_t body_len,
-  size_t *out_len
+  size_t *out_len,
+  const char *via_override
 );
 
 char *sip_proto_build_request(

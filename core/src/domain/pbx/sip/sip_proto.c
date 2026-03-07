@@ -13,11 +13,12 @@ char *sip_proto_build_response(
   const char *extra_headers,
   const char *body,
   size_t body_len,
-  size_t *out_len
+  size_t *out_len,
+  const char *via_override
 ) {
   if (!req || !out_len) return NULL;
 
-  size_t cap = 1024 + (extra_headers ? strlen(extra_headers) : 0) + body_len;
+  size_t cap = 1024 + (extra_headers ? strlen(extra_headers) : 0) + (via_override ? strlen(via_override) : 0) + body_len;
   char  *resp = malloc(cap);
   if (!resp) return NULL;
 
@@ -31,17 +32,26 @@ char *sip_proto_build_response(
   }
   used += (size_t)n;
 
-  const char *vias[10];
-  size_t via_lens[10];
-  size_t via_count = 0;
-  sip_message_header_get_all(req, "Via", vias, via_lens, 10, &via_count);
-  for (size_t i = 0; i < via_count; i++) {
-    n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_lens[i], vias[i]);
+  if (via_override) {
+    n = snprintf(resp + used, cap - used, "Via: %s\r\n", via_override);
     if (n < 0 || (size_t)n >= cap - used) {
       free(resp);
       return NULL;
     }
     used += (size_t)n;
+  } else {
+    const char *vias[10];
+    size_t via_lens[10];
+    size_t via_count = 0;
+    sip_message_header_get_all(req, "Via", vias, via_lens, 10, &via_count);
+    for (size_t i = 0; i < via_count; i++) {
+      n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_lens[i], vias[i]);
+      if (n < 0 || (size_t)n >= cap - used) {
+        free(resp);
+        return NULL;
+      }
+      used += (size_t)n;
+    }
   }
 
   size_t      from_len;

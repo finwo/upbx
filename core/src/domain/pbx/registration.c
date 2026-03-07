@@ -29,7 +29,7 @@ const char *registration_get_dir(void) {
   return registrations_dir;
 }
 
-static int save_registration_to_file(const registration_t *reg) {
+int save_registration_to_file(const registration_t *reg) {
   if (!reg || !reg->number || !registrations_dir) return -1;
 
   if (mkdir(registrations_dir, 0755) != 0 && errno != EEXIST) {
@@ -101,6 +101,23 @@ static int delete_registration_file(const char *number) {
   }
 
   return 0;
+}
+
+int registration_update_pbx_addr(const char *number, const char *pbx_addr) {
+  if (!number) return -1;
+
+  registration_t *reg = registration_find(number);
+  if (!reg) return -1;
+
+  if ((reg->pbx_addr == NULL && pbx_addr == NULL) ||
+      (reg->pbx_addr && pbx_addr && strcmp(reg->pbx_addr, pbx_addr) == 0)) {
+    return 0;
+  }
+
+  if (reg->pbx_addr) free(reg->pbx_addr);
+  reg->pbx_addr = pbx_addr ? strdup(pbx_addr) : NULL;
+
+  return save_registration_to_file(reg);
 }
 
 static registration_t *load_registration_from_file(const char *number) {

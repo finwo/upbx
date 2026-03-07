@@ -177,18 +177,23 @@ int sdp_rewrite_all_media(const char *body, size_t body_len, const char new_ip[]
       *o++ = '\n';
       remain -= need;
     } else if (ll >= 4 && ls[0] == 'm' && ls[1] == '=') {
-      const char *q = ls + 2;
-      while (q < le && *q >= '0' && *q <= '9') q++;
+      const char *p = ls + 2;
+      while (p < le && *p >= 'a' && *p <= 'z') p++;
+      while (p < le && *p == ' ') p++;
+      const char *port_start = p;
+      while (p < le && *p >= '0' && *p <= '9') p++;
+      const char *port_end = p;
+
       char   port_buf[16];
       snprintf(port_buf, sizeof(port_buf), "%d", new_port[stream_idx]);
       size_t new_port_len = strlen(port_buf);
 
-      size_t need = 2 + new_port_len + (size_t)(le - q) + 2;
+      size_t need = (size_t)(port_start - ls) + new_port_len + (size_t)(le - port_end) + 2;
       if (need > remain) return -1;
 
-      memcpy(o, ls, 2);
-      memcpy(o + 2, port_buf, new_port_len);
-      memcpy(o + 2 + new_port_len, q, (size_t)(le - q));
+      memcpy(o, ls, (size_t)(port_start - ls));
+      memcpy(o + (port_start - ls), port_buf, new_port_len);
+      memcpy(o + (port_start - ls) + new_port_len, port_end, (size_t)(le - port_end));
       o += need - 2;
       *o++ = '\r';
       *o++ = '\n';
