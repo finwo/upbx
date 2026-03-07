@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 
 #include "common/resp.h"
+#include "common/scheduler.h"
 
 typedef struct udphole_transport udphole_transport_t;
 
@@ -66,6 +67,8 @@ int udphole_forward_destroy(udphole_client_t *client, const char *session_id, co
                             const char *dst_socket_id);
 
 int udphole_ping(udphole_client_t *client);
+
+int udphole_keepalive_pt(int64_t timestamp, struct pt_task *task);
 
 udphole_client_t *udphole_get_client(void);
 const char       *udphole_get_advertise_addr(void);

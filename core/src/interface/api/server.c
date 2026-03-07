@@ -551,18 +551,35 @@ int api_client_pt(int64_t timestamp, struct pt_task *task) {
     return SCHED_RUNNING;
   }
 
-  char    buf[1];
-  ssize_t n = recv(state->fd, buf, 1, MSG_PEEK);
-  if (n <= 0) {
+  if (state->rlen >= READ_BUF_SIZE) {
     goto cleanup;
   }
 
-  resp_object *cmd = resp_read(state->fd);
-  if (!cmd) {
+  ssize_t n = recv(state->fd, state->rbuf + state->rlen, READ_BUF_SIZE - state->rlen, 0);
+  if (n < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return SCHED_RUNNING;
     }
     goto cleanup;
+  }
+  if (n == 0) {
+    goto cleanup;
+  }
+  state->rlen += (size_t)n;
+
+  resp_object *cmd = NULL;
+  int consumed = resp_read_buf(state->rbuf, state->rlen, &cmd);
+  if (consumed > 0) {
+    memmove(state->rbuf, state->rbuf + consumed, state->rlen - consumed);
+    state->rlen -= consumed;
+  } else if (consumed < 0) {
+    return SCHED_RUNNING;
+  } else {
+    return SCHED_RUNNING;
+  }
+
+  if (!cmd) {
+    return SCHED_RUNNING;
   }
 
   if (cmd->type != RESPT_ARRAY || cmd->u.arr.n == 0) {

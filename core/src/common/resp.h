@@ -40,8 +40,11 @@ void resp_map_set(resp_object *map, const char *key, resp_object *value);
 resp_object *resp_read(int fd);
 /* Returns new object: caller owns the result, must call resp_free() */
 
-resp_object *resp_read_buf(const char *buf, size_t len);
-/* Returns new object: caller owns the result, must call resp_free() */
+int resp_read_buf(const char *buf, size_t len, resp_object **out_obj);
+/* Returns 0=no data yet, <0=incomplete (need more data), >0=bytes consumed from buffer */
+/* If out_obj is NULL, returns -1 */
+/* If *out_obj is NULL, creates new object */
+/* If *out_obj exists, appends to it (for arrays) */
 
 int resp_encode_array(int argc, const resp_object *const *argv, char **out_buf, size_t *out_len);
 /* Returns allocated string in out_buf: caller must free() the string */

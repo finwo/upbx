@@ -13,155 +13,288 @@
 
 static void resp_free_internal(resp_object *o);
 
-static int resp_read_byte_from_buf(const char **buf, size_t *len) {
-  if (*len < 1) return -1;
-  unsigned char c = (unsigned char)(*buf)[0];
-  *buf += 1;
-  *len -= 1;
-  return (int)c;
-}
+int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
+  log_trace("resp_read_buf: START buf=%p len=%zu out_obj=%p", (void*)buf, len, (void*)out_obj);
+  if (!out_obj) return -1;
 
-static int resp_read_line_from_buf(const char **buf, size_t *len, char *out, size_t out_size) {
-  size_t i    = 0;
-  int    prev = -1;
-  while (i + 1 < out_size) {
-    if (*len < 1) return -1;
-    int b = (int)(unsigned char)(*buf)[0];
-    *buf += 1;
-    *len -= 1;
-    if (prev == '\r' && b == '\n') {
-      out[i - 1] = '\0';
-      return 0;
+  const char *start = buf;
+  const char *p = buf;
+  size_t remaining = len;
+
+  // We need at least 1 byte
+  if (len <= 0) return -1;
+
+  // Ensure we have memory to place data in
+  resp_object *output = *out_obj;
+  if (!output) {
+    *out_obj = output = calloc(1, sizeof(resp_object));
+    if (!output) return -1;
+  }
+
+  // Skip empty lines (only \r\n)
+  if (p[0] == '\r' || p[0] == '\n') {
+    while (remaining > 0 && (p[0] == '\r' || p[0] == '\n')) {
+      p++;
+      remaining--;
     }
-    prev     = b;
-    out[i++] = (char)b;
+    if (remaining == 0) return 0;  // only whitespace, need more data
   }
-  return -1;
-}
 
-resp_object *resp_read_buf(const char *buf, size_t len) {
-  const char *p         = buf;
-  size_t      remaining = len;
+  // Consume first character for object type detection
+  int type_c = p[0];
+  remaining--;
+  p++;
 
-  int type_c = resp_read_byte_from_buf(&p, &remaining);
-  if (type_c < 0) return NULL;
-  if (type_c == -2) return NULL;
-  resp_object *o = calloc(1, sizeof(resp_object));
-  if (!o) return NULL;
-  char line[LINE_BUF];
-  switch ((char)type_c) {
+  log_trace("resp_read_buf: type_c='%c' (0x%02x)", type_c >= 32 ? type_c : '.', type_c);
+
+  // And act accordingly
+  switch((char)type_c) {
+
     case '+':
-      o->type = RESPT_SIMPLE;
-      if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-        free(o);
-        return NULL;
+      log_trace("resp_read_buf: case '+' SIMPLE");
+      output->type = output->type ? output->type : RESPT_SIMPLE;
+      if (output->type != RESPT_SIMPLE) {
+        return -2; // Mismatching types
       }
-      o->u.s = strdup(line);
+      // Read until \r\n, don't include \r\n in string
+      {
+        size_t i = 0;
+        char line[LINE_BUF];
+        int found_crlf = 0;
+        while (i + 1 < LINE_BUF && remaining > 0) {
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+            found_crlf = 1;
+            break;
+          }
+          line[i++] = p[0];
+          p++;
+          remaining--;
+        }
+        if (!found_crlf) {
+          log_trace("resp_read_buf: SIMPLE incomplete, returning -1");
+          return -1; // Incomplete, need more data
+        }
+        line[i] = '\0';
+        if (output->u.s) free(output->u.s);
+        output->u.s = strdup(line);
+        log_trace("resp_read_buf: SIMPLE value='%s'", line);
+      }
       break;
+
     case '-':
-      o->type = RESPT_ERROR;
-      if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-        free(o);
-        return NULL;
+      log_trace("resp_read_buf: case '-' ERROR");
+      output->type = output->type ? output->type : RESPT_ERROR;
+      if (output->type != RESPT_ERROR) {
+        return -2; // Mismatching types
       }
-      o->u.s = strdup(line);
+      // Read until \r\n, don't include \r\n in string
+      {
+        size_t i = 0;
+        char line[LINE_BUF];
+        int found_crlf = 0;
+        while (i + 1 < LINE_BUF && remaining > 0) {
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+            found_crlf = 1;
+            break;
+          }
+          line[i++] = p[0];
+          p++;
+          remaining--;
+        }
+        if (!found_crlf) {
+          log_trace("resp_read_buf: ERROR incomplete, returning -1");
+          return -1; // Incomplete, need more data
+        }
+        line[i] = '\0';
+        if (output->u.s) free(output->u.s);
+        output->u.s = strdup(line);
+        log_trace("resp_read_buf: ERROR value='%s'", line);
+      }
       break;
+
     case ':':
-      {
-        if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-          free(o);
-          return NULL;
-        }
-        o->type = RESPT_INT;
-        o->u.i  = (long long)strtoll(line, NULL, 10);
-        break;
+      log_trace("resp_read_buf: case ':' INT");
+      output->type = output->type ? output->type : RESPT_INT;
+      if (output->type != RESPT_INT) {
+        return -2; // Mismatching types
       }
+      // Read until \r\n, don't include \r\n in string
+      // value = strtoll(line);
+      {
+        size_t i = 0;
+        char line[LINE_BUF];
+        int found_crlf = 0;
+        while (i + 1 < LINE_BUF && remaining > 0) {
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+            found_crlf = 1;
+            break;
+          }
+          line[i++] = p[0];
+          p++;
+          remaining--;
+        }
+        if (!found_crlf) {
+          log_trace("resp_read_buf: INT incomplete, returning -1");
+          return -1; // Incomplete, need more data
+        }
+        line[i] = '\0';
+        output->u.i = strtoll(line, NULL, 10);
+        log_trace("resp_read_buf: INT value=%lld", output->u.i);
+      }
+      break;
+
     case '$':
+      log_trace("resp_read_buf: case '$' BULK");
+      output->type = output->type ? output->type : RESPT_BULK;
+      if (output->type != RESPT_BULK) {
+        return -2; // Mismatching types
+      }
+      // Read until \r\n, don't include \r\n in string
+      // data_length = strtoll(line);
       {
-        if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-          free(o);
-          return NULL;
-        }
-        long blen = strtol(line, NULL, 10);
-        if (blen < 0 || blen > (long)MAX_BULK_LEN) {
-          free(o);
-          return NULL;
-        }
-        o->type = RESPT_BULK;
-        if (blen == 0) {
-          o->u.s = strdup("");
-          if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-            free(o->u.s);
-            free(o);
-            return NULL;
+        size_t i = 0;
+        char line[LINE_BUF];
+        int found_crlf = 0;
+        while (i + 1 < LINE_BUF && remaining > 0) {
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+            found_crlf = 1;
+            break;
           }
+          line[i++] = p[0];
+          p++;
+          remaining--;
+        }
+        if (!found_crlf) {
+          log_trace("resp_read_buf: BULK length incomplete, returning -1");
+          return -1; // Incomplete, need more data
+        }
+        line[i] = '\0';
+        long data_length = strtol(line, NULL, 10);
+        log_trace("resp_read_buf: BULK data_length=%ld", data_length);
+
+        if (data_length < 0) {
+          output->u.s = NULL;
+        } else if (data_length == 0) {
+          // Null bulk string or empty string - need \r\n
+
+
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+          } else {
+            log_trace("resp_read_buf: BULK zero incomplete, returning -1");
+            return -1; // Incomplete, need more data
+          }
+          if (output->u.s) free(output->u.s);
+          output->u.s = strdup("");
         } else {
-          if ((size_t)blen > remaining) {
-            free(o);
-            return NULL;
+          // Read data_length bytes
+          if ((size_t)data_length > remaining) {
+            log_trace("resp_read_buf: BULK not enough data, returning -1");
+            return -1;  // not enough data
           }
-          o->u.s = malloc((size_t)blen + 1);
-          if (!o->u.s) {
-            free(o);
-            return NULL;
+          if (output->u.s) free(output->u.s);
+          output->u.s = malloc((size_t)data_length + 1);
+          if (!output->u.s) return -1;
+          memcpy(output->u.s, p, (size_t)data_length);
+          output->u.s[data_length] = '\0';
+          p += data_length;
+          remaining -= data_length;
+          // Skip \r\n
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+          } else {
+            free(output->u.s);
+            output->u.s = NULL;
+            log_trace("resp_read_buf: BULK data incomplete, returning -1");
+            return -1; // Incomplete, need more data
           }
-          memcpy(o->u.s, p, (size_t)blen);
-          p += blen;
-          remaining -= (size_t)blen;
-          o->u.s[blen] = '\0';
-          if (remaining < 2) {
-            free(o->u.s);
-            free(o);
-            return NULL;
-          }
-          if (p[0] != '\r' || p[1] != '\n') {
-            free(o->u.s);
-            free(o);
-            return NULL;
-          }
-          p += 2;
-          remaining -= 2;
         }
-        break;
       }
+      break;
+
     case '*':
-      {
-        if (resp_read_line_from_buf(&p, &remaining, line, sizeof(line)) != 0) {
-          free(o);
-          return NULL;
-        }
-        long n = strtol(line, NULL, 10);
-        if (n < 0 || n > 65536) {
-          free(o);
-          return NULL;
-        }
-        o->type       = RESPT_ARRAY;
-        o->u.arr.n    = (size_t)n;
-        o->u.arr.elem = n ? calloc((size_t)n, sizeof(resp_object)) : NULL;
-        if (n && !o->u.arr.elem) {
-          free(o);
-          return NULL;
-        }
-        for (size_t i = 0; i < (size_t)n; i++) {
-          resp_object *sub = resp_read_buf(p, remaining);
-          if (!sub) {
-            for (size_t j = 0; j < i; j++) resp_free_internal(&o->u.arr.elem[j]);
-            free(o->u.arr.elem);
-            free(o);
-            return NULL;
-          }
-          p += remaining - (sub ? remaining : 0);
-          remaining        = 0;
-          o->u.arr.elem[i] = *sub;
-          free(sub);
-        }
-        break;
+      log_trace("resp_read_buf: case '*' ARRAY");
+      output->type = output->type ? output->type : RESPT_ARRAY;
+      if (output->type != RESPT_ARRAY) {
+        return -2; // Mismatching types
       }
+      // Read until \r\n, don't include \r\n in string
+      // items = strtoll(line);
+      {
+        size_t i = 0;
+        char line[LINE_BUF];
+        int found_crlf = 0;
+        while (i + 1 < LINE_BUF && remaining > 0) {
+          if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
+            p += 2;
+            remaining -= 2;
+            found_crlf = 1;
+            break;
+          }
+          line[i++] = p[0];
+          p++;
+          remaining--;
+        }
+        if (!found_crlf) {
+          log_trace("resp_read_buf: ARRAY count incomplete, returning -1");
+          return -1; // Incomplete, need more data
+        }
+        line[i] = '\0';
+        long items = strtol(line, NULL, 10);
+        log_trace("resp_read_buf: ARRAY items=%ld", items);
+
+        if (items < 0 || items > 65536) {
+          log_trace("resp_read_buf: ARRAY items invalid, returning -1");
+          return -1;
+        }
+
+        // Initialize array if needed
+        if (!output->u.arr.elem) {
+          output->u.arr.n = 0;
+          output->u.arr.elem = NULL;
+        }
+
+        for (size_t j = 0; j < (size_t)items; j++) {
+          if (remaining == 0) {
+            log_trace("resp_read_buf: ARRAY elem[%zu] no remaining, returning -1", j);
+            return -1;
+          }
+          resp_object *element = NULL;
+          log_trace("resp_read_buf: ARRAY calling recursive for elem[%zu]", j);
+          int element_consumed = resp_read_buf(p, remaining, &element);
+          log_trace("resp_read_buf: ARRAY elem[%zu] consumed=%d element=%p", j, element_consumed, (void*)element);
+          if (element_consumed <= 0) {
+            log_trace("resp_read_buf: ARRAY elem[%zu] failed, returning -1", j);
+            return -1;
+          }
+          if (resp_array_append_obj(output, element) != 0) {
+            resp_free(element);
+            log_trace("resp_read_buf: ARRAY append failed, returning -1");
+            return -1;
+          }
+          p += element_consumed;
+          remaining -= element_consumed;
+        }
+      }
+      break;
+
     default:
-      free(o);
-      return NULL;
+      log_trace("resp_read_buf: default case, returning -1");
+      return -1;
   }
-  return o;
+
+  log_trace("resp_read_buf: returning %d", (int)(p - start));
+  return (int)(p - start);
 }
 
 static int resp_read_byte(int fd) {

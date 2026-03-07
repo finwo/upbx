@@ -61,8 +61,7 @@ static int save_registration_to_file(const registration_t *reg) {
 
   char                    *buf     = NULL;
   size_t                   buf_len = 0;
-  const resp_object *const argv[]  = {obj};
-  if (resp_encode_array(1, argv, &buf, &buf_len) != 0) {
+  if (resp_serialize(obj, &buf, &buf_len) != 0) {
     resp_free(obj);
     return -1;
   }

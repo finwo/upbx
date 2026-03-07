@@ -2,6 +2,8 @@
 
 CONFIG_PATH="/etc/upbx.conf"
 
+UPBXBIN="/usr/bin/upbx"
+
 if [ -f "$CONFIG_PATH" ]; then
     echo "Using mounted config: $CONFIG_PATH"
 else
@@ -46,4 +48,12 @@ else
     cat "$CONFIG_PATH"
 fi
 
-exec /usr/bin/upbx --config /etc/upbx.conf daemon --no-daemonize
+CMD="${UPBXBIN}"
+
+if [ -n "$LOG_LEVEL" ]; then
+    CMD="${CMD} --verbosity ${LOG_LEVEL}"
+fi
+
+CMD="${CMD} daemon --no-daemonize"
+
+exec ${CMD}

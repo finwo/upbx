@@ -27,7 +27,6 @@ static void impl_parse_url(udphole_impl_t *impl, const char *url);
 static void impl_disconnect(void *self);
 static int impl_send(void *self, const char *cmd, size_t cmd_len);
 static resp_object *impl_recv(void *self);
-static int impl_encode_and_send(udphole_impl_t *impl, int argc, const char **argv);
 
 static void impl_parse_url(udphole_impl_t *impl, const char *url) {
   free(impl->url);
@@ -92,29 +91,52 @@ static int impl_connect(void *self) {
       memcpy(&srv.sin_addr, he->h_addr_list[0], he->h_length);
     }
     if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+      log_warn("udphole: connect() failed: %m");
       close(sock);
       parsed_url_free(parsed);
       return -1;
     }
+    log_info("udphole: connected, now authenticating");
   }
 
   impl->fd = sock;
   impl->connected = 1;
 
   if (parsed->username && parsed->password) {
-    const char *argv[3] = {"auth", parsed->username, parsed->password};
-    if (impl_encode_and_send(impl, 3, argv) < 0) {
+    log_info("udphole: sending auth command");
+    resp_object *cmd = resp_array_init();
+    resp_array_append_bulk(cmd, "auth");
+    resp_array_append_bulk(cmd, parsed->username);
+    resp_array_append_bulk(cmd, parsed->password);
+    char *buf = NULL;
+    size_t buf_len = 0;
+    resp_serialize(cmd, &buf, &buf_len);
+    resp_free(cmd);
+
+    if (impl_send(impl, buf, buf_len) < 0) {
+      free(buf);
       impl_disconnect(impl);
       parsed_url_free(parsed);
       return -1;
     }
+    free(buf);
+
     resp_object *resp = impl_recv(impl);
-    if (!resp || resp->type != RESPT_SIMPLE || !resp->u.s || strcmp(resp->u.s, "OK") != 0) {
-      if (resp) resp_free(resp);
+    if (!resp) {
+      log_warn("udphole: auth response is NULL");
       impl_disconnect(impl);
       parsed_url_free(parsed);
       return -1;
     }
+    log_info("udphole: auth response received, type=%d", resp->type);
+    if (resp->type != RESPT_SIMPLE || !resp->u.s || strcmp(resp->u.s, "OK") != 0) {
+      log_warn("udphole: auth failed, response=%s", resp->u.s ? resp->u.s : "(null)");
+      resp_free(resp);
+      impl_disconnect(impl);
+      parsed_url_free(parsed);
+      return -1;
+    }
+    log_info("udphole: auth succeeded");
     resp_free(resp);
   }
 
@@ -138,7 +160,9 @@ static int impl_send(void *self, const char *cmd, size_t cmd_len) {
   if (!impl || !impl->connected || !cmd || cmd_len == 0) return -1;
 
   ssize_t sent = send(impl->fd, cmd, cmd_len, 0);
-  if (sent < 0) return -1;
+  if (sent < 0) {
+    return -1;
+  }
 
   return 0;
 }
@@ -148,33 +172,6 @@ static resp_object *impl_recv(void *self) {
   if (!impl || !impl->connected) return NULL;
 
   return resp_read(impl->fd);
-}
-
-static int impl_encode_and_send(udphole_impl_t *impl, int argc, const char **argv) {
-  char  *buf     = NULL;
-  size_t buf_len = 0;
-
-  resp_object *args[16];
-  for (int i = 0; i < argc && i < 16; i++) {
-    args[i] = resp_array_init();
-    if (!args[i]) return -1;
-    resp_array_append_simple(args[i], argv[i]);
-  }
-
-  if (resp_encode_array(argc, (const resp_object *const *)args, &buf, &buf_len) != 0) {
-    for (int i = 0; i < argc && i < 16; i++) {
-      resp_free(args[i]);
-    }
-    return -1;
-  }
-
-  for (int i = 0; i < argc && i < 16; i++) {
-    resp_free(args[i]);
-  }
-
-  int ret = impl_send(impl, buf, buf_len);
-  free(buf);
-  return ret;
 }
 
 static void impl_cleanup(udphole_impl_t *impl) {
@@ -259,23 +256,24 @@ int infrastructure_udphole_init_global(void) {
   global_pool->current = head;
   global_pool->count = 0;
 
+  rtpproxy_node_t *node = head;
+  do {
+    global_pool->count++;
+    node = node->next;
+  } while (node && node != head);
+
+  log_info("udphole: initialized with %d rtpproxy(s) configured", global_pool->count);
+
   rtpproxy_node_t *start = head;
   do {
+    log_info("udphole: connection attempt to %s", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
     if (udphole_client_connect(global_pool->current->client) == 0) {
       log_info("udphole: connected to %s", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
-      global_pool->count++;
       break;
     }
-    log_warn("udphole: failed to connect to %s, trying next", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
+    log_warn("udphole: failed to connect to %s, will retry later", ((udphole_impl_t *)global_pool->current->client->transport.impl)->url);
     global_pool->current = global_pool->current->next;
   } while (global_pool->current != start);
-
-  if (global_pool->count == 0) {
-    log_fatal("udphole: could not connect to any rtp proxy");
-    return -1;
-  }
-
-  log_info("udphole: initialized with %d rtpproxy(s)", global_pool->count);
 
   return 0;
 }
@@ -319,6 +317,12 @@ static int pool_advance(void) {
 static resp_object *pool_execute(resp_object *cmd) {
   if (!global_pool || !cmd) return NULL;
 
+  char *buf = NULL;
+  size_t buf_len = 0;
+  if (resp_serialize(cmd, &buf, &buf_len) != 0) {
+    return NULL;
+  }
+
   for (int i = 0; i < global_pool->count; i++) {
     udphole_client_t *client = global_pool->current->client;
     udphole_impl_t *impl = client->transport.impl;
@@ -330,7 +334,7 @@ static resp_object *pool_execute(resp_object *cmd) {
       }
     }
 
-    if (impl_encode_and_send(impl, cmd->u.arr.n, (const char **)cmd->u.arr.elem) < 0) {
+    if (impl_send(impl, buf, buf_len) < 0) {
       udphole_client_disconnect(client);
       pool_advance();
       continue;
@@ -343,9 +347,11 @@ static resp_object *pool_execute(resp_object *cmd) {
       continue;
     }
 
+    free(buf);
     return resp;
   }
 
+  free(buf);
   return NULL;
 }
 
@@ -397,12 +403,18 @@ void udphole_client_disconnect(udphole_client_t *client) {
 int udphole_ping(udphole_client_t *client) {
   (void)client;
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "ping");
+  resp_array_append_bulk(cmd, "ping");
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
 
   if (!resp) return -1;
+
+  char * serialized = NULL;
+  size_t serialized_len = 0;
+  resp_serialize(resp, &serialized, &serialized_len);
+  log_debug("udphole_ping response: %s", serialized ? serialized : "(null)");
+  free(serialized);
 
   int ok = (resp->type == RESPT_SIMPLE && resp->u.s && strcmp(resp->u.s, "PONG") == 0);
   resp_free(resp);
@@ -418,9 +430,9 @@ int udphole_session_create(udphole_client_t *client, const char *session_id, int
   snprintf(expiry_str, sizeof(expiry_str), "%d", idle_expiry);
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.create");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, expiry_str);
+  resp_array_append_bulk(cmd, "session.create");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, expiry_str);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -438,8 +450,8 @@ int udphole_session_destroy(udphole_client_t *client, const char *session_id) {
   if (!session_id) return -1;
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.destroy");
-  resp_array_append_simple(cmd, session_id);
+  resp_array_append_bulk(cmd, "session.destroy");
+  resp_array_append_bulk(cmd, session_id);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -460,9 +472,9 @@ int udphole_socket_create_listen(udphole_client_t *client, const char *session_i
   memset(info, 0, sizeof(*info));
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.socket.create.listen");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, socket_id);
+  resp_array_append_bulk(cmd, "session.socket.create.listen");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, socket_id);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -501,11 +513,11 @@ int udphole_socket_create_connect(udphole_client_t *client, const char *session_
   snprintf(port_str, sizeof(port_str), "%d", port);
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.socket.create.connect");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, socket_id);
-  resp_array_append_simple(cmd, ip);
-  resp_array_append_simple(cmd, port_str);
+  resp_array_append_bulk(cmd, "session.socket.create.connect");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, socket_id);
+  resp_array_append_bulk(cmd, ip);
+  resp_array_append_bulk(cmd, port_str);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -538,9 +550,9 @@ int udphole_socket_destroy(udphole_client_t *client, const char *session_id, con
   if (!session_id || !socket_id) return -1;
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.socket.destroy");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, socket_id);
+  resp_array_append_bulk(cmd, "session.socket.destroy");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, socket_id);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -559,10 +571,10 @@ int udphole_forward_create(udphole_client_t *client, const char *session_id, con
   if (!session_id || !src_socket_id || !dst_socket_id) return -1;
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.forward.create");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, src_socket_id);
-  resp_array_append_simple(cmd, dst_socket_id);
+  resp_array_append_bulk(cmd, "session.forward.create");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, src_socket_id);
+  resp_array_append_bulk(cmd, dst_socket_id);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -581,10 +593,10 @@ int udphole_forward_destroy(udphole_client_t *client, const char *session_id, co
   if (!session_id || !src_socket_id || !dst_socket_id) return -1;
 
   resp_object *cmd = resp_array_init();
-  resp_array_append_simple(cmd, "session.forward.destroy");
-  resp_array_append_simple(cmd, session_id);
-  resp_array_append_simple(cmd, src_socket_id);
-  resp_array_append_simple(cmd, dst_socket_id);
+  resp_array_append_bulk(cmd, "session.forward.destroy");
+  resp_array_append_bulk(cmd, session_id);
+  resp_array_append_bulk(cmd, src_socket_id);
+  resp_array_append_bulk(cmd, dst_socket_id);
 
   resp_object *resp = pool_execute(cmd);
   resp_free(cmd);
@@ -620,4 +632,39 @@ udphole_client_t *udphole_client_create(const char *address, const char *auth_us
 
 void udphole_client_destroy(udphole_client_t *client) {
   infrastructure_udphole_destroy(client);
+}
+
+#define UDPHOLE_KEEPALIVE_INTERVAL_MS 30000
+
+typedef struct {
+  int64_t last_ping;
+} udphole_keepalive_udata_t;
+
+int udphole_keepalive_pt(int64_t timestamp, struct pt_task *task) {
+  udphole_keepalive_udata_t *udata = task->udata;
+
+  if (!udata) {
+    udata = calloc(1, sizeof(udphole_keepalive_udata_t));
+    if (!udata) return SCHED_ERROR;
+    udata->last_ping = timestamp;
+    task->udata     = udata;
+  }
+
+  if (timestamp - udata->last_ping >= UDPHOLE_KEEPALIVE_INTERVAL_MS) {
+    udata->last_ping = timestamp;
+
+    udphole_client_t *client = udphole_get_client();
+    if (!client) {
+      log_warn("udphole: keepalive - no client available");
+      return SCHED_RUNNING;
+    }
+
+    if (udphole_ping(client) == 0) {
+      log_trace("udphole: keepalive ping successful");
+    } else {
+      log_warn("udphole: keepalive ping failed");
+    }
+  }
+
+  return SCHED_RUNNING;
 }

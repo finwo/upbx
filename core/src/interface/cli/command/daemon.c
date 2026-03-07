@@ -12,6 +12,7 @@
 #include "domain/config.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/transport_udp.h"
+#include "domain/pbx/sip/udphole_client.h"
 #include "infrastructure/config.h"
 #include "interface/api/server.h"
 #include "interface/cli/common.h"
@@ -102,9 +103,12 @@ int cli_cmd_daemon(int argc, const char **argv) {
 
   domain_config_init();
 
+  udphole_client_init_global();
+
   sched_create(api_server_pt, NULL);
   sched_create(sip_transport_udp_pt, NULL);
   sched_create(registration_cleanup_pt, NULL);
+  sched_create(udphole_keepalive_pt, NULL);
 
   log_info("upbx: daemon started");
 
