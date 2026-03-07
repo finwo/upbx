@@ -205,6 +205,16 @@ char *sip_handle_register(
 
   normalize_ext_number(username, strlen(username), ext_number, sizeof(ext_number));
 
+  char to_username[128] = "";
+  if (!sip_header_uri_extract_user(msg, "To", to_username, sizeof(to_username))) {
+    normalize_ext_number(to_username, strlen(to_username), to_username, sizeof(to_username));
+  }
+
+  if (ext_number[0] != '\0' && to_username[0] != '\0' && strcmp(ext_number, to_username) != 0) {
+    log_warn("sip_handler: username mismatch - Authorization: %s, To: %s", ext_number, to_username);
+    return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+  }
+
   if (ext_number[0] == '\0') {
     return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
   }
@@ -275,7 +285,7 @@ char *sip_handle_register(
 
   char contact_resp[600];
   if (contact[0]) {
-    snprintf(contact_resp, sizeof(contact_resp), "<%s>;expires=%d", contact, expires);
+    snprintf(contact_resp, sizeof(contact_resp), "Contact: <%s>;expires=%d", contact, expires);
   } else {
     contact_resp[0] = '\0';
   }
