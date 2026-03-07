@@ -348,17 +348,20 @@ char *call_handle_bye(
   }
 
   const char *sender_ext = NULL;
+  bool from_source = false;
   if (remote_addr->ss_family == AF_INET && c->source_addr.ss_family == AF_INET) {
     struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
     struct sockaddr_in *call_src = (struct sockaddr_in *)&c->source_addr;
     if (src->sin_addr.s_addr == call_src->sin_addr.s_addr) {
       sender_ext = c->source_ext;
+      from_source = true;
     }
   } else if (remote_addr->ss_family == AF_INET6 && c->source_addr.ss_family == AF_INET6) {
     struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
     struct sockaddr_in6 *call_src = (struct sockaddr_in6 *)&c->source_addr;
     if (memcmp(&src->sin6_addr, &call_src->sin6_addr, sizeof(src->sin6_addr)) == 0) {
       sender_ext = c->source_ext;
+      from_source = true;
     }
   }
 
@@ -374,6 +377,57 @@ char *call_handle_bye(
       struct sockaddr_in6 *call_dest = (struct sockaddr_in6 *)&c->dest_addr;
       if (memcmp(&src->sin6_addr, &call_dest->sin6_addr, sizeof(src->sin6_addr)) == 0) {
         sender_ext = c->dest_ext;
+      }
+    }
+  }
+
+  log_trace("call_handle_bye: from %s, forwarding to %s", from_source ? "source" : "dest", from_source ? "dest" : "source");
+
+  struct sockaddr_storage target_addr;
+  memcpy(&target_addr, from_source ? &c->dest_addr : &c->source_addr, sizeof(target_addr));
+
+  if (sip_fds && msg->method && msg->method_len > 0) {
+    char method[16];
+    if (msg->method_len < sizeof(method)) {
+      memcpy(method, msg->method, msg->method_len);
+      method[msg->method_len] = '\0';
+
+      char target_uri[256];
+      char target_ip[64] = "127.0.0.1";
+      if (target_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&target_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, target_ip, sizeof(target_ip));
+      }
+      snprintf(target_uri, sizeof(target_uri), "sip:%s@%s", from_source ? c->dest_ext : c->source_ext, target_ip);
+
+      char from_header[256], to_header[256];
+      snprintf(from_header, sizeof(from_header), "<sip:%s@%s>", sender_ext ? sender_ext : "unknown", target_ip);
+      snprintf(to_header, sizeof(to_header), "<sip:%s@%s>", from_source ? c->dest_ext : c->source_ext, target_ip);
+
+      size_t fwd_len = 0;
+      char *fwd_req = sip_proto_build_request(
+        method,
+        target_uri,
+        target_ip,
+        from_header,
+        to_header,
+        call_id,
+        "1 BYE",
+        NULL,
+        NULL,
+        NULL,
+        0,
+        &fwd_len
+      );
+
+      if (fwd_req) {
+        int send_fd = find_socket_by_family(sip_fds, target_addr.ss_family);
+        if (send_fd >= 0) {
+          socklen_t dst_len = (target_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+          sendto(send_fd, fwd_req, fwd_len, 0, (struct sockaddr *)&target_addr, dst_len);
+          log_trace("call_handle_bye: forwarded BYE to %s", target_ip);
+        }
+        free(fwd_req);
       }
     }
   }
@@ -408,6 +462,63 @@ char *call_handle_cancel(
     if (c) {
       int authorized = (strcmp(src_ext, c->source_ext) == 0 || strcmp(src_ext, c->dest_ext) == 0);
       if (authorized) {
+        bool from_source = false;
+        if (remote_addr->ss_family == AF_INET && c->source_addr.ss_family == AF_INET) {
+          struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
+          struct sockaddr_in *call_src = (struct sockaddr_in *)&c->source_addr;
+          from_source = (src->sin_addr.s_addr == call_src->sin_addr.s_addr);
+        } else if (remote_addr->ss_family == AF_INET6 && c->source_addr.ss_family == AF_INET6) {
+          struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
+          struct sockaddr_in6 *call_src = (struct sockaddr_in6 *)&c->source_addr;
+          from_source = (memcmp(&src->sin6_addr, &call_src->sin6_addr, sizeof(src->sin6_addr)) == 0);
+        }
+
+        log_trace("call_handle_cancel: from %s, forwarding to %s", from_source ? "source" : "dest", from_source ? "dest" : "source");
+
+        struct sockaddr_storage target_addr;
+        memcpy(&target_addr, from_source ? &c->dest_addr : &c->source_addr, sizeof(target_addr));
+
+        if (sip_fds) {
+          char target_ip[64] = "127.0.0.1";
+          if (target_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&target_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, target_ip, sizeof(target_ip));
+          }
+
+          char target_uri[256];
+          snprintf(target_uri, sizeof(target_uri), "sip:%s@%s", from_source ? c->dest_ext : c->source_ext, target_ip);
+
+          char from_header[256], to_header[256];
+          snprintf(from_header, sizeof(from_header), "<sip:%s@%s>", src_ext, target_ip);
+          snprintf(to_header, sizeof(to_header), "<sip:%s@%s>", from_source ? c->dest_ext : c->source_ext, target_ip);
+
+          size_t fwd_len = 0;
+          char *fwd_req = sip_proto_build_request(
+            "CANCEL",
+            target_uri,
+            target_ip,
+            from_header,
+            to_header,
+            call_id,
+            "1 CANCEL",
+            NULL,
+            NULL,
+            NULL,
+            0,
+            &fwd_len
+          );
+
+          if (fwd_req) {
+            int send_fd = find_socket_by_family(sip_fds, target_addr.ss_family);
+            if (send_fd >= 0) {
+              socklen_t dst_len = (target_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+              sendto(send_fd, fwd_req, fwd_len, 0, (struct sockaddr *)&target_addr, dst_len);
+              log_trace("call_handle_cancel: forwarded CANCEL to %s", target_ip);
+            }
+            free(fwd_req);
+          }
+        }
+
         call_handle_cancel_internal(call_id);
       }
     }
@@ -423,7 +534,6 @@ char *call_handle_response(
   int listen_fd,
   size_t *response_len
 ) {
-  (void)remote_addr;
   (void)registration;
   (void)listen_fd;
 
@@ -446,6 +556,57 @@ char *call_handle_response(
   int status_code = msg->status_code;
   log_trace("call_handle_response: forwarding SIP response %d for call %s", status_code, call_id);
 
+  char remote_ip[64] = "?";
+  if (remote_addr->ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)remote_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, remote_ip, sizeof(remote_ip));
+  } else if (remote_addr->ss_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)remote_addr;
+    inet_ntop(AF_INET6, &sin6->sin6_addr, remote_ip, sizeof(remote_ip));
+  }
+
+  char source_ip[64] = "?", dest_ip[64] = "?";
+  if (c->source_addr.ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&c->source_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, source_ip, sizeof(source_ip));
+  }
+  if (c->dest_addr.ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, dest_ip, sizeof(dest_ip));
+  }
+  log_trace("call_handle_response: remote=%s, source=%s, dest=%s", remote_ip, source_ip, dest_ip);
+
+  bool from_source = false;
+  if (remote_addr->ss_family == AF_INET && c->source_addr.ss_family == AF_INET) {
+    struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
+    struct sockaddr_in *call_src = (struct sockaddr_in *)&c->source_addr;
+    from_source = (src->sin_addr.s_addr == call_src->sin_addr.s_addr);
+  } else if (remote_addr->ss_family == AF_INET6 && c->source_addr.ss_family == AF_INET6) {
+    struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
+    struct sockaddr_in6 *call_src = (struct sockaddr_in6 *)&c->source_addr;
+    from_source = (memcmp(&src->sin6_addr, &call_src->sin6_addr, sizeof(src->sin6_addr)) == 0);
+  }
+
+  struct sockaddr_storage target_addr;
+  char target_rtp_ip[64] = {0};
+  int target_rtp_port = 0;
+
+  if (from_source) {
+    log_trace("call_handle_response: response from source, forwarding to dest");
+    memcpy(&target_addr, &c->dest_addr, sizeof(target_addr));
+    if (c->dest_rtp_ip[0][0]) {
+      strncpy(target_rtp_ip, c->dest_rtp_ip[0], sizeof(target_rtp_ip) - 1);
+    }
+    target_rtp_port = c->dest_rtp_port[0];
+  } else {
+    log_trace("call_handle_response: response from dest, forwarding to source");
+    memcpy(&target_addr, &c->source_addr, sizeof(target_addr));
+    if (c->source_rtp_ip[0][0]) {
+      strncpy(target_rtp_ip, c->source_rtp_ip[0], sizeof(target_rtp_ip) - 1);
+    }
+    target_rtp_port = c->source_rtp_port[0];
+  }
+
   char pbx_addr[256] = "127.0.0.1";
   registration_t *src_reg = registration_find(c->source_ext);
   if (src_reg && src_reg->pbx_addr) {
@@ -456,25 +617,55 @@ char *call_handle_response(
   char via_header[300];
   snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s", pbx_addr);
 
+  char *sdp_body = NULL;
+  size_t sdp_body_len = 0;
+
+  if (msg->body && msg->body_len > 0 && target_rtp_ip[0]) {
+    sdp_body = malloc(4096);
+    if (sdp_body) {
+      sdp_body_len = (size_t)sdp_rewrite_all_media(msg->body, msg->body_len, &target_rtp_ip, &target_rtp_port, 1, sdp_body, 4096);
+      if (sdp_body_len <= 0) {
+        free(sdp_body);
+        sdp_body = NULL;
+        sdp_body_len = 0;
+      }
+    }
+  }
+
   size_t fwd_len = 0;
   char *fwd_resp = sip_proto_build_response(
     msg,
     status_code,
     msg->reason,
     NULL,
-    msg->body,
-    msg->body_len,
+    sdp_body ? sdp_body : msg->body,
+    sdp_body ? sdp_body_len : msg->body_len,
     &fwd_len,
     via_header
   );
 
+  free(sdp_body);
+
+  char target_ip[64] = "?";
+  if (target_addr.ss_family == AF_INET) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&target_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, target_ip, sizeof(target_ip));
+  }
+  log_trace("call_handle_response: target=%s, rtp_ip=%s, rtp_port=%d", target_ip, target_rtp_ip[0] ? target_rtp_ip : "(none)", target_rtp_port);
+
   if (fwd_resp && sip_fds) {
-    int send_fd = find_socket_by_family(sip_fds, c->source_addr.ss_family);
+    int send_fd = find_socket_by_family(sip_fds, target_addr.ss_family);
+    log_trace("call_handle_response: send_fd=%d", send_fd);
     if (send_fd >= 0) {
-      socklen_t dst_len = (c->source_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-      sendto(send_fd, fwd_resp, fwd_len, 0, (struct sockaddr *)&c->source_addr, dst_len);
+      socklen_t dst_len = (target_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      sendto(send_fd, fwd_resp, fwd_len, 0, (struct sockaddr *)&target_addr, dst_len);
+      log_trace("call_handle_response: forwarded response %d to %s", status_code, target_ip);
+    } else {
+      log_trace("call_handle_response: FAILED to forward - no suitable socket");
     }
     free(fwd_resp);
+  } else {
+    log_trace("call_handle_response: FAILED to forward - fwd_resp=%p, sip_fds=%p", (void*)fwd_resp, (void*)sip_fds);
   }
 
   return NULL;
