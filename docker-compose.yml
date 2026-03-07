@@ -17,12 +17,13 @@ services:
       - RTPPROXY=unix:///var/run/udphole.sock
       - API_ADMIN_USER=admin
       - API_ADMIN_PASS=supers3cret
+      - LOG_LEVEL=debug
     depends_on:
       udphole:
         condition: service_healthy
 
   udphole:
-    image: finwo/udphole:1.3.9
+    image: finwo/udphole:1.3.10
     ports:
       - "7000-7999:7000-7999/udp"
     environment:

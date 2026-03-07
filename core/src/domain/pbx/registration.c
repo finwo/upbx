@@ -54,6 +54,8 @@ static int save_registration_to_file(const registration_t *reg) {
   resp_array_append_bulk(obj, reg->group ? reg->group : "");
   resp_array_append_bulk(obj, "remote_addr");
   resp_array_append_bulk(obj, addr_str);
+  resp_array_append_bulk(obj, "pbx_addr");
+  resp_array_append_bulk(obj, reg->pbx_addr ? reg->pbx_addr : "");
   resp_array_append_bulk(obj, "expires_at");
   resp_array_append_int(obj, (long long)reg->expires_at);
   resp_array_append_bulk(obj, "registered_at");
@@ -141,6 +143,11 @@ static registration_t *load_registration_from_file(const char *number) {
   const char *addr_str = resp_map_get_string(obj, "remote_addr");
   if (addr_str && addr_str[0]) {
     string_to_sockaddr(addr_str, &reg->remote_addr);
+  }
+
+  const char *pbx = resp_map_get_string(obj, "pbx_addr");
+  if (pbx && pbx[0]) {
+    reg->pbx_addr = strdup(pbx);
   }
 
   resp_object *val;
@@ -355,7 +362,7 @@ const char *registration_pattern_best_match(const char *extension) {
   return best_pattern;
 }
 
-int registration_add(const char *number, const char *contact, const char *group, const struct sockaddr *remote_addr, int expires_seconds) {
+int registration_add(const char *number, const char *contact, const char *group, const char *pbx_addr, const struct sockaddr *remote_addr, int listen_fd, int expires_seconds) {
   if (!number) return -1;
 
   registration_t *reg = registration_find(number);
@@ -376,9 +383,14 @@ int registration_add(const char *number, const char *contact, const char *group,
   if (reg->group) free(reg->group);
   reg->group = group ? strdup(group) : NULL;
 
+  if (reg->pbx_addr) free(reg->pbx_addr);
+  reg->pbx_addr = pbx_addr ? strdup(pbx_addr) : NULL;
+
   if (remote_addr) {
     memcpy(&reg->remote_addr, remote_addr, sizeof(reg->remote_addr));
   }
+
+  reg->listen_fd = listen_fd;
 
   time_t now         = time(NULL);
   reg->registered_at = now;
@@ -393,6 +405,10 @@ int registration_add(const char *number, const char *contact, const char *group,
     if (reg->group) {
       free(reg->group);
       reg->group = NULL;
+    }
+    if (reg->pbx_addr) {
+      free(reg->pbx_addr);
+      reg->pbx_addr = NULL;
     }
     reg->expires_at    = 0;
     reg->registered_at = 0;
@@ -435,6 +451,7 @@ void registration_free(registration_t *reg) {
   free(reg->number);
   free(reg->contact);
   free(reg->group);
+  free(reg->pbx_addr);
   free(reg);
 }
 

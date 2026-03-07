@@ -11,7 +11,9 @@ typedef struct {
   char                   *number;
   char                   *contact;
   char                   *group;
+  char                   *pbx_addr;
   struct sockaddr_storage remote_addr;
+  int                     listen_fd;
   time_t                  expires_at;
   time_t                  registered_at;
 } registration_t;
@@ -34,7 +36,7 @@ int pattern_specificity_cmp(const char *a, const char *b);
 
 const char *registration_pattern_best_match(const char *extension);
 
-int registration_add(const char *number, const char *contact, const char *group, const struct sockaddr *remote_addr, int expires_seconds);
+int registration_add(const char *number, const char *contact, const char *group, const char *pbx_addr, const struct sockaddr *remote_addr, int listen_fd, int expires_seconds);
 
 void registration_remove(const char *number);
 

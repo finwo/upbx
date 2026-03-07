@@ -13,19 +13,28 @@
 #include "domain/pbx/group.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sdp_parse.h"
+#include "domain/pbx/sip/sip_message.h"
+#include "domain/pbx/sip/sip_proto.h"
 #include "domain/pbx/sip/udphole_client.h"
+#include "finwo/mindex.h"
 #include "rxi/log.h"
-#include "tidwall/hashmap.h"
 
 #define CALL_TIMEOUT_SEC 3600
 #define RING_TIMEOUT_SEC 60
 
-static struct hashmap *calls = NULL;
+static int *sip_fds = NULL;
 
-static uint64_t call_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-  const call_t *c = item;
-  return hashmap_sip(c->call_id, strlen(c->call_id), seed0, seed1);
-}
+extern void sip_transport_udp_set_fds(int *fds);
+
+static struct mindex_t *calls = NULL;
+
+static int call_route_invite_internal(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
+                       const char *sdp, size_t sdp_len, char **out_sdp,
+                       size_t *out_sdp_len, char **out_dest_sdp, size_t *out_dest_sdp_len);
+
+static void call_handle_bye_internal(const char *call_id, const char *sender_ext);
+
+static void call_handle_cancel_internal(const char *call_id);
 
 static int call_compare(const void *a, const void *b, void *udata) {
   (void)udata;
@@ -37,7 +46,7 @@ static int call_compare(const void *a, const void *b, void *udata) {
 static const call_t *find_call(const char *call_id) {
   if (!calls || !call_id) return NULL;
   call_t key = {.call_id = (char *)call_id};
-  return hashmap_get(calls, &key);
+  return mindex_get(calls, &key);
 }
 
 static const char *get_advertise_ip(void) {
@@ -62,41 +71,367 @@ static void free_call(const call_t *c) {
   free((void*)c);
 }
 
+static void free_call_wrapper(void *item, void *udata) {
+  (void)udata;
+  free_call(item);
+}
+
 void call_init(void) {
   if (calls) return;
-  calls = hashmap_new(sizeof(call_t), 64, 0, 0, call_hash, call_compare, NULL, NULL);
+  calls = mindex_init(call_compare, free_call_wrapper, NULL);
 }
 
 const call_t *call_find(const char *call_id) {
   return find_call(call_id);
 }
 
-int call_route_invite(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
-                      const char *sdp, size_t sdp_len, const char *source_ip, int source_port, char **out_sdp,
-                      size_t *out_sdp_len, char **out_dest_sdp, size_t *out_dest_sdp_len) {
+static int find_socket_by_family(int *sock_array, sa_family_t family) {
+  if (!sock_array || sock_array[0] == 0) return -1;
+  for (int i = 1; i <= sock_array[0]; i++) {
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getsockname(sock_array[i], (struct sockaddr *)&addr, &addrlen) == 0) {
+      if (addr.ss_family == family) {
+        return sock_array[i];
+      }
+    }
+  }
+  return -1;
+}
+
+char *call_handle_invite(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+) {
+  (void)remote_addr;
+  (void)listen_fd;
+
+  if (!msg || !sip_is_request(msg) || !response_len) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+  }
+
+  char from_ext[64] = {0};
+  char to_ext[64] = {0};
+  char call_id[256] = {0};
+  char from_tag[64] = {0};
+
+  sip_header_uri_extract_user(msg, "From", from_ext, sizeof(from_ext));
+  sip_header_uri_extract_user(msg, "To", to_ext, sizeof(to_ext));
+  sip_message_header_copy(msg, "Call-ID", call_id, sizeof(call_id));
+
+  const char *from_header = sip_message_header_get(msg, "From", NULL);
+  if (from_header) {
+    const char *tag = strstr(from_header, ";tag=");
+    if (tag) {
+      tag += 5;
+      const char *end = tag;
+      while (*end && *end != ';' && *end != '>' && *end != '\r' && *end != '\n') end++;
+      size_t tag_len = (size_t)(end - tag);
+      if (tag_len < sizeof(from_tag)) {
+        memcpy(from_tag, tag, tag_len);
+        from_tag[tag_len] = '\0';
+      }
+    }
+  }
+
+  if (!from_ext[0] || !to_ext[0] || !call_id[0] || !from_tag[0]) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+  }
+
+  if (!registration) {
+    log_error("call_handle_invite: INVITE from unregistered source");
+    return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+  }
+
+  if (registration_is_pattern(registration->number)) {
+    if (!registration_match_pattern(registration->number, from_ext)) {
+      log_error("call_handle_invite: INVITE from %s does not match pattern %s", from_ext, registration->number);
+      return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+    }
+  } else {
+    if (strcmp(from_ext, registration->number) != 0) {
+      log_error("call_handle_invite: INVITE from %s does not match registered %s", from_ext, registration->number);
+      return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+    }
+  }
+
+  const char *sdp = msg->body;
+  size_t sdp_len = msg->body_len;
+
+  char *out_sdp = NULL;
+  size_t out_sdp_len = 0;
+  char *out_dest_sdp = NULL;
+  size_t out_dest_sdp_len = 0;
+
+  int r = call_route_invite_internal(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, &out_sdp, &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
+
+  if (r == -1) {
+    return sip_proto_build_response(msg, 403, "Forbidden", NULL, NULL, 0, response_len);
+  } else if (r == -2) {
+    return sip_proto_build_response(msg, 404, "Not Found", NULL, NULL, 0, response_len);
+  }
+
+  char *resp = sip_proto_build_response(msg, 100, "Trying", NULL, out_sdp, out_sdp_len, response_len);
+  free(out_sdp);
+
+  if (resp && out_dest_sdp) {
+    call_t *c = find_call(call_id);
+    if (c) {
+      char dest_contact_host[256] = {0};
+      int dest_contact_port = 5060;
+
+      if (c->dest_contact && c->dest_contact[0]) {
+        const char *at = strchr(c->dest_contact, '@');
+        if (at) {
+          const char *host_start = at + 1;
+          const char *colon = strchr(host_start, ':');
+          if (colon) {
+            size_t host_len = (size_t)(colon - host_start);
+            if (host_len < sizeof(dest_contact_host)) {
+              memcpy(dest_contact_host, host_start, host_len);
+              dest_contact_host[host_len] = '\0';
+            }
+            dest_contact_port = atoi(colon + 1);
+          } else {
+            size_t host_len = strlen(host_start);
+            if (host_len < sizeof(dest_contact_host)) {
+              memcpy(dest_contact_host, host_start, host_len);
+              dest_contact_host[host_len] = '\0';
+            }
+          }
+        }
+      }
+
+      if (!dest_contact_host[0]) {
+        if (c->dest_addr.ss_family == AF_INET) {
+          struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
+          inet_ntop(AF_INET, &sin->sin_addr, dest_contact_host, sizeof(dest_contact_host));
+          dest_contact_port = ntohs(sin->sin_port);
+        } else if (c->dest_addr.ss_family == AF_INET6) {
+          struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
+          inet_ntop(AF_INET6, &sin6->sin6_addr, dest_contact_host, sizeof(dest_contact_host));
+          dest_contact_port = ntohs(sin6->sin6_port);
+        }
+      }
+
+      char pbx_addr[256] = "127.0.0.1";
+      registration_t *dest_reg = registration_find(c->dest_ext);
+      if (dest_reg && dest_reg->pbx_addr) {
+        strncpy(pbx_addr, dest_reg->pbx_addr, sizeof(pbx_addr) - 1);
+        pbx_addr[sizeof(pbx_addr) - 1] = '\0';
+      }
+
+      char from_header[256];
+      snprintf(from_header, sizeof(from_header), "<sip:%s@%s>;tag=%s", from_ext, pbx_addr, from_tag);
+      char to_header[256];
+      snprintf(to_header, sizeof(to_header), "<sip:%s@%s>", to_ext, pbx_addr);
+
+      char *inv = sip_proto_build_request(
+        "INVITE",
+        dest_contact_host,
+        pbx_addr,
+        from_header,
+        to_header,
+        call_id,
+        "1 INVITE",
+        NULL,
+        "application/sdp",
+        out_dest_sdp,
+        out_dest_sdp_len,
+        &out_dest_sdp_len
+      );
+      free(out_dest_sdp);
+
+      if (inv && sip_fds) {
+        int send_fd = find_socket_by_family(sip_fds, c->dest_addr.ss_family);
+        if (send_fd >= 0) {
+          socklen_t dst_len = (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+          sendto(send_fd, inv, out_dest_sdp_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
+        }
+        free(inv);
+      }
+    }
+  }
+
+  return resp;
+}
+
+char *call_handle_bye(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+) {
+  (void)registration;
+  (void)listen_fd;
+
+  if (!msg || !response_len) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+  }
+
+  char call_id[256] = {0};
+  sip_message_header_copy(msg, "Call-ID", call_id, sizeof(call_id));
+
+  if (!call_id[0]) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+  }
+
+  const call_t *c = find_call(call_id);
+  if (!c) {
+    return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len);
+  }
+
+  const char *sender_ext = NULL;
+  if (remote_addr->ss_family == AF_INET && c->source_addr.ss_family == AF_INET) {
+    struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
+    struct sockaddr_in *call_src = (struct sockaddr_in *)&c->source_addr;
+    if (src->sin_addr.s_addr == call_src->sin_addr.s_addr) {
+      sender_ext = c->source_ext;
+    }
+  } else if (remote_addr->ss_family == AF_INET6 && c->source_addr.ss_family == AF_INET6) {
+    struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
+    struct sockaddr_in6 *call_src = (struct sockaddr_in6 *)&c->source_addr;
+    if (memcmp(&src->sin6_addr, &call_src->sin6_addr, sizeof(src->sin6_addr)) == 0) {
+      sender_ext = c->source_ext;
+    }
+  }
+
+  if (!sender_ext) {
+    if (remote_addr->ss_family == AF_INET && c->dest_addr.ss_family == AF_INET) {
+      struct sockaddr_in *src = (struct sockaddr_in *)remote_addr;
+      struct sockaddr_in *call_dest = (struct sockaddr_in *)&c->dest_addr;
+      if (src->sin_addr.s_addr == call_dest->sin_addr.s_addr) {
+        sender_ext = c->dest_ext;
+      }
+    } else if (remote_addr->ss_family == AF_INET6 && c->dest_addr.ss_family == AF_INET6) {
+      struct sockaddr_in6 *src = (struct sockaddr_in6 *)remote_addr;
+      struct sockaddr_in6 *call_dest = (struct sockaddr_in6 *)&c->dest_addr;
+      if (memcmp(&src->sin6_addr, &call_dest->sin6_addr, sizeof(src->sin6_addr)) == 0) {
+        sender_ext = c->dest_ext;
+      }
+    }
+  }
+
+  call_handle_bye_internal(call_id, sender_ext);
+
+  return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len);
+}
+
+char *call_handle_cancel(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+) {
+  (void)registration;
+  (void)listen_fd;
+
+  if (!msg || !response_len) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
+  }
+
+  char call_id[256] = {0};
+  sip_message_header_copy(msg, "Call-ID", call_id, sizeof(call_id));
+
+  if (call_id[0]) {
+    char src_ext[64] = {0};
+    sip_header_uri_extract_user(msg, "From", src_ext, sizeof(src_ext));
+
+    const call_t *c = find_call(call_id);
+    if (c) {
+      int authorized = (strcmp(src_ext, c->source_ext) == 0 || strcmp(src_ext, c->dest_ext) == 0);
+      if (authorized) {
+        call_handle_cancel_internal(call_id);
+      }
+    }
+  }
+
+  return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len);
+}
+
+char *call_handle_response(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+) {
+  (void)remote_addr;
+  (void)registration;
+  (void)listen_fd;
+
+  if (!msg || !sip_is_request(msg) || !response_len) {
+    return NULL;
+  }
+
+  char call_id[256] = {0};
+  sip_message_header_copy(msg, "Call-ID", call_id, sizeof(call_id));
+
+  if (!call_id[0]) {
+    return NULL;
+  }
+
+  const call_t *c = find_call(call_id);
+  if (!c) {
+    return NULL;
+  }
+
+  int status_code = msg->status_code;
+  log_trace("call_handle_response: forwarding SIP response %d for call %s", status_code, call_id);
+
+  char pbx_addr[256] = "127.0.0.1";
+  registration_t *src_reg = registration_find(c->source_ext);
+  if (src_reg && src_reg->pbx_addr) {
+    strncpy(pbx_addr, src_reg->pbx_addr, sizeof(pbx_addr) - 1);
+    pbx_addr[sizeof(pbx_addr) - 1] = '\0';
+  }
+
+  char from_header[256];
+  snprintf(from_header, sizeof(from_header), "<sip:%s@%s>;tag=%s", c->dest_ext, pbx_addr, c->to_tag ? c->to_tag : "");
+  char to_header[256];
+  snprintf(to_header, sizeof(to_header), "<sip:%s@%s>;tag=%s", c->source_ext, pbx_addr, c->from_tag ? c->from_tag : "");
+
+  size_t fwd_len = 0;
+  char *fwd_resp = sip_proto_build_request(
+    "SIP/2.0",
+    call_id,
+    pbx_addr,
+    from_header,
+    to_header,
+    call_id,
+    "1 INVITE",
+    NULL,
+    msg->body && msg->body_len > 0 ? "application/sdp" : NULL,
+    msg->body,
+    msg->body_len,
+    &fwd_len
+  );
+
+  if (fwd_resp && sip_fds) {
+    int send_fd = find_socket_by_family(sip_fds, c->source_addr.ss_family);
+    if (send_fd >= 0) {
+      socklen_t dst_len = (c->source_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      sendto(send_fd, fwd_resp, fwd_len, 0, (struct sockaddr *)&c->source_addr, dst_len);
+    }
+    free(fwd_resp);
+  }
+
+  return NULL;
+}
+
+int call_route_invite_internal(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
+                       const char *sdp, size_t sdp_len, char **out_sdp,
+                       size_t *out_sdp_len, char **out_dest_sdp, size_t *out_dest_sdp_len) {
   log_info("call: %s -> %s, call_id=%s, from_tag=%s", from_ext, to_ext, call_id, from_tag);
 
   registration_t *source_reg = registration_find(from_ext);
   if (!source_reg) {
     log_error("call: source extension %s not registered", from_ext);
-    return -1;
-  }
-
-  char source_reg_ip[INET6_ADDRSTRLEN] = {0};
-  int  source_reg_port                 = 0;
-  if (source_reg->remote_addr.ss_family == AF_INET) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)&source_reg->remote_addr;
-    inet_ntop(AF_INET, &sin->sin_addr, source_reg_ip, sizeof(source_reg_ip));
-    source_reg_port = ntohs(sin->sin_port);
-  } else if (source_reg->remote_addr.ss_family == AF_INET6) {
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&source_reg->remote_addr;
-    inet_ntop(AF_INET6, &sin6->sin6_addr, source_reg_ip, sizeof(source_reg_ip));
-    source_reg_port = ntohs(sin6->sin6_port);
-  }
-
-  if (strcmp(source_ip, source_reg_ip) != 0 || source_port != source_reg_port) {
-    log_error("call: source IP mismatch: expected %s:%d, got %s:%d", source_reg_ip, source_reg_port, source_ip,
-              source_port);
     return -1;
   }
 
@@ -279,7 +614,7 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
     free(dest_info[i].advertise_ip);
   }
 
-  hashmap_set(calls, c);
+  mindex_set(calls, c);
 
   *out_sdp = malloc(4096);
   *out_dest_sdp = malloc(4096);
@@ -324,7 +659,7 @@ int call_route_invite(const char *from_ext, const char *to_ext, const char *call
   return 0;
 }
 
-void call_handle_bye(const char *call_id) {
+void call_handle_bye_internal(const char *call_id, const char *sender_ext) {
   const call_t *c = find_call(call_id);
   if (!c) {
     log_warn("call_bye: call not found: %s", call_id);
@@ -332,6 +667,73 @@ void call_handle_bye(const char *call_id) {
   }
 
   log_info("call_bye: call_id=%s", call_id);
+
+  const char *pbx_addr = "127.0.0.1";
+  const char *recipient_ext = NULL;
+  const struct sockaddr_storage *recipient_addr = NULL;
+
+  if (sender_ext && c->source_ext && strcmp(sender_ext, c->source_ext) == 0) {
+    recipient_ext = c->dest_ext;
+    recipient_addr = &c->dest_addr;
+  } else if (sender_ext && c->dest_ext && strcmp(sender_ext, c->dest_ext) == 0) {
+    recipient_ext = c->source_ext;
+    recipient_addr = &c->source_addr;
+    registration_t *sender_reg = registration_find(c->dest_ext);
+    if (sender_reg && sender_reg->pbx_addr) {
+      pbx_addr = sender_reg->pbx_addr;
+    }
+  }
+
+  if (recipient_ext && recipient_addr) {
+    char dest_host[INET6_ADDRSTRLEN] = {0};
+    int dest_port = 5060;
+
+    if (recipient_addr->ss_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)recipient_addr;
+      inet_ntop(AF_INET, &sin->sin_addr, dest_host, sizeof(dest_host));
+      dest_port = ntohs(sin->sin_port);
+    } else if (recipient_addr->ss_family == AF_INET6) {
+      struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)recipient_addr;
+      inet_ntop(AF_INET6, &sin6->sin6_addr, dest_host, sizeof(dest_host));
+      dest_port = ntohs(sin6->sin6_port);
+    }
+
+    char from_header[256];
+    snprintf(from_header, sizeof(from_header), "<sip:%s@%s>;tag=%s", sender_ext ? sender_ext : "", pbx_addr, c->from_tag ? c->from_tag : "");
+    char to_header[256];
+    snprintf(to_header, sizeof(to_header), "<sip:%s@%s>", recipient_ext, pbx_addr);
+
+    size_t bye_len = 0;
+    char *bye = sip_proto_build_request(
+      "BYE",
+      dest_host,
+      pbx_addr,
+      from_header,
+      to_header,
+      call_id,
+      "1 BYE",
+      NULL,
+      NULL,
+      NULL,
+      0,
+      &bye_len
+    );
+
+    if (bye && bye_len > 0) {
+      int send_fd = socket(recipient_addr->ss_family, SOCK_DGRAM, 0);
+      if (send_fd >= 0) {
+        socklen_t dst_len = (recipient_addr->ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+        ssize_t sent = sendto(send_fd, bye, bye_len, 0, (const struct sockaddr *)recipient_addr, dst_len);
+        if (sent > 0) {
+          log_info("call_bye: forwarded BYE to %s (%s:%d)", recipient_ext, dest_host, dest_port);
+        } else {
+          log_error("call_bye: failed to forward BYE to %s: %s", recipient_ext, strerror(errno));
+        }
+        close(send_fd);
+      }
+      free(bye);
+    }
+  }
 
   udphole_client_t *udphole = udphole_get_client();
   if (udphole) {
@@ -346,10 +748,10 @@ void call_handle_bye(const char *call_id) {
     udphole_session_destroy(udphole, call_id);
   }
 
-  hashmap_delete(calls, c);
-  free_call(c);
+  call_t key = {.call_id = (char*)call_id};
+  mindex_delete(calls, &key);
 }
 
-void call_handle_cancel(const char *call_id) {
-  call_handle_bye(call_id);
+void call_handle_cancel_internal(const char *call_id) {
+  call_handle_bye_internal(call_id, NULL);
 }

@@ -5,6 +5,9 @@
 #include <sys/socket.h>
 #include <time.h>
 
+#include "domain/pbx/registration.h"
+#include "domain/pbx/sip/sip_message.h"
+
 #define MAX_MEDIA_STREAMS 8
 
 typedef struct {
@@ -29,12 +32,37 @@ typedef struct {
   int                     ringing;
 } call_t;
 
-int call_route_invite(const char *from_ext, const char *to_ext, const char *call_id, const char *from_tag,
-                      const char *sdp, size_t sdp_len, const char *source_ip, int source_port, char **out_sdp,
-                      size_t *out_sdp_len, char **out_dest_sdp, size_t *out_dest_sdp_len);
+char *call_handle_invite(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+);
 
-void call_handle_bye(const char *call_id);
-void call_handle_cancel(const char *call_id);
+char *call_handle_bye(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+);
+
+char *call_handle_cancel(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+);
+
+char *call_handle_response(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+);
 
 const call_t *call_find(const char *call_id);
 

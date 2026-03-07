@@ -25,9 +25,9 @@
 #include "common/scheduler.h"
 #include "common/socket_util.h"
 #include "domain/config.h"
+#include "finwo/mindex.h"
 #include "infrastructure/config.h"
 #include "rxi/log.h"
-#include "tidwall/hashmap.h"
 
 int api_client_pt(int64_t timestamp, struct pt_task *task);
 
@@ -62,8 +62,8 @@ typedef struct {
 } domain_cmd_entry;
 
 static char           *current_listen = NULL;
-static struct hashmap *cmd_map        = NULL;
-static struct hashmap *domain_cmd_map = NULL;
+static struct mindex_t *cmd_map        = NULL;
+static struct mindex_t *domain_cmd_map = NULL;
 
 typedef struct {
   int *server_fds;
@@ -212,11 +212,6 @@ static bool user_has_permit(api_client_t *c, const char *cmd) {
   return false;
 }
 
-static uint64_t cmd_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-  const api_cmd_entry *cmd = item;
-  return hashmap_sip(cmd->name, strlen(cmd->name), seed0, seed1);
-}
-
 static int cmd_compare(const void *a, const void *b, void *udata) {
   (void)udata;
   const api_cmd_entry *ca = a;
@@ -224,15 +219,18 @@ static int cmd_compare(const void *a, const void *b, void *udata) {
   return strcasecmp(ca->name, cb->name);
 }
 
-void api_register_cmd(const char *name, char (*func)(api_client_t *, char **, int)) {
-  if (!cmd_map) cmd_map = hashmap_new(sizeof(api_cmd_entry), 0, 0, 0, cmd_hash, cmd_compare, NULL, NULL);
-  hashmap_set(cmd_map, &(api_cmd_entry){.name = name, .func = func});
-  log_trace("api: registered command '%s'", name);
+static void cmd_purge(void *item, void *udata) {
+  (void)item;
+  (void)udata;
 }
 
-static uint64_t domain_cmd_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-  const domain_cmd_entry *cmd = item;
-  return hashmap_sip(cmd->name, strlen(cmd->name), seed0, seed1);
+void api_register_cmd(const char *name, char (*func)(api_client_t *, char **, int)) {
+  if (!cmd_map) cmd_map = mindex_init(cmd_compare, cmd_purge, NULL);
+  api_cmd_entry *entry = malloc(sizeof(api_cmd_entry));
+  entry->name = name;
+  entry->func = func;
+  mindex_set(cmd_map, entry);
+  log_trace("api: registered command '%s'", name);
 }
 
 static int domain_cmd_compare(const void *a, const void *b, void *udata) {
@@ -242,10 +240,18 @@ static int domain_cmd_compare(const void *a, const void *b, void *udata) {
   return strcasecmp(ca->name, cb->name);
 }
 
+static void domain_cmd_purge(void *item, void *udata) {
+  (void)item;
+  (void)udata;
+}
+
 void api_register_domain_cmd(const char *name, domain_cmd_fn func) {
   if (!domain_cmd_map)
-    domain_cmd_map = hashmap_new(sizeof(domain_cmd_entry), 0, 0, 0, domain_cmd_hash, domain_cmd_compare, NULL, NULL);
-  hashmap_set(domain_cmd_map, &(domain_cmd_entry){.name = name, .func = func});
+    domain_cmd_map = mindex_init(domain_cmd_compare, domain_cmd_purge, NULL);
+  domain_cmd_entry *entry = malloc(sizeof(domain_cmd_entry));
+  entry->name = name;
+  entry->func = func;
+  mindex_set(domain_cmd_map, entry);
   log_trace("api: registered domain command '%s'", name);
 }
 
@@ -297,10 +303,8 @@ static char cmdCOMMAND(api_client_t *c, char **args, int nargs) {
   if (!result) return 0;
 
   if (domain_cmd_map) {
-    size_t iter = 0;
-    void  *item;
-    while (hashmap_iter(domain_cmd_map, &iter, &item)) {
-      const domain_cmd_entry *e = item;
+    for (size_t i = 0; i < mindex_length(domain_cmd_map); i++) {
+      const domain_cmd_entry *e = mindex_nth(domain_cmd_map, i);
       if (!user_has_permit(c, e->name)) continue;
 
       resp_array_append_bulk(result, e->name);
@@ -316,10 +320,8 @@ static char cmdCOMMAND(api_client_t *c, char **args, int nargs) {
   }
 
   if (cmd_map) {
-    size_t iter = 0;
-    void  *item;
-    while (hashmap_iter(cmd_map, &iter, &item)) {
-      const api_cmd_entry *e = item;
+    for (size_t i = 0; i < mindex_length(cmd_map); i++) {
+      const api_cmd_entry *e = mindex_nth(cmd_map, i);
       if (!is_builtin(e->name) && !user_has_permit(c, e->name)) continue;
 
       resp_array_append_bulk(result, e->name);
@@ -364,7 +366,7 @@ static void dispatch_command(api_client_t *c, char **args, int nargs) {
 
   for (char *p = args[0]; *p; p++) *p = (char)tolower((unsigned char)*p);
 
-  const domain_cmd_entry *dcmd = hashmap_get(domain_cmd_map, &(domain_cmd_entry){.name = args[0]});
+  const domain_cmd_entry *dcmd = mindex_get(domain_cmd_map, &(domain_cmd_entry){.name = args[0]});
   if (dcmd) {
     if (!is_builtin(args[0])) {
       if (!user_has_permit(c, args[0])) {
@@ -402,7 +404,7 @@ static void dispatch_command(api_client_t *c, char **args, int nargs) {
     return;
   }
 
-  const api_cmd_entry *cmd = hashmap_get(cmd_map, &(api_cmd_entry){.name = args[0]});
+  const api_cmd_entry *cmd = mindex_get(cmd_map, &(api_cmd_entry){.name = args[0]});
   if (!cmd) {
     api_write_err(c, "unknown command");
     return;

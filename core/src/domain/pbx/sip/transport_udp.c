@@ -19,8 +19,8 @@
 #include "domain/pbx/group.h"
 #include "domain/pbx/nonce.h"
 #include "domain/pbx/registration.h"
-#include "domain/pbx/sip/sdp_parse.h"
 #include "domain/pbx/sip/sip_message.h"
+#include "domain/pbx/sip/sip_proto.h"
 #include "domain/pbx/sip_handler.h"
 #include "infrastructure/config.h"
 #include "rxi/log.h"
@@ -38,337 +38,54 @@ typedef struct {
   int                     current_fd_idx;
 } sip_udp_udata_t;
 
-static char *build_method_not_allowed(sip_message_t *msg, size_t *out_len) {
-  size_t cap  = 1024;
-  char  *resp = malloc(cap);
-  if (!resp) return NULL;
+typedef struct {
+  const char  *method;
+  size_t      method_len;
+  sip_method_handler handler;
+} sip_handler_entry;
 
-  size_t used = 0;
-  int    n;
+static const sip_handler_entry sip_handlers[] = {
+  {"REGISTER",  8, sip_handle_register},
+  {"INVITE",    6, call_handle_invite},
+  {"BYE",       3, call_handle_bye},
+  {"CANCEL",    6, call_handle_cancel},
+  {"ACK",       3, NULL},
+  {"OPTIONS",   7, NULL},
+};
 
-  n = snprintf(resp + used, cap - used, "SIP/2.0 405 Method Not Allowed\r\n");
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  size_t      via_len;
-  const char *via = sip_message_header_get(msg, "Via", &via_len);
-  if (via && via_len > 0) {
-    n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_len, via);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      from_len;
-  const char *from = sip_message_header_get(msg, "From", &from_len);
-  if (from && from_len > 0) {
-    n = snprintf(resp + used, cap - used, "From: %.*s\r\n", (int)from_len, from);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      to_len;
-  const char *to = sip_message_header_get(msg, "To", &to_len);
-  if (to && to_len > 0) {
-    n = snprintf(resp + used, cap - used, "To: %.*s\r\n", (int)to_len, to);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      call_id_len;
-  const char *call_id = sip_message_header_get(msg, "Call-ID", &call_id_len);
-  if (call_id && call_id_len > 0) {
-    n = snprintf(resp + used, cap - used, "Call-ID: %.*s\r\n", (int)call_id_len, call_id);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      cseq_len;
-  const char *cseq = sip_message_header_get(msg, "CSeq", &cseq_len);
-  if (cseq && cseq_len > 0) {
-    n = snprintf(resp + used, cap - used, "CSeq: %.*s\r\n", (int)cseq_len, cseq);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  n = snprintf(resp + used, cap - used, "Content-Length: 0\r\n\r\n");
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  *out_len = used;
-  return resp;
+void sip_transport_udp_set_fds(int *fds) {
+  sip_fds = fds;
 }
 
-static char *build_response(sip_message_t *msg, int code, const char *reason, size_t *out_len) {
-  size_t cap  = 1024;
-  char  *resp = malloc(cap);
-  if (!resp) return NULL;
-
-  size_t used = 0;
-  int    n;
-
-  n = snprintf(resp + used, cap - used, "SIP/2.0 %d %s\r\n", code, reason);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
+static char *sip_dispatch(sip_message_t *msg, const struct sockaddr_storage *remote_addr, int listen_fd, size_t *response_len) {
+  if (!msg || !sip_is_request(msg) || !response_len) {
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
   }
-  used += (size_t)n;
 
-  size_t      via_len;
-  const char *via = sip_message_header_get(msg, "Via", &via_len);
-  if (via && via_len > 0) {
-    n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_len, via);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
+  for (size_t i = 0; i < sizeof(sip_handlers) / sizeof(sip_handlers[0]); i++) {
+    if (msg->method_len == sip_handlers[i].method_len &&
+        strncasecmp(msg->method, sip_handlers[i].method, msg->method_len) == 0) {
+
+      registration_t *reg = registration_find_by_addr((const struct sockaddr *)remote_addr);
+
+      if (sip_handlers[i].handler) {
+        return sip_handlers[i].handler(msg, remote_addr, reg, listen_fd, response_len);
+      }
+
+      if (msg->method_len == 3 && strncasecmp(msg->method, "ACK", 3) == 0) {
+        log_trace("transport_udp: ACK received, no response needed");
+        return NULL;
+      }
+
+      if (msg->method_len == 7 && strncasecmp(msg->method, "OPTIONS", 7) == 0) {
+        return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
+      }
+
+      return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
     }
-    used += (size_t)n;
   }
 
-  size_t      from_len;
-  const char *from = sip_message_header_get(msg, "From", &from_len);
-  if (from && from_len > 0) {
-    n = snprintf(resp + used, cap - used, "From: %.*s\r\n", (int)from_len, from);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      to_len;
-  const char *to = sip_message_header_get(msg, "To", &to_len);
-  if (to && to_len > 0) {
-    n = snprintf(resp + used, cap - used, "To: %.*s\r\n", (int)to_len, to);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      call_id_len;
-  const char *call_id = sip_message_header_get(msg, "Call-ID", &call_id_len);
-  if (call_id && call_id_len > 0) {
-    n = snprintf(resp + used, cap - used, "Call-ID: %.*s\r\n", (int)call_id_len, call_id);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      cseq_len;
-  const char *cseq = sip_message_header_get(msg, "CSeq", &cseq_len);
-  if (cseq && cseq_len > 0) {
-    n = snprintf(resp + used, cap - used, "CSeq: %.*s\r\n", (int)cseq_len, cseq);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  n = snprintf(resp + used, cap - used, "Content-Length: 0\r\n\r\n");
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  *out_len = used;
-  return resp;
-}
-
-static char *build_response_with_sdp(sip_message_t *msg, int code, const char *reason, const char *sdp, size_t sdp_len,
-                                     size_t *out_len) {
-  size_t cap  = 2048 + sdp_len;
-  char  *resp = malloc(cap);
-  if (!resp) return NULL;
-
-  size_t used = 0;
-  int    n;
-
-  n = snprintf(resp + used, cap - used, "SIP/2.0 %d %s\r\n", code, reason);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  size_t      via_len;
-  const char *via = sip_message_header_get(msg, "Via", &via_len);
-  if (via && via_len > 0) {
-    n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_len, via);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      from_len;
-  const char *from = sip_message_header_get(msg, "From", &from_len);
-  if (from && from_len > 0) {
-    n = snprintf(resp + used, cap - used, "From: %.*s\r\n", (int)from_len, from);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      to_len;
-  const char *to = sip_message_header_get(msg, "To", &to_len);
-  if (to && to_len > 0) {
-    n = snprintf(resp + used, cap - used, "To: %.*s\r\n", (int)to_len, to);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      call_id_len;
-  const char *call_id = sip_message_header_get(msg, "Call-ID", &call_id_len);
-  if (call_id && call_id_len > 0) {
-    n = snprintf(resp + used, cap - used, "Call-ID: %.*s\r\n", (int)call_id_len, call_id);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      cseq_len;
-  const char *cseq = sip_message_header_get(msg, "CSeq", &cseq_len);
-  if (cseq && cseq_len > 0) {
-    n = snprintf(resp + used, cap - used, "CSeq: %.*s\r\n", (int)cseq_len, cseq);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  n = snprintf(resp + used, cap - used, "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n", (int)sdp_len);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  if (sdp && sdp_len > 0) {
-    if (used + sdp_len >= cap) {
-      free(resp);
-      return NULL;
-    }
-    memcpy(resp + used, sdp, sdp_len);
-    used += sdp_len;
-  }
-
-  *out_len = used;
-  return resp;
-}
-
-static char *build_invite_to_destination(sip_message_t *msg, const char *dest_ext, const char *call_id,
-                                         const char *from_tag, const char *dest_ip, int dest_port, const char *sdp,
-                                         size_t sdp_len, const char *pbx_addr, size_t *out_len) {
-  size_t cap = 2048 + sdp_len;
-  char  *inv = malloc(cap);
-  if (!inv) return NULL;
-
-  size_t used = 0;
-  int    n;
-
-  n = snprintf(inv + used, cap - used, "INVITE sip:%s@%s:%d SIP/2.0\r\n", dest_ext, dest_ip, dest_port);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "Via: SIP/2.0/UDP %s;branch=z9hG4bKupbx%x\r\n", pbx_addr,
-               (unsigned int)time(NULL));
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "From: <sip:%%from_ext%%@%s>;tag=%s\r\n", pbx_addr, from_tag);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "To: <sip:%s@%s>\r\n", dest_ext, pbx_addr);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "Call-ID: %s\r\n", call_id);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "CSeq: 1 INVITE\r\n");
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "Contact: <sip:pbx@%s:5060>\r\n", pbx_addr);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  n = snprintf(inv + used, cap - used, "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n", (int)sdp_len);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(inv);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  if (sdp && sdp_len > 0) {
-    if (used + sdp_len >= cap) {
-      free(inv);
-      return NULL;
-    }
-    memcpy(inv + used, sdp, sdp_len);
-    used += sdp_len;
-  }
-
-  *out_len = used;
-  return inv;
+  return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
 }
 
 int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
@@ -479,6 +196,8 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
       return SCHED_ERROR;
     }
 
+    sip_transport_udp_set_fds(sip_fds);
+
     udata->state          = 1;
     udata->current_fd_idx = 1;
   }
@@ -518,248 +237,31 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
           return SCHED_RUNNING;
         }
 
+        log_hexdump_trace(udata->buf, (size_t)n);
+
         size_t resp_len = 0;
         char  *resp     = NULL;
 
         if (!sip_is_request(&udata->sip_msg)) {
-          log_trace("sip_udp: ignoring SIP response from %s:%d", src_ip, src_port);
+          registration_t *reg = registration_find_by_addr((const struct sockaddr *)&udata->src_addr);
+          resp = call_handle_response(&udata->sip_msg, &udata->src_addr, reg, ready_fd, &resp_len);
           sip_message_free(&udata->sip_msg);
+
+          if (resp) {
+            socklen_t dst_len =
+                (udata->src_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+            ssize_t sent = sendto(ready_fd, resp, resp_len, 0, (struct sockaddr *)&udata->src_addr, dst_len);
+            if (sent > 0) {
+              log_trace("sip_udp: sent %zd bytes response", sent);
+            } else {
+              log_error("sip_udp: sendto failed: %s", strerror(errno));
+            }
+            free(resp);
+          }
           return SCHED_RUNNING;
         }
 
-        if (udata->sip_msg.method_len == 8 && strncasecmp(udata->sip_msg.method, "REGISTER", 8) == 0) {
-          resp = sip_handle_register(&udata->sip_msg, &udata->src_addr, &resp_len);
-        } else if (udata->sip_msg.method_len == 6 && strncasecmp(udata->sip_msg.method, "INVITE", 6) == 0) {
-          char from_ext[64] = {0};
-          char to_ext[64]   = {0};
-          char call_id[256] = {0};
-          char from_tag[64] = {0};
-
-          sip_header_uri_extract_user(&udata->sip_msg, "From", from_ext, sizeof(from_ext));
-          sip_header_uri_extract_user(&udata->sip_msg, "To", to_ext, sizeof(to_ext));
-          sip_message_header_copy(&udata->sip_msg, "Call-ID", call_id, sizeof(call_id));
-
-          const char *from_header = sip_message_header_get(&udata->sip_msg, "From", NULL);
-          if (from_header) {
-            const char *tag = strstr(from_header, ";tag=");
-            if (tag) {
-              tag += 5;
-              const char *end = tag;
-              while (*end && *end != ';' && *end != '>' && *end != '\r' && *end != '\n') end++;
-              size_t tag_len = (size_t)(end - tag);
-              if (tag_len < sizeof(from_tag)) {
-                memcpy(from_tag, tag, tag_len);
-                from_tag[tag_len] = '\0';
-              }
-            }
-          }
-
-          if (!from_ext[0] || !to_ext[0] || !call_id[0] || !from_tag[0]) {
-            resp = build_response(&udata->sip_msg, 400, "Bad Request", &resp_len);
-          } else {
-            registration_t *src_reg = registration_find_by_addr((const struct sockaddr *)&udata->src_addr);
-            if (!src_reg) {
-              log_error("transport_udp: INVITE from unregistered source %s:%d", src_ip, src_port);
-              resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-            } else if (registration_is_pattern(src_reg->number)) {
-              if (!registration_match_pattern(src_reg->number, from_ext)) {
-                log_error("transport_udp: INVITE from %s does not match pattern %s", from_ext, src_reg->number);
-                resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-              } else {
-                const char *sdp     = udata->sip_msg.body;
-                size_t      sdp_len = udata->sip_msg.body_len;
-
-                char  *out_sdp         = NULL;
-                size_t out_sdp_len     = 0;
-                char  *out_dest_sdp    = NULL;
-                size_t out_dest_sdp_len = 0;
-
-                int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
-                                          &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
-
-                if (r == -1) {
-                  resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-                } else if (r == -2) {
-                  resp = build_response(&udata->sip_msg, 404, "Not Found", &resp_len);
-                } else {
-                  resp = build_response_with_sdp(&udata->sip_msg, 100, "Trying", out_sdp, out_sdp_len, &resp_len);
-                  if (out_sdp) free(out_sdp);
-
-                  call_t *c = call_find(call_id);
-                  if (c) {
-                    char dest_contact_host[256] = {0};
-                    int  dest_contact_port = 5060;
-
-                    if (c->dest_contact && c->dest_contact[0]) {
-                      const char *at = strchr(c->dest_contact, '@');
-                      if (at) {
-                        const char *host_start = at + 1;
-                        const char *colon = strchr(host_start, ':');
-                        if (colon) {
-                          size_t host_len = (size_t)(colon - host_start);
-                          if (host_len < sizeof(dest_contact_host)) {
-                            memcpy(dest_contact_host, host_start, host_len);
-                            dest_contact_host[host_len] = '\0';
-                          }
-                          dest_contact_port = atoi(colon + 1);
-                        } else {
-                          size_t host_len = strlen(host_start);
-                          if (host_len < sizeof(dest_contact_host)) {
-                            memcpy(dest_contact_host, host_start, host_len);
-                            dest_contact_host[host_len] = '\0';
-                          }
-                        }
-                      }
-                    }
-
-                    if (!dest_contact_host[0]) {
-                      if (c->dest_addr.ss_family == AF_INET) {
-                        struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
-                        inet_ntop(AF_INET, &sin->sin_addr, dest_contact_host, sizeof(dest_contact_host));
-                        dest_contact_port = ntohs(sin->sin_port);
-                      } else if (c->dest_addr.ss_family == AF_INET6) {
-                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
-                        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_contact_host, sizeof(dest_contact_host));
-                        dest_contact_port = ntohs(sin6->sin6_port);
-                      }
-                    }
-
-                    char  *inv     = NULL;
-                    size_t inv_len = 0;
-                    inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag,
-                                                      dest_contact_host, dest_contact_port,
-                                                      out_dest_sdp, out_dest_sdp_len, dest_contact_host, &inv_len);
-                    if (out_dest_sdp) free(out_dest_sdp);
-                    if (inv) {
-                      int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
-                      if (fd >= 0) {
-                        socklen_t dst_len =
-                            (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-                        sendto(fd, inv, inv_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
-                        close(fd);
-                      }
-                      free(inv);
-                    }
-                  }
-                }
-              }
-            } else {
-              if (strcmp(from_ext, src_reg->number) != 0) {
-                log_error("transport_udp: INVITE from %s does not match registered %s", from_ext, src_reg->number);
-                resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-              } else {
-                const char *sdp     = udata->sip_msg.body;
-                size_t      sdp_len = udata->sip_msg.body_len;
-
-                char  *out_sdp         = NULL;
-                size_t out_sdp_len     = 0;
-                char  *out_dest_sdp    = NULL;
-                size_t out_dest_sdp_len = 0;
-
-                int r = call_route_invite(from_ext, to_ext, call_id, from_tag, sdp, sdp_len, src_ip, src_port, &out_sdp,
-                                          &out_sdp_len, &out_dest_sdp, &out_dest_sdp_len);
-
-                if (r == -1) {
-                  resp = build_response(&udata->sip_msg, 403, "Forbidden", &resp_len);
-                } else if (r == -2) {
-                  resp = build_response(&udata->sip_msg, 404, "Not Found", &resp_len);
-                } else {
-                  resp = build_response_with_sdp(&udata->sip_msg, 100, "Trying", out_sdp, out_sdp_len, &resp_len);
-                  if (out_sdp) free(out_sdp);
-
-                  call_t *c = call_find(call_id);
-                  if (c) {
-                    char dest_contact_host[256] = {0};
-                    int  dest_contact_port = 5060;
-
-                    if (c->dest_contact && c->dest_contact[0]) {
-                      const char *at = strchr(c->dest_contact, '@');
-                      if (at) {
-                        const char *host_start = at + 1;
-                        const char *colon = strchr(host_start, ':');
-                        if (colon) {
-                          size_t host_len = (size_t)(colon - host_start);
-                          if (host_len < sizeof(dest_contact_host)) {
-                            memcpy(dest_contact_host, host_start, host_len);
-                            dest_contact_host[host_len] = '\0';
-                          }
-                          dest_contact_port = atoi(colon + 1);
-                        } else {
-                          size_t host_len = strlen(host_start);
-                          if (host_len < sizeof(dest_contact_host)) {
-                            memcpy(dest_contact_host, host_start, host_len);
-                            dest_contact_host[host_len] = '\0';
-                          }
-                        }
-                      }
-                    }
-
-                    if (!dest_contact_host[0]) {
-                      if (c->dest_addr.ss_family == AF_INET) {
-                        struct sockaddr_in *sin = (struct sockaddr_in *)&c->dest_addr;
-                        inet_ntop(AF_INET, &sin->sin_addr, dest_contact_host, sizeof(dest_contact_host));
-                        dest_contact_port = ntohs(sin->sin_port);
-                      } else if (c->dest_addr.ss_family == AF_INET6) {
-                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&c->dest_addr;
-                        inet_ntop(AF_INET6, &sin6->sin6_addr, dest_contact_host, sizeof(dest_contact_host));
-                        dest_contact_port = ntohs(sin6->sin6_port);
-                      }
-                    }
-
-                    char  *inv     = NULL;
-                    size_t inv_len = 0;
-                    inv = build_invite_to_destination(&udata->sip_msg, c->dest_ext, call_id, from_tag,
-                                                      dest_contact_host, dest_contact_port,
-                                                      out_dest_sdp, out_dest_sdp_len, dest_contact_host, &inv_len);
-                    if (out_dest_sdp) free(out_dest_sdp);
-                    if (inv) {
-                      int fd = socket(c->dest_addr.ss_family, SOCK_DGRAM, 0);
-                      if (fd >= 0) {
-                        socklen_t dst_len =
-                            (c->dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-                        sendto(fd, inv, inv_len, 0, (struct sockaddr *)&c->dest_addr, dst_len);
-                        close(fd);
-                      }
-                      free(inv);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        } else if (udata->sip_msg.method_len == 6 && strncasecmp(udata->sip_msg.method, "OPTIONS", 6) == 0) {
-          resp = build_method_not_allowed(&udata->sip_msg, &resp_len);
-        } else if (udata->sip_msg.method_len == 3 && strncasecmp(udata->sip_msg.method, "ACK", 3) == 0) {
-          resp = NULL;
-        } else if (udata->sip_msg.method_len == 3 && strncasecmp(udata->sip_msg.method, "BYE", 3) == 0) {
-          char call_id[256] = {0};
-          sip_message_header_copy(&udata->sip_msg, "Call-ID", call_id, sizeof(call_id));
-          if (call_id[0]) {
-            call_handle_bye(call_id);
-          }
-          resp = build_response(&udata->sip_msg, 200, "OK", &resp_len);
-        } else if (udata->sip_msg.method_len == 6 && strncasecmp(udata->sip_msg.method, "CANCEL", 6) == 0) {
-          char call_id[256] = {0};
-          sip_message_header_copy(&udata->sip_msg, "Call-ID", call_id, sizeof(call_id));
-          if (call_id[0]) {
-            call_t *c = call_find(call_id);
-            if (c) {
-              char src_ext[64]      = {0};
-              char from_header[256] = {0};
-              sip_message_header_copy(&udata->sip_msg, "From", from_header, sizeof(from_header));
-              sip_header_uri_extract_user(&udata->sip_msg, "From", src_ext, sizeof(src_ext));
-
-              int authorized = (strcmp(src_ext, c->source_ext) == 0 || strcmp(src_ext, c->dest_ext) == 0);
-
-              if (authorized) {
-                call_handle_cancel(call_id);
-              }
-            }
-          }
-          resp = build_response(&udata->sip_msg, 200, "OK", &resp_len);
-        } else {
-          resp = build_method_not_allowed(&udata->sip_msg, &resp_len);
-        }
+        resp = sip_dispatch(&udata->sip_msg, &udata->src_addr, ready_fd, &resp_len);
 
         sip_message_free(&udata->sip_msg);
 

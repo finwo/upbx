@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "common/digest_auth.h"
 #include "common/resp.h"
@@ -12,6 +13,7 @@
 #include "domain/pbx/nonce.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/sip/sip_message.h"
+#include "domain/pbx/sip/sip_proto.h"
 #include "rxi/log.h"
 
 #define REALM           "upbx"
@@ -123,106 +125,6 @@ static int parse_digest_param(const char *val, size_t val_len, const char *key, 
   return 0;
 }
 
-static char *build_response(int status_code, const char *reason, const sip_message_t *req, const char *www_authenticate,
-                            const char *contact, size_t *out_len) {
-  size_t cap  = 4096;
-  char  *resp = malloc(cap);
-  if (!resp) return NULL;
-
-  size_t used = 0;
-  int    n;
-
-  n = snprintf(resp + used, cap - used, "SIP/2.0 %d %s\r\n", status_code, reason);
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  size_t      via_len;
-  const char *via = sip_message_header_get(req, "Via", &via_len);
-  if (via && via_len > 0) {
-    n = snprintf(resp + used, cap - used, "Via: %.*s\r\n", (int)via_len, via);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      from_len;
-  const char *from = sip_message_header_get(req, "From", &from_len);
-  if (from && from_len > 0) {
-    n = snprintf(resp + used, cap - used, "From: %.*s\r\n", (int)from_len, from);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      to_len;
-  const char *to = sip_message_header_get(req, "To", &to_len);
-  if (to && to_len > 0) {
-    n = snprintf(resp + used, cap - used, "To: %.*s\r\n", (int)to_len, to);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      call_id_len;
-  const char *call_id = sip_message_header_get(req, "Call-ID", &call_id_len);
-  if (call_id && call_id_len > 0) {
-    n = snprintf(resp + used, cap - used, "Call-ID: %.*s\r\n", (int)call_id_len, call_id);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  size_t      cseq_len;
-  const char *cseq = sip_message_header_get(req, "CSeq", &cseq_len);
-  if (cseq && cseq_len > 0) {
-    n = snprintf(resp + used, cap - used, "CSeq: %.*s\r\n", (int)cseq_len, cseq);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  if (contact && contact[0]) {
-    n = snprintf(resp + used, cap - used, "Contact: %s\r\n", contact);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  if (www_authenticate && www_authenticate[0]) {
-    n = snprintf(resp + used, cap - used, "%s\r\n", www_authenticate);
-    if (n < 0 || (size_t)n >= cap - used) {
-      free(resp);
-      return NULL;
-    }
-    used += (size_t)n;
-  }
-
-  n = snprintf(resp + used, cap - used, "Content-Length: 0\r\n\r\n");
-  if (n < 0 || (size_t)n >= cap - used) {
-    free(resp);
-    return NULL;
-  }
-  used += (size_t)n;
-
-  if (out_len) *out_len = used;
-  return resp;
-}
-
 static char *build_401_response(const sip_message_t *req, const char *ext_number, size_t *out_len) {
   char nonce[128];
   nonce_generate(ext_number, nonce, sizeof(nonce));
@@ -231,7 +133,7 @@ static char *build_401_response(const sip_message_t *req, const char *ext_number
   snprintf(www_auth, sizeof(www_auth), "WWW-Authenticate: Digest realm=\"%s\", nonce=\"%s\", algorithm=MD5", REALM,
            nonce);
 
-  return build_response(401, "Unauthorized", req, www_auth, NULL, out_len);
+  return sip_proto_build_response(req, 401, "Unauthorized", www_auth, NULL, 0, out_len);
 }
 
 static resp_object *get_extension_config(const char *number) {
@@ -246,13 +148,21 @@ static resp_object *get_extension_config(const char *number) {
   return sec;
 }
 
-char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *remote_addr, size_t *response_len) {
+char *sip_handle_register(
+  sip_message_t *msg,
+  const struct sockaddr_storage *remote_addr,
+  registration_t *registration,
+  int listen_fd,
+  size_t *response_len
+) {
+  (void)registration;
+
   if (!msg || !sip_is_request(msg)) {
-    return build_response(400, "Bad Request", msg, NULL, NULL, response_len);
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
   }
 
   if (msg->method_len != 8 || strncasecmp(msg->method, "REGISTER", 8) != 0) {
-    return build_response(405, "Method Not Allowed", msg, NULL, NULL, response_len);
+    return sip_proto_build_response(msg, 405, "Method Not Allowed", NULL, NULL, 0, response_len);
   }
 
   char ext_number[128] = "";
@@ -296,7 +206,7 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
   normalize_ext_number(username, strlen(username), ext_number, sizeof(ext_number));
 
   if (ext_number[0] == '\0') {
-    return build_response(400, "Bad Request", msg, NULL, NULL, response_len);
+    return sip_proto_build_response(msg, 400, "Bad Request", NULL, NULL, 0, response_len);
   }
 
   if (nonce_validate(nonce, ext_number) != 0) {
@@ -340,25 +250,27 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
   char contact[512] = "";
   sip_message_header_copy(msg, "Contact", contact, sizeof(contact));
 
+  char to_header[512] = "";
+  sip_message_header_copy(msg, "To", to_header, sizeof(to_header));
+
+  char pbx_addr[256] = "";
+  if (to_header[0]) {
+    char port[32];
+    sip_uri_extract_host_port(to_header, strlen(to_header), pbx_addr, sizeof(pbx_addr), port, sizeof(port));
+  }
+
   const char *group = group_find_for_extension(ext_number);
 
-  log_info("sip_handler: REGISTER from %s, Contact: %s, Expires: %d, group: %s", ext_number,
-           contact[0] ? contact : "(none)", expires, group ? group : "(none)");
+  log_info("sip_handler: REGISTER from %s, Contact: %s, PBX addr: %s, Expires: %d, group: %s", ext_number,
+           contact[0] ? contact : "(none)", pbx_addr[0] ? pbx_addr : "(none)", expires, group ? group : "(none)");
 
   if (expires == 0 || contact[0] == '\0') {
     registration_remove(ext_number);
-    return build_response(200, "OK", msg, NULL, NULL, response_len);
+    return sip_proto_build_response(msg, 200, "OK", NULL, NULL, 0, response_len);
   }
 
-  if (registration_add(ext_number, contact, group, (const struct sockaddr *)remote_addr, expires) != 0) {
-    return build_response(500, "Server Internal Error", msg, NULL, NULL, response_len);
-  }
-
-  char expires_header[64];
-  if (expires > 0) {
-    snprintf(expires_header, sizeof(expires_header), "Expires: %d\r\n", expires);
-  } else {
-    expires_header[0] = '\0';
+  if (registration_add(ext_number, contact, group, pbx_addr[0] ? pbx_addr : NULL, (const struct sockaddr *)remote_addr, listen_fd, expires) != 0) {
+    return sip_proto_build_response(msg, 500, "Server Internal Error", NULL, NULL, 0, response_len);
   }
 
   char contact_resp[600];
@@ -368,18 +280,7 @@ char *sip_handle_register(sip_message_t *msg, const struct sockaddr_storage *rem
     contact_resp[0] = '\0';
   }
 
-  char *resp = build_response(200, "OK", msg, NULL, contact_resp[0] ? contact_resp : NULL, response_len);
-
-  if (resp && expires > 0) {
-    size_t new_len = *response_len + strlen(expires_header);
-    char  *new_resp = realloc(resp, new_len + 1);
-    if (new_resp) {
-      memcpy(new_resp + *response_len, expires_header, strlen(expires_header));
-      new_resp[new_len] = '\0';
-      *response_len = new_len;
-      resp = new_resp;
-    }
-  }
+  char *resp = sip_proto_build_response(msg, 200, "OK", contact_resp[0] ? contact_resp : NULL, NULL, 0, response_len);
 
   log_info("sip_handler: 200 OK to %s, Expires: %d", ext_number, expires);
 
