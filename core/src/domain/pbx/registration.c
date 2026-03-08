@@ -113,7 +113,7 @@ pbx_registration_t *pbx_registration_find(const char *extension) {
   return reg;
 }
 
-pbx_registration_t *pbx_registration_create(const char *extension, const char *contact, int fd, const struct sockaddr *remote_addr, int expires) {
+pbx_registration_t *pbx_registration_create(const char *extension, const char *contact, int fd, const struct sockaddr *remote_addr, int expires, const char *pbx_addr) {
   (void)fd;
 
   pbx_extension_t *ext = pbx_extension_find(extension);
@@ -142,7 +142,7 @@ pbx_registration_t *pbx_registration_create(const char *extension, const char *c
   }
   resp_map_set(obj, "remote_addr", resp_simple_init(addr_str));
 
-  resp_map_set(obj, "pbx_addr", resp_simple_init(""));
+  resp_map_set(obj, "pbx_addr", resp_simple_init(pbx_addr ? pbx_addr : ""));
 
   char *out_buf = NULL;
   size_t out_len = 0;

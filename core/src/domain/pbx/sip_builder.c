@@ -31,6 +31,7 @@ char *sip_build_response(int status_code, const char *reason, const sip_message_
   if (!reason) reason = status_reason(status_code);
 
   size_t buf_size = 256;
+  if (req->uri) buf_size += strlen(req->uri);
   if (req->via) buf_size += strlen(req->via);
   if (req->from) buf_size += strlen(req->from);
   if (req->to) buf_size += strlen(req->to);
@@ -43,9 +44,13 @@ char *sip_build_response(int status_code, const char *reason, const sip_message_
   if (!buf) return NULL;
   buf[0] = '\0';
 
-  char status_line[128];
-  snprintf(status_line, sizeof(status_line), "SIP/2.0 %d %s\r\n", status_code, reason);
-  strcat(buf, status_line);
+  char request_line[128];
+  if (status_code == 0 && req->method && req->uri) {
+    snprintf(request_line, sizeof(request_line), "%s %s SIP/2.0\r\n", req->method, req->uri);
+  } else {
+    snprintf(request_line, sizeof(request_line), "SIP/2.0 %d %s\r\n", status_code, reason);
+  }
+  strcat(buf, request_line);
 
   if (req->via) {
     strcat(buf, "Via: ");

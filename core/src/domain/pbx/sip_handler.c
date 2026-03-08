@@ -8,6 +8,7 @@
 #include "common/digest_auth.h"
 #include "common/hexdump.h"
 #include "common/resp.h"
+#include "common/socket_util.h"
 #include "domain/pbx/call.h"
 #include "domain/pbx/extension.h"
 #include "domain/pbx/media_proxy.h"
@@ -143,7 +144,9 @@ static void handle_register(pbx_sip_context_t *ctx) {
     expires = EXPIRES_MAX;
   }
 
-  pbx_registration_create(user, contact, ctx->fd, (struct sockaddr *)&ctx->remote_addr, expires);
+  char *host_port = sip_request_uri_host_port(msg);
+  pbx_registration_create(user, contact, ctx->fd, (struct sockaddr *)&ctx->remote_addr, expires, host_port);
+  free(host_port);
 
   char expires_header[64];
   snprintf(expires_header, sizeof(expires_header), "Expires: %d", expires);
@@ -388,8 +391,13 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   snprintf(new_uri, sizeof(new_uri), "sip:%s@%s", dst_reg->extension, dst_reg->pbx_addr[0] ? dst_reg->pbx_addr : src_pbx_addr);
   sip_rewrite_request_uri(msg, new_uri);
 
+  char via_header[256];
+  snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;rport", dst_reg->pbx_addr[0] ? dst_reg->pbx_addr : src_pbx_addr);
+  sip_prepend_via(msg, via_header);
+
+  int contact_port = dst_sock_info.port > 0 ? dst_sock_info.port : 5060;
   char forward_contact[256];
-  snprintf(forward_contact, sizeof(forward_contact), "sip:%s@%s:%d", dst_reg->extension, src_pbx_addr, dst_sock_info.port);
+  snprintf(forward_contact, sizeof(forward_contact), "sip:%s@%s:%d", dst_reg->extension, src_pbx_addr, contact_port);
   
   char fwd_headers[512];
   snprintf(fwd_headers, sizeof(fwd_headers),
@@ -398,7 +406,11 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   
   char *invite = sip_build_response(0, "INVITE", msg, fwd_headers, sdp_to_use);
   
-  log_debug("pbx: INVITE - forwarding to %s at %s", dst_reg->extension, dst_reg->contact);
+  char dst_addr_str[128] = "";
+  sockaddr_to_string((struct sockaddr *)&dst_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
+  log_debug("pbx: INVITE - forwarding to %s at %s (remote_addr=%s) dst_pbx_addr=%s",
+            dst_reg->extension, dst_reg->contact, dst_addr_str, dst_reg->pbx_addr);
+  log_hexdump_trace(invite, strlen(invite));
   
   sendto(ctx->fd, invite, strlen(invite), 0,
          (struct sockaddr *)&dst_reg->remote_addr, sizeof(dst_reg->remote_addr));
