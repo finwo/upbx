@@ -17,7 +17,9 @@ static int call_compare(const void *a, const void *b, void *udata) {
 
 static void call_purge(void *item, void *udata) {
   (void)udata;
+  log_debug("pbx: call_purge - item=%p", item);
   pbx_call_t *call = (pbx_call_t *)item;
+  log_debug("pbx: call_purge - call_id=%s", call->call_id ? call->call_id : "(null)");
   free(call->call_id);
   free(call->source_extension);
   free(call->destination_extension);
@@ -26,7 +28,9 @@ static void call_purge(void *item, void *udata) {
   free(call->rtp_session_id);
   free(call->source_advertise);
   free(call->dest_advertise);
+  log_debug("pbx: call_purge - freeing call struct");
   free(call);
+  log_debug("pbx: call_purge - done");
 }
 
 void pbx_call_init(void) {
@@ -70,14 +74,18 @@ pbx_call_t *pbx_call_find(const char *call_id) {
 }
 
 void pbx_call_delete(const char *call_id) {
+  log_debug("pbx: call_delete - call_id=%s calls=%p", call_id ? call_id : "(null)", calls);
   if (!calls) return;
   pbx_call_t key = { .call_id = (char *)call_id };
   pbx_call_t *call = (pbx_call_t *)mindex_get(calls, &key);
-  if (call) {
-    mindex_delete(calls, call);
-    call_purge(call, NULL);
-    log_debug("pbx: deleted call %s", call_id);
+  log_debug("pbx: call_delete - call=%p", call);
+  if (!call) {
+    log_debug("pbx: call_delete - call not found, returning");
+    return;
   }
+  log_debug("pbx: call_delete - deleting call");
+  mindex_delete(calls, call);
+  log_debug("pbx: call_delete - call deleted");
 }
 
 void pbx_call_set_rtp_info(const char *call_id, const char *session_id, int src_port, int dst_port, const char *src_adv, const char *dst_adv) {

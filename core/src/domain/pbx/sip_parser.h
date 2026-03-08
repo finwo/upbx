@@ -29,7 +29,6 @@ sip_message_t *sip_parse(const char *buf, size_t len);
 int sip_is_request(const sip_message_t *msg);
 int sip_response_status_code(const sip_message_t *msg);
 const char *sip_header_get(const sip_message_t *msg, const char *name);
-char *sip_header_copy(const sip_message_t *msg, const char *name);
 
 char *sip_request_uri_user(const sip_message_t *msg);
 char *sip_request_uri_user_from_to(const sip_message_t *msg);

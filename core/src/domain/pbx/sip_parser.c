@@ -58,14 +58,14 @@ void sip_message_free(sip_message_t *msg) {
 
 static char *header_value(sip_message_t *msg, const char *name) {
   if (!msg || !name) return NULL;
-  if (strcmp(name, "via") == 0) return msg->via;
-  if (strcmp(name, "from") == 0) return msg->from;
-  if (strcmp(name, "to") == 0) return msg->to;
-  if (strcmp(name, "call-id") == 0) return msg->call_id;
-  if (strcmp(name, "contact") == 0) return msg->contact;
-  if (strcmp(name, "authorization") == 0) return msg->authorization;
-  if (strcmp(name, "www-authenticate") == 0) return msg->www_authenticate;
-  if (strcmp(name, "content-type") == 0) return msg->content_type;
+  if (strcasecmp(name, "via") == 0) return msg->via;
+  if (strcasecmp(name, "from") == 0) return msg->from;
+  if (strcasecmp(name, "to") == 0) return msg->to;
+  if (strcasecmp(name, "call-id") == 0 || strcasecmp(name, "callid") == 0) return msg->call_id;
+  if (strcasecmp(name, "contact") == 0) return msg->contact;
+  if (strcasecmp(name, "authorization") == 0) return msg->authorization;
+  if (strcasecmp(name, "www-authenticate") == 0) return msg->www_authenticate;
+  if (strcasecmp(name, "content-type") == 0) return msg->content_type;
   return NULL;
 }
 
@@ -179,11 +179,6 @@ int sip_response_status_code(const sip_message_t *msg) {
 
 const char *sip_header_get(const sip_message_t *msg, const char *name) {
   return header_value(msg, name);
-}
-
-char *sip_header_copy(const sip_message_t *msg, const char *name) {
-  char *v = header_value(msg, name);
-  return v ? strdup(v) : NULL;
 }
 
 char *sip_request_uri_user(const sip_message_t *msg) {

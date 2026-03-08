@@ -20,17 +20,39 @@ typedef struct {
   char recv_buf[4096];
 } pbx_transport_udata_t;
 
-static char *extract_extension_from_from_header(const sip_message_t *msg) {
-  if (!msg || !msg->from) return NULL;
-  const char *from = msg->from;
-  if (strncmp(from, "sip:", 4) == 0) {
-    const char *user = from + 4;
+static char *extract_extension_from_uri(const char *uri) {
+  if (!uri) return NULL;
+  const char *start = uri;
+  if (start[0] == '<') {
+    start++;
+    const char *end = strchr(start, '>');
+    if (end) {
+      size_t len = (size_t)(end - start);
+      char *tmp = malloc(len + 1);
+      memcpy(tmp, start, len);
+      tmp[len] = '\0';
+      char *result = extract_extension_from_uri(tmp);
+      free(tmp);
+      return result;
+    }
+  }
+  if (strncmp(start, "sip:", 4) == 0) {
+    const char *user = start + 4;
     const char *at = strchr(user, '@');
     if (at) {
       return strndup(user, at - user);
     }
   }
   return NULL;
+}
+
+static char *extract_extension_from_from_header(const sip_message_t *msg) {
+  if (!msg || !msg->from) return NULL;
+  const char *from = msg->from;
+  if (strncmp(from, "sip:", 4) == 0) {
+    return extract_extension_from_uri(from + 4);
+  }
+  return extract_extension_from_uri(from);
 }
 
 static void pbx_sip_context_resolve_registration(pbx_sip_context_t *ctx) {
@@ -40,60 +62,46 @@ static void pbx_sip_context_resolve_registration(pbx_sip_context_t *ctx) {
     return;
   }
 
-  char *extension = NULL;
   int is_register = (strcmp(msg->method, "REGISTER") == 0);
 
   if (is_register) {
-    extension = sip_request_uri_user_from_to(msg);
-  } else {
-    extension = extract_extension_from_from_header(msg);
-  }
-
-  if (extension) {
-    pbx_registration_t *reg = pbx_registration_find(extension);
-    if (reg) {
-      if (is_register || sockaddr_equal((struct sockaddr *)&ctx->remote_addr, (struct sockaddr *)&reg->remote_addr)) {
+    char *extension = sip_request_uri_user_from_to(msg);
+    if (extension) {
+      pbx_registration_t *reg = pbx_registration_find(extension);
+      if (reg) {
         char *host_port = sip_request_uri_host_port(msg);
         if (host_port) {
           pbx_registration_update_pbx_addr(extension, host_port);
           free(host_port);
         }
         ctx->reg = reg;
-      } else {
-        free(reg);
-        ctx->reg = NULL;
       }
-    } else if (!is_register) {
-      pbx_registration_t *reg_by_addr = pbx_registration_find_by_remote_addr((struct sockaddr *)&ctx->remote_addr);
-      if (reg_by_addr) {
-        char *host_port = sip_request_uri_host_port(msg);
-        if (host_port) {
-          pbx_registration_update_pbx_addr(reg_by_addr->extension, host_port);
-          free(host_port);
-        }
-        ctx->reg = reg_by_addr;
-      } else {
-        ctx->reg = NULL;
-      }
-    } else {
-      ctx->reg = NULL;
+      free(extension);
     }
-    free(extension);
-  } else if (!is_register) {
-    pbx_registration_t *reg_by_addr = pbx_registration_find_by_remote_addr((struct sockaddr *)&ctx->remote_addr);
-    if (reg_by_addr) {
-      char *host_port = sip_request_uri_host_port(msg);
-      if (host_port) {
-        pbx_registration_update_pbx_addr(reg_by_addr->extension, host_port);
-        free(host_port);
-      }
-      ctx->reg = reg_by_addr;
-    } else {
-      ctx->reg = NULL;
+    return;
+  }
+
+  pbx_registration_t *reg = pbx_registration_find_by_remote_addr((struct sockaddr *)&ctx->remote_addr);
+  if (!reg) {
+    ctx->reg = NULL;
+    return;
+  }
+
+  char *from_ext = extract_extension_from_from_header(msg);
+  if (from_ext && strcmp(from_ext, reg->extension) == 0) {
+    char *host_port = sip_request_uri_host_port(msg);
+    if (host_port) {
+      pbx_registration_update_pbx_addr(reg->extension, host_port);
+      free(host_port);
     }
+    ctx->reg = reg;
   } else {
+    log_warn("pbx: registration lookup - From header %s doesn't match registration %s", 
+              from_ext ? from_ext : "(null)", reg->extension);
+    free(reg);
     ctx->reg = NULL;
   }
+  free(from_ext);
 }
 
 int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
