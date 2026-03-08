@@ -10,13 +10,19 @@
 #include "cofyc/argparse.h"
 #include "common/scheduler.h"
 #include "domain/config.h"
-#include "domain/pbx/registration.h"
-#include "domain/pbx/sip/transport_udp.h"
-#include "domain/pbx/sip/udphole_client.h"
+#include "domain/pbx/media_proxy.h"
+#include "domain/pbx/pbx.h"
 #include "infrastructure/config.h"
 #include "interface/api/server.h"
 #include "interface/cli/common.h"
 #include "rxi/log.h"
+
+void pbx_media_proxy_init(void);
+void pbx_init(void);
+
+static void udphole_client_init_global(void) {
+  pbx_media_proxy_init();
+}
 
 /// # DAEMON
 /// **daemon** is the command that runs the SIP PBX server. It has no subcommands, only local options.
@@ -101,13 +107,16 @@ int cli_cmd_daemon(int argc, const char **argv) {
     do_daemonize();
   }
 
-  domain_config_init();
+  config_init();
 
   udphole_client_init_global();
+
+  pbx_init();
 
   sched_create(api_server_pt, NULL);
   sched_create(sip_transport_udp_pt, NULL);
   sched_create(registration_cleanup_pt, NULL);
+  sched_create(addrmap_cleanup_pt, NULL);
   sched_create(udphole_keepalive_pt, NULL);
 
   log_info("upbx: daemon started");

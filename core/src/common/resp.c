@@ -14,7 +14,6 @@
 static void resp_free_internal(resp_object *o);
 
 int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
-  log_trace("resp_read_buf: START buf=%p len=%zu out_obj=%p", (void*)buf, len, (void*)out_obj);
   if (!out_obj) return -1;
 
   const char *start = buf;
@@ -45,13 +44,10 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
   remaining--;
   p++;
 
-  log_trace("resp_read_buf: type_c='%c' (0x%02x)", type_c >= 32 ? type_c : '.', type_c);
-
   // And act accordingly
   switch((char)type_c) {
 
     case '+':
-      log_trace("resp_read_buf: case '+' SIMPLE");
       output->type = output->type ? output->type : RESPT_SIMPLE;
       if (output->type != RESPT_SIMPLE) {
         return -2; // Mismatching types
@@ -73,18 +69,15 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          log_trace("resp_read_buf: SIMPLE incomplete, returning -1");
           return -1; // Incomplete, need more data
         }
         line[i] = '\0';
         if (output->u.s) free(output->u.s);
         output->u.s = strdup(line);
-        log_trace("resp_read_buf: SIMPLE value='%s'", line);
       }
       break;
 
     case '-':
-      log_trace("resp_read_buf: case '-' ERROR");
       output->type = output->type ? output->type : RESPT_ERROR;
       if (output->type != RESPT_ERROR) {
         return -2; // Mismatching types
@@ -106,18 +99,15 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          log_trace("resp_read_buf: ERROR incomplete, returning -1");
           return -1; // Incomplete, need more data
         }
         line[i] = '\0';
         if (output->u.s) free(output->u.s);
         output->u.s = strdup(line);
-        log_trace("resp_read_buf: ERROR value='%s'", line);
       }
       break;
 
     case ':':
-      log_trace("resp_read_buf: case ':' INT");
       output->type = output->type ? output->type : RESPT_INT;
       if (output->type != RESPT_INT) {
         return -2; // Mismatching types
@@ -140,17 +130,14 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          log_trace("resp_read_buf: INT incomplete, returning -1");
           return -1; // Incomplete, need more data
         }
         line[i] = '\0';
         output->u.i = strtoll(line, NULL, 10);
-        log_trace("resp_read_buf: INT value=%lld", output->u.i);
       }
       break;
 
     case '$':
-      log_trace("resp_read_buf: case '$' BULK");
       output->type = output->type ? output->type : RESPT_BULK;
       if (output->type != RESPT_BULK) {
         return -2; // Mismatching types
@@ -173,12 +160,10 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          log_trace("resp_read_buf: BULK length incomplete, returning -1");
           return -1; // Incomplete, need more data
         }
         line[i] = '\0';
         long data_length = strtol(line, NULL, 10);
-        log_trace("resp_read_buf: BULK data_length=%ld", data_length);
 
         if (data_length < 0) {
           output->u.s = NULL;
@@ -190,7 +175,6 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
             p += 2;
             remaining -= 2;
           } else {
-            log_trace("resp_read_buf: BULK zero incomplete, returning -1");
             return -1; // Incomplete, need more data
           }
           if (output->u.s) free(output->u.s);
@@ -198,7 +182,6 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
         } else {
           // Read data_length bytes
           if ((size_t)data_length > remaining) {
-            log_trace("resp_read_buf: BULK not enough data, returning -1");
             return -1;  // not enough data
           }
           if (output->u.s) free(output->u.s);
@@ -215,7 +198,6 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           } else {
             free(output->u.s);
             output->u.s = NULL;
-            log_trace("resp_read_buf: BULK data incomplete, returning -1");
             return -1; // Incomplete, need more data
           }
         }
@@ -223,7 +205,6 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
       break;
 
     case '*':
-      log_trace("resp_read_buf: case '*' ARRAY");
       output->type = output->type ? output->type : RESPT_ARRAY;
       if (output->type != RESPT_ARRAY) {
         return -2; // Mismatching types
@@ -246,15 +227,12 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          log_trace("resp_read_buf: ARRAY count incomplete, returning -1");
           return -1; // Incomplete, need more data
         }
         line[i] = '\0';
         long items = strtol(line, NULL, 10);
-        log_trace("resp_read_buf: ARRAY items=%ld", items);
 
         if (items < 0 || items > 65536) {
-          log_trace("resp_read_buf: ARRAY items invalid, returning -1");
           return -1;
         }
 
@@ -266,20 +244,15 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
 
         for (size_t j = 0; j < (size_t)items; j++) {
           if (remaining == 0) {
-            log_trace("resp_read_buf: ARRAY elem[%zu] no remaining, returning -1", j);
             return -1;
           }
           resp_object *element = NULL;
-          log_trace("resp_read_buf: ARRAY calling recursive for elem[%zu]", j);
           int element_consumed = resp_read_buf(p, remaining, &element);
-          log_trace("resp_read_buf: ARRAY elem[%zu] consumed=%d element=%p", j, element_consumed, (void*)element);
           if (element_consumed <= 0) {
-            log_trace("resp_read_buf: ARRAY elem[%zu] failed, returning -1", j);
             return -1;
           }
           if (resp_array_append_obj(output, element) != 0) {
             resp_free(element);
-            log_trace("resp_read_buf: ARRAY append failed, returning -1");
             return -1;
           }
           p += element_consumed;
@@ -289,11 +262,9 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
       break;
 
     default:
-      log_trace("resp_read_buf: default case, returning -1");
       return -1;
   }
 
-  log_trace("resp_read_buf: returning %d", (int)(p - start));
   return (int)(p - start);
 }
 

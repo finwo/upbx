@@ -4,7 +4,6 @@
 #include <unistd.h>
 
 #include "common/resp.h"
-#include "domain/pbx/registration.h"
 #include "finwo/assert.h"
 
 void test_pattern_is_pattern(void) {
