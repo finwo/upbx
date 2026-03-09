@@ -558,6 +558,17 @@ static void handle_ack(pbx_sip_context_t *ctx) {
     if (other_ext) {
       pbx_registration_t *other_reg = pbx_registration_find(other_ext);
       if (other_reg) {
+        // Rewrite Request-URI for the other party
+        char new_uri[256];
+        char *other_pbx_addr = other_reg->pbx_addr[0] ? other_reg->pbx_addr : ctx->reg->pbx_addr;
+        snprintf(new_uri, sizeof(new_uri), "sip:%s@%s", other_ext, other_pbx_addr);
+        sip_rewrite_request_uri(msg, new_uri);
+
+        // Add to-tag when forwarding to the destination (callee)
+        if (strcmp(call->source_extension, ctx->reg->extension) == 0 && call->to_tag) {
+          sip_update_to_tag(msg, call->to_tag);
+        }
+
         // Build Contact header - use target's pbx_addr
         char contact_header[256];
         snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
