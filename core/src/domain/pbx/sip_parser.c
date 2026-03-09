@@ -319,6 +319,37 @@ void sip_strip_top_via(sip_message_t *msg) {
   }
 }
 
+void sip_update_to_tag(sip_message_t *msg, const char *tag) {
+  if (!msg || !tag) return;
+
+  free(msg->to_tag);
+  msg->to_tag = strdup(tag);
+
+  if (!msg->to) return;
+
+  const char *existing_tag = strstr(msg->to, "tag=");
+  if (existing_tag) {
+    size_t base_len = existing_tag - msg->to;
+    char *new_to = malloc(base_len + strlen(tag) + 6);
+    memcpy(new_to, msg->to, base_len);
+    snprintf(new_to + base_len, strlen(tag) + 6, "tag=%s", tag);
+    free(msg->to);
+    msg->to = new_to;
+  } else {
+    char *new_to = malloc(strlen(msg->to) + strlen(tag) + 8);
+    const char *gt = strchr(msg->to, '>');
+    if (gt) {
+      size_t prefix_len = gt - msg->to;
+      memcpy(new_to, msg->to, prefix_len);
+      snprintf(new_to + prefix_len, strlen(tag) + 8, ">;tag=%s", tag);
+    } else {
+      snprintf(new_to, strlen(msg->to) + strlen(tag) + 8, "%s;tag=%s", msg->to, tag);
+    }
+    free(msg->to);
+    msg->to = new_to;
+  }
+}
+
 static char *parse_auth_param(const char *auth_header, const char *param) {
   if (!auth_header || !param) return NULL;
   const char *p = strstr(auth_header, param);

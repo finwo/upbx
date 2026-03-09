@@ -29,6 +29,8 @@ static void call_purge(void *item, void *udata) {
   free(call->rtp_session_id);
   free(call->source_media_ports);
   free(call->dest_media_ports);
+  free(call->source_rtcp_ports);
+  free(call->dest_rtcp_ports);
   free(call->source_advertise);
   free(call->dest_advertise);
   free(call->source_via);
@@ -93,7 +95,7 @@ void pbx_call_delete(const char *call_id) {
   log_debug("pbx: call_delete - call deleted");
 }
 
-void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count, const char *src_adv, const char *dst_adv) {
+void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count, int *src_rtcp_ports, int src_rtcp_count, int *dst_rtcp_ports, int dst_rtcp_count, const char *src_adv, const char *dst_adv) {
   pbx_call_t *call = pbx_call_find(call_id);
   if (!call) return;
 
@@ -109,11 +111,23 @@ void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count,
   }
   call->dest_media_port_count = dst_count;
 
+  call->source_rtcp_ports = src_rtcp_count > 0 && src_rtcp_ports ? malloc(src_rtcp_count * sizeof(int)) : NULL;
+  if (call->source_rtcp_ports && src_rtcp_ports) {
+    memcpy(call->source_rtcp_ports, src_rtcp_ports, src_rtcp_count * sizeof(int));
+  }
+  call->source_rtcp_port_count = src_rtcp_count;
+
+  call->dest_rtcp_ports = dst_rtcp_count > 0 && dst_rtcp_ports ? malloc(dst_rtcp_count * sizeof(int)) : NULL;
+  if (call->dest_rtcp_ports && dst_rtcp_ports) {
+    memcpy(call->dest_rtcp_ports, dst_rtcp_ports, dst_rtcp_count * sizeof(int));
+  }
+  call->dest_rtcp_port_count = dst_rtcp_count;
+
   call->source_advertise = src_adv ? strdup(src_adv) : NULL;
   call->dest_advertise = dst_adv ? strdup(dst_adv) : NULL;
 
-  log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_adv=%s dst_adv=%s",
-            call_id, src_count, dst_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
+  log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_rtcp=%d dst_rtcp=%d src_adv=%s dst_adv=%s",
+            call_id, src_count, dst_count, src_rtcp_count, dst_rtcp_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
 }
 
 void pbx_call_set_via(const char *call_id, const char *src_via, const char *dst_via) {
@@ -138,4 +152,12 @@ void pbx_call_set_answered(const char *call_id) {
   if (!call) return;
   call->answered_at = time(NULL);
   log_debug("pbx: call %s answered at %ld", call_id, (long)call->answered_at);
+}
+
+void pbx_call_set_to_tag(const char *call_id, const char *to_tag) {
+  pbx_call_t *call = pbx_call_find(call_id);
+  if (!call) return;
+  free(call->to_tag);
+  call->to_tag = to_tag ? strdup(to_tag) : NULL;
+  log_debug("pbx: call %s to_tag=%s", call_id, to_tag ? to_tag : "(null)");
 }

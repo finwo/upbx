@@ -187,7 +187,7 @@ static int count_media_streams(const char *sdp) {
   return count;
 }
 
-static char *rewrite_sdp_for_proxy(const char *sdp, const char *advertise_ip, int *ports, int port_count) {
+static char *rewrite_sdp_for_proxy(const char *sdp, const char *advertise_ip, int *ports, int port_count, int *rtcp_ports, int rtcp_port_count) {
   if (!sdp || !ports || port_count == 0) return NULL;
 
   char *result = malloc(4096);
@@ -223,7 +223,6 @@ static char *rewrite_sdp_for_proxy(const char *sdp, const char *advertise_ip, in
           if (sscanf(buf, "%63s %d %255[^\n]", media, &port, rest) >= 2) {
             buf[0] = '\0';
             snprintf(buf, sizeof(buf), "%s %d %s", media, ports[port_idx], rest);
-            port_idx++;
           }
         }
       } else if (line_len >= 2 && buf[0] == 'c' && buf[1] == '=') {
@@ -238,12 +237,29 @@ static char *rewrite_sdp_for_proxy(const char *sdp, const char *advertise_ip, in
           buf[0] = '\0';
           snprintf(buf, sizeof(buf), "%s %s %s IN IP4 %s", username, sess_id, sess_version, advertise_ip && advertise_ip[0] ? advertise_ip : "");
         }
+      } else if (line_len >= 2 && buf[0] == 'a' && buf[1] == '=') {
+        // Strip a=rtcp-mux and any existing a=rtcp: lines
+        if (strncmp(buf, "a=rtcp-mux", 10) == 0 || strncmp(buf, "a=rtcp:", 7) == 0) {
+          goto next_line;
+        }
       }
 
       strcat(result, buf);
       strcat(result, "\r\n");
+
+      // After m= line, inject a=rtcp:<port> for the corresponding RTCP socket
+      if (line_len >= 2 && buf[0] == 'm' && buf[1] == '=') {
+        if (port_idx < rtcp_port_count && rtcp_ports) {
+          char rtcp_line[128];
+          snprintf(rtcp_line, sizeof(rtcp_line), "a=rtcp:%d", rtcp_ports[port_idx]);
+          strcat(result, rtcp_line);
+          strcat(result, "\r\n");
+        }
+        port_idx++;
+      }
     }
 
+next_line:
     if (line_end) {
       line_start = line_end + 1;
       if (*line_start == '\0') break;
@@ -397,25 +413,42 @@ static void handle_invite(pbx_sip_context_t *ctx) {
 
   int src_ports[16] = {0};
   int dst_ports[16] = {0};
+  int src_rtcp_ports[16] = {0};
+  int dst_rtcp_ports[16] = {0};
   char src_advertise_addr[16][64] = {0};
   char dst_advertise_addr[16][64] = {0};
 
+  // Create RTP and RTCP sockets interleaved per stream:
+  // src-rtp, src-rtcp, dst-rtp, dst-rtcp for each stream.
+  // This ensures a non-compliant extension sending RTCP to rtp_port+1
+  // hits the RTCP socket instead of another extension's media socket.
   for (int i = 0; i < num_streams; i++) {
-    char src_socket_id[128], dst_socket_id[128];
+    char src_socket_id[128], src_rtcp_id[128];
+    char dst_socket_id[128], dst_rtcp_id[128];
     snprintf(src_socket_id, sizeof(src_socket_id), "%s-src-%d", msg->call_id, i);
+    snprintf(src_rtcp_id, sizeof(src_rtcp_id), "%s-src-rtcp-%d", msg->call_id, i);
     snprintf(dst_socket_id, sizeof(dst_socket_id), "%s-dst-%d", msg->call_id, i);
+    snprintf(dst_rtcp_id, sizeof(dst_rtcp_id), "%s-dst-rtcp-%d", msg->call_id, i);
 
     pbx_media_proxy_socket_info_t src_info = {0};
+    pbx_media_proxy_socket_info_t src_rtcp_info = {0};
     pbx_media_proxy_socket_info_t dst_info = {0};
+    pbx_media_proxy_socket_info_t dst_rtcp_info = {0};
 
     pbx_media_proxy_create_listen_socket(msg->call_id, src_socket_id, &src_info);
+    pbx_media_proxy_create_listen_socket(msg->call_id, src_rtcp_id, &src_rtcp_info);
     pbx_media_proxy_create_listen_socket(msg->call_id, dst_socket_id, &dst_info);
+    pbx_media_proxy_create_listen_socket(msg->call_id, dst_rtcp_id, &dst_rtcp_info);
 
     pbx_media_proxy_create_forward(msg->call_id, src_socket_id, dst_socket_id);
     pbx_media_proxy_create_forward(msg->call_id, dst_socket_id, src_socket_id);
+    pbx_media_proxy_create_forward(msg->call_id, src_rtcp_id, dst_rtcp_id);
+    pbx_media_proxy_create_forward(msg->call_id, dst_rtcp_id, src_rtcp_id);
 
     src_ports[i] = src_info.port;
     dst_ports[i] = dst_info.port;
+    src_rtcp_ports[i] = src_rtcp_info.port;
+    dst_rtcp_ports[i] = dst_rtcp_info.port;
     if (src_info.advertise_addr[0]) {
       strncpy(src_advertise_addr[i], src_info.advertise_addr, sizeof(src_advertise_addr[i]) - 1);
     }
@@ -428,20 +461,22 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   const char *dst_advertise = dst_advertise_addr[0][0] ? dst_advertise_addr[0] : (dst_reg->pbx_addr[0] ? dst_reg->pbx_addr : NULL);
 
   pbx_call_set_media_info(msg->call_id, src_ports, num_streams, dst_ports, num_streams,
+                          src_rtcp_ports, num_streams, dst_rtcp_ports, num_streams,
                           src_advertise, dst_advertise);
 
   const char *fwd_advertise_ip = dst_advertise ? dst_advertise : dst_reg->pbx_addr;
   const char *ring_advertise_ip = src_advertise ? src_advertise : (ctx->reg && ctx->reg->pbx_addr[0] ? ctx->reg->pbx_addr : NULL);
 
   log_debug("pbx: INVITE - msg->body=%p, num_streams=%d", (void*)msg->body, num_streams);
-  log_debug("pbx: INVITE - src_ports[0]=%d, dst_ports[0]=%d, fwd_advertise_ip=%s", src_ports[0], dst_ports[0], fwd_advertise_ip ? fwd_advertise_ip : "null");
+  log_debug("pbx: INVITE - src_ports[0]=%d, dst_ports[0]=%d, src_rtcp[0]=%d, dst_rtcp[0]=%d, fwd_advertise_ip=%s",
+            src_ports[0], dst_ports[0], src_rtcp_ports[0], dst_rtcp_ports[0], fwd_advertise_ip ? fwd_advertise_ip : "null");
 
   char *ring_sdp = NULL;
   char *fwd_sdp = NULL;
   if (msg->body) {
     log_debug("pbx: INVITE - body len=%zu", strlen(msg->body));
-    ring_sdp = rewrite_sdp_for_proxy(msg->body, ring_advertise_ip, src_ports, num_streams);
-    fwd_sdp = rewrite_sdp_for_proxy(msg->body, fwd_advertise_ip, dst_ports, num_streams);
+    ring_sdp = rewrite_sdp_for_proxy(msg->body, ring_advertise_ip, src_ports, num_streams, src_rtcp_ports, num_streams);
+    fwd_sdp = rewrite_sdp_for_proxy(msg->body, fwd_advertise_ip, dst_ports, num_streams, dst_rtcp_ports, num_streams);
     log_debug("pbx: INVITE - ring_sdp=%p, fwd_sdp=%p", (void*)ring_sdp, (void*)fwd_sdp);
     if (fwd_sdp) {
       log_debug("pbx: INVITE - fwd_sdp len=%zu, first line: %.50s", strlen(fwd_sdp), fwd_sdp);
@@ -583,6 +618,10 @@ static void handle_bye(pbx_sip_context_t *ctx) {
     snprintf(new_uri, sizeof(new_uri), "sip:%s@%s", other_ext, other_pbx_addr);
     sip_rewrite_request_uri(msg, new_uri);
 
+    if (strcmp(call->source_extension, ctx->reg->extension) == 0 && call->to_tag) {
+      sip_update_to_tag(msg, call->to_tag);
+    }
+
     char via_header[256];
     snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
              other_pbx_addr, generate_branch_id());
@@ -647,6 +686,10 @@ static void handle_cancel(pbx_sip_context_t *ctx) {
       snprintf(new_uri, sizeof(new_uri), "sip:%s@%s", other_ext, other_pbx_addr);
       sip_rewrite_request_uri(msg, new_uri);
 
+      if (strcmp(call->source_extension, ctx->reg->extension) == 0 && call->to_tag) {
+        sip_update_to_tag(msg, call->to_tag);
+      }
+
       char via_header[256];
       snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
                other_pbx_addr, generate_branch_id());
@@ -697,16 +740,22 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
         char *other_ext = NULL;
         int *other_ports = NULL;
         int other_port_count = 0;
+        int *other_rtcp_ports = NULL;
+        int other_rtcp_port_count = 0;
         const char *other_advertise = NULL;
         if (strcmp(call->source_extension, ctx->reg->extension) == 0) {
           other_ext = call->destination_extension;
           other_ports = call->dest_media_ports;
           other_port_count = call->dest_media_port_count;
+          other_rtcp_ports = call->dest_rtcp_ports;
+          other_rtcp_port_count = call->dest_rtcp_port_count;
           other_advertise = call->dest_advertise;
         } else {
           other_ext = call->source_extension;
           other_ports = call->source_media_ports;
           other_port_count = call->source_media_port_count;
+          other_rtcp_ports = call->source_rtcp_ports;
+          other_rtcp_port_count = call->source_rtcp_port_count;
           other_advertise = call->source_advertise;
         }
         log_debug("pbx: response - other_ext=%s", other_ext);
@@ -718,7 +767,7 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
           char *rewritten_sdp = NULL;
           if (msg->body && other_ports && other_port_count > 0 && other_advertise) {
             log_debug("pbx: response - rewriting SDP with c=%s ports=%d", other_advertise, other_port_count);
-            rewritten_sdp = rewrite_sdp_for_proxy(msg->body, other_advertise, other_ports, other_port_count);
+            rewritten_sdp = rewrite_sdp_for_proxy(msg->body, other_advertise, other_ports, other_port_count, other_rtcp_ports, other_rtcp_port_count);
           }
 
           // Restore the original Via from the party we're forwarding to
@@ -747,8 +796,13 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
           char extra_hdrs[512];
           snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
                    ctx->reg->extension, other_reg->pbx_addr);
-          snprintf(extra_hdrs, sizeof(extra_hdrs),
-                   "Contact: <%s>\r\nContent-Type: application/sdp", contact_header);
+          if (rewritten_sdp || msg->body) {
+            snprintf(extra_hdrs, sizeof(extra_hdrs),
+                     "Contact: <%s>\r\nContent-Type: application/sdp", contact_header);
+          } else {
+            snprintf(extra_hdrs, sizeof(extra_hdrs),
+                     "Contact: <%s>", contact_header);
+          }
 
           char *response = sip_build_response(status_code, NULL, msg, extra_hdrs, rewritten_sdp ? rewritten_sdp : msg->body);
           free(rewritten_sdp);
@@ -764,6 +818,10 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
 
           if (status_code == 200 && call->answered_at == 0) {
             pbx_call_set_answered(msg->call_id);
+          }
+
+          if (status_code == 200 && msg->to_tag && strcmp(call->destination_extension, ctx->reg->extension) == 0) {
+            pbx_call_set_to_tag(msg->call_id, msg->to_tag);
           }
         }
 
