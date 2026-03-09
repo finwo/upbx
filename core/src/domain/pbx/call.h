@@ -17,6 +17,8 @@ typedef struct {
   int dest_media_port_count;
   char *source_advertise;
   char *dest_advertise;
+  char *source_via;
+  char *dest_via;
   time_t answered_at;
 } pbx_call_t;
 
@@ -27,6 +29,7 @@ pbx_call_t *pbx_call_create(const char *call_id, const char *source_ext, const c
 pbx_call_t *pbx_call_find(const char *call_id);
 void pbx_call_delete(const char *call_id);
 void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count, const char *src_adv, const char *dst_adv);
+void pbx_call_set_via(const char *call_id, const char *src_via, const char *dst_via);
 void pbx_call_set_answered(const char *call_id);
 
 #endif

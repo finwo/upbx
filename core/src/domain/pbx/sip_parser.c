@@ -296,6 +296,12 @@ void sip_prepend_via(sip_message_t *msg, const char *via) {
   }
 }
 
+void sip_replace_via(sip_message_t *msg, const char *via) {
+  if (!msg) return;
+  free(msg->via);
+  msg->via = via ? strdup(via) : NULL;
+}
+
 void sip_strip_top_via(sip_message_t *msg) {
   if (!msg || !msg->via) return;
   char *first_via_end = strstr(msg->via, "\r\n");

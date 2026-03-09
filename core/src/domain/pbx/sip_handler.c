@@ -24,6 +24,13 @@
 
 static const char *default_realm = "upbx.local";
 
+static char *generate_branch_id(void) {
+  static char branch[64];
+  snprintf(branch, sizeof(branch), "z9hG4bK%08x%08x",
+           (unsigned int)rand(), (unsigned int)time(NULL));
+  return branch;
+}
+
 static const char *pbx_config_get_realm(void) {
   extern resp_object *domain_cfg;
   if (!domain_cfg) return default_realm;
@@ -51,6 +58,16 @@ static void send_response(pbx_sip_context_t *ctx, const char *response) {
 static char *extract_extension_from_uri(const char *uri) {
   if (!uri) return NULL;
   const char *start = uri;
+  // Skip leading whitespace
+  while (*start == ' ' || *start == '\t') start++;
+  // Skip quoted display name if present
+  if (start[0] == '"') {
+    const char *quote_end = strchr(start + 1, '"');
+    if (quote_end) {
+      start = quote_end + 1;
+      while (*start == ' ' || *start == '\t') start++;
+    }
+  }
   if (start[0] == '<') {
     start++;
     const char *end = strchr(start, '>');
@@ -352,6 +369,9 @@ static void handle_invite(pbx_sip_context_t *ctx) {
     return;
   }
 
+  // Save the original Via from the caller for later use in responses
+  pbx_call_set_via(msg->call_id, msg->via, NULL);
+
   log_debug("pbx: INVITE - creating media proxy session");
   if (pbx_media_proxy_session_create(msg->call_id) != 0) {
     log_error("pbx: INVITE - media proxy session create failed");
@@ -381,7 +401,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   char dst_advertise_addr[16][64] = {0};
 
   for (int i = 0; i < num_streams; i++) {
-    char src_socket_id[32], dst_socket_id[32];
+    char src_socket_id[128], dst_socket_id[128];
     snprintf(src_socket_id, sizeof(src_socket_id), "%s-src-%d", msg->call_id, i);
     snprintf(dst_socket_id, sizeof(dst_socket_id), "%s-dst-%d", msg->call_id, i);
 
@@ -449,12 +469,18 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   sip_rewrite_request_uri(msg, new_uri);
 
   char via_header[256];
-  snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;rport", dst_reg->pbx_addr[0] ? dst_reg->pbx_addr : src_pbx_addr);
-  sip_prepend_via(msg, via_header);
+  snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+           dst_reg->pbx_addr[0] ? dst_reg->pbx_addr : src_pbx_addr,
+           generate_branch_id());
+  sip_replace_via(msg, via_header);
 
-  int contact_port = dst_ports[0] > 0 ? dst_ports[0] : 5060;
+  // Save the Via we use for the destination for later use in responses
+  pbx_call_set_via(msg->call_id, NULL, via_header);
+
+  // Build Contact header - use destination's pbx_addr
   char forward_contact[256];
-  snprintf(forward_contact, sizeof(forward_contact), "sip:%s@%s:%d", dst_reg->extension, src_pbx_addr, contact_port);
+  snprintf(forward_contact, sizeof(forward_contact), "sip:%s@%s",
+           dst_reg->extension, dst_reg->pbx_addr);
 
   char fwd_headers[512];
   snprintf(fwd_headers, sizeof(fwd_headers),
@@ -497,7 +523,14 @@ static void handle_ack(pbx_sip_context_t *ctx) {
     if (other_ext) {
       pbx_registration_t *other_reg = pbx_registration_find(other_ext);
       if (other_reg) {
-        char *ack = sip_build_response(0, "ACK", msg, NULL, NULL);
+        // Build Contact header - use target's pbx_addr
+        char contact_header[256];
+        snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
+                 ctx->reg->extension, other_reg->pbx_addr);
+        char extra_hdrs[256];
+        snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
+
+        char *ack = sip_build_response(0, "ACK", msg, extra_hdrs, NULL);
         char dst_addr_str[128] = "";
         sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
         log_debug("pbx: ACK - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -551,10 +584,18 @@ static void handle_bye(pbx_sip_context_t *ctx) {
     sip_rewrite_request_uri(msg, new_uri);
 
     char via_header[256];
-    snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;rport", other_pbx_addr);
-    sip_prepend_via(msg, via_header);
+    snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+             other_pbx_addr, generate_branch_id());
+    sip_replace_via(msg, via_header);
 
-    char *bye = sip_build_response(0, "BYE", msg, NULL, NULL);
+    // Build Contact header - use target's pbx_addr
+    char contact_header[256];
+    snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
+             ctx->reg->extension, other_pbx_addr);
+    char extra_hdrs[256];
+    snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
+
+    char *bye = sip_build_response(0, "BYE", msg, extra_hdrs, NULL);
     char dst_addr_str[128] = "";
     sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
     log_debug("pbx: BYE - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -607,10 +648,18 @@ static void handle_cancel(pbx_sip_context_t *ctx) {
       sip_rewrite_request_uri(msg, new_uri);
 
       char via_header[256];
-      snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;rport", other_pbx_addr);
-      sip_prepend_via(msg, via_header);
+      snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+               other_pbx_addr, generate_branch_id());
+      sip_replace_via(msg, via_header);
 
-      char *cancel = sip_build_response(0, "CANCEL", msg, NULL, NULL);
+      // Build Contact header - use target's pbx_addr
+      char contact_header[256];
+      snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
+               ctx->reg->extension, other_pbx_addr);
+      char extra_hdrs[256];
+      snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
+
+      char *cancel = sip_build_response(0, "CANCEL", msg, extra_hdrs, NULL);
       char dst_addr_str[128] = "";
       sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
       log_debug("pbx: CANCEL - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -671,7 +720,37 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
             log_debug("pbx: response - rewriting SDP with c=%s ports=%d", other_advertise, other_port_count);
             rewritten_sdp = rewrite_sdp_for_proxy(msg->body, other_advertise, other_ports, other_port_count);
           }
-          char *response = sip_build_response(status_code, NULL, msg, NULL, rewritten_sdp ? rewritten_sdp : msg->body);
+
+          // Restore the original Via from the party we're forwarding to
+          const char *original_via = NULL;
+          if (strcmp(call->source_extension, ctx->reg->extension) == 0) {
+            // Response FROM source, forwarding TO destination, need destination's Via
+            original_via = call->dest_via;
+          } else {
+            // Response FROM destination, forwarding TO source, need source's Via
+            original_via = call->source_via;
+          }
+          if (original_via) {
+            sip_replace_via(msg, original_via);
+          } else {
+            // Fallback: generate a new Via if no original is available
+            char via_header[256];
+            const char *pbx_addr = other_reg->pbx_addr[0] ? other_reg->pbx_addr :
+                                    (ctx->reg && ctx->reg->pbx_addr[0] ? ctx->reg->pbx_addr : "127.0.0.1");
+            snprintf(via_header, sizeof(via_header), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+                     pbx_addr, generate_branch_id());
+            sip_replace_via(msg, via_header);
+          }
+
+          // Build Contact header for the response - use the target's pbx_addr
+          char contact_header[256];
+          char extra_hdrs[512];
+          snprintf(contact_header, sizeof(contact_header), "sip:%s@%s",
+                   ctx->reg->extension, other_reg->pbx_addr);
+          snprintf(extra_hdrs, sizeof(extra_hdrs),
+                   "Contact: <%s>\r\nContent-Type: application/sdp", contact_header);
+
+          char *response = sip_build_response(status_code, NULL, msg, extra_hdrs, rewritten_sdp ? rewritten_sdp : msg->body);
           free(rewritten_sdp);
 
           char dst_addr_str[128] = "";

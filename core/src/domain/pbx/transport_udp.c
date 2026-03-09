@@ -25,6 +25,16 @@ typedef struct {
 static char *extract_extension_from_uri(const char *uri) {
   if (!uri) return NULL;
   const char *start = uri;
+  // Skip leading whitespace
+  while (*start == ' ' || *start == '\t') start++;
+  // Skip quoted display name if present
+  if (start[0] == '"') {
+    const char *quote_end = strchr(start + 1, '"');
+    if (quote_end) {
+      start = quote_end + 1;
+      while (*start == ' ' || *start == '\t') start++;
+    }
+  }
   if (start[0] == '<') {
     start++;
     const char *end = strchr(start, '>');

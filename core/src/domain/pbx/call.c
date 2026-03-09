@@ -31,6 +31,8 @@ static void call_purge(void *item, void *udata) {
   free(call->dest_media_ports);
   free(call->source_advertise);
   free(call->dest_advertise);
+  free(call->source_via);
+  free(call->dest_via);
   log_debug("pbx: call_purge - freeing call struct");
   free(call);
   log_debug("pbx: call_purge - done");
@@ -112,6 +114,23 @@ void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count,
 
   log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_adv=%s dst_adv=%s",
             call_id, src_count, dst_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
+}
+
+void pbx_call_set_via(const char *call_id, const char *src_via, const char *dst_via) {
+  pbx_call_t *call = pbx_call_find(call_id);
+  if (!call) return;
+
+  if (src_via) {
+    free(call->source_via);
+    call->source_via = strdup(src_via);
+  }
+  if (dst_via) {
+    free(call->dest_via);
+    call->dest_via = strdup(dst_via);
+  }
+
+  log_debug("pbx: call %s via: src_via=%s dst_via=%s",
+            call_id, call->source_via ? call->source_via : "?", call->dest_via ? call->dest_via : "?");
 }
 
 void pbx_call_set_answered(const char *call_id) {

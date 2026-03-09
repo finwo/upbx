@@ -37,6 +37,7 @@ char *sip_format_request_uri(const char *user, const char *host_port);
 
 void sip_rewrite_request_uri(sip_message_t *msg, const char *new_uri);
 void sip_prepend_via(sip_message_t *msg, const char *via);
+void sip_replace_via(sip_message_t *msg, const char *via);
 void sip_strip_top_via(sip_message_t *msg);
 
 int sip_security_check_raw(const char *auth_header, const char *method, const char *uri, const char *password);
