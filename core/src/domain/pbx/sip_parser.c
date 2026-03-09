@@ -83,10 +83,35 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
     return NULL;
   }
 
-  char *line, *saveptr;
-  char *data_copy = data;
+  char *body_start = strstr(data, "\r\n\r\n");
+  if (!body_start) {
+    body_start = strstr(data, "\n\n");
+  }
+  if (body_start) {
+    if (body_start[0] == '\r') {
+      body_start += 4;
+    } else {
+      body_start += 2;
+    }
+    if (*body_start != '\0') {
+      msg->body = strdup(body_start);
+    }
+  }
 
-  line = strtok_r(data_copy, "\r\n", &saveptr);
+  char *line, *saveptr;
+  char *header_end = body_start ? body_start - (body_start[0] == '\r' ? 4 : 2) : data + len;
+  size_t header_len = (size_t)(header_end - data);
+  char *header_data = malloc(header_len + 1);
+  if (!header_data) {
+    free(data);
+    free(msg->body);
+    free(msg);
+    return NULL;
+  }
+  memcpy(header_data, data, header_len);
+  header_data[header_len] = '\0';
+
+  line = strtok_r(header_data, "\r\n", &saveptr);
   if (line) {
     msg->raw_request_line = strdup(line);
 
@@ -104,15 +129,6 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
   }
 
   while ((line = strtok_r(NULL, "\r\n", &saveptr)) != NULL) {
-    if (line[0] == '\0') {
-      msg->body = strdup(line + 1);
-      if (msg->body && *msg->body == '\0') {
-        free(msg->body);
-        msg->body = NULL;
-      }
-      break;
-    }
-
     char *colon = strchr(line, ':');
     if (!colon) continue;
     *colon = '\0';
@@ -150,6 +166,14 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
     }
   }
 
+  if (msg->body && msg->content_length > 0) {
+    size_t body_len = strlen(msg->body);
+    if (body_len > (size_t)msg->content_length) {
+      msg->body[msg->content_length] = '\0';
+    }
+  }
+
+  free(header_data);
   free(data);
   return msg;
 }

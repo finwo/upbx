@@ -456,19 +456,41 @@ int pbx_media_proxy_session_destroy(const char *session_id) {
 }
 
 int pbx_media_proxy_create_listen_socket(const char *session_id, const char *socket_id, pbx_media_proxy_socket_info_t *info) {
+  log_debug("pbx: media_proxy create listen socket session=%s id=%s", session_id, socket_id);
   resp_object *resp = pool_command("session.socket.create.listen", session_id, socket_id, NULL);
-  if (!resp || resp->type != RESPT_ARRAY || resp->u.arr.n < 2) {
+  log_debug("pbx: media_proxy resp=%p type=%d n=%zu", (void*)resp, resp ? resp->type : -1, resp && resp->type == RESPT_ARRAY ? resp->u.arr.n : 0);
+  if (!resp || resp->type != RESPT_ARRAY || resp->u.arr.n < 1) {
     if (resp) resp_free(resp);
     pbx_media_proxy_disconnect();
     return -1;
   }
 
-  const char *port_str = resp_map_get_string(&resp->u.arr.elem[0], "_value");
-  const char *adv_str = resp_map_get_string(&resp->u.arr.elem[1], "_value");
+  int port = 0;
+  const char *adv_str = NULL;
+
+  if (resp->u.arr.n >= 1) {
+    resp_object *port_elem = &resp->u.arr.elem[0];
+    if (port_elem->type == RESPT_INT) {
+      port = port_elem->u.i;
+    } else if (port_elem->type == RESPT_SIMPLE) {
+      port = atoi(port_elem->u.s);
+    }
+  }
+
+  if (resp->u.arr.n >= 2) {
+    resp_object *adv_elem = &resp->u.arr.elem[1];
+    if (adv_elem->type == RESPT_SIMPLE) {
+      adv_str = adv_elem->u.s;
+    } else if (adv_elem->type == RESPT_BULK) {
+      adv_str = adv_elem->u.s;
+    }
+  }
+
+  log_debug("pbx: media_proxy port=%d adv_str=%s", port, adv_str ? adv_str : "null");
 
   if (info) {
-    info->port = port_str ? atoi(port_str) : 0;
-    if (adv_str) {
+    info->port = port;
+    if (adv_str && adv_str[0]) {
       strncpy(info->advertise_addr, adv_str, sizeof(info->advertise_addr) - 1);
     } else {
       info->advertise_addr[0] = '\0';

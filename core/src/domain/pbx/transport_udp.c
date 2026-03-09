@@ -6,7 +6,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include "common/hexdump.h"
 #include "common/scheduler.h"
+#include "common/socket_util.h"
 #include "common/socket_util.h"
 #include "domain/config.h"
 #include "domain/pbx/registration.h"
@@ -81,6 +83,12 @@ static void pbx_sip_context_resolve_registration(pbx_sip_context_t *ctx) {
     return;
   }
 
+  int status_code = sip_response_status_code(msg);
+  if (status_code > 0) {
+    ctx->reg = pbx_registration_find_by_remote_addr((struct sockaddr *)&ctx->remote_addr);
+    return;
+  }
+
   pbx_registration_t *reg = pbx_registration_find_by_remote_addr((struct sockaddr *)&ctx->remote_addr);
   if (!reg) {
     ctx->reg = NULL;
@@ -146,7 +154,10 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
 
   if (n > 0) {
     udata->recv_buf[n] = '\0';
-    log_trace("pbx: received %zd bytes from SIP UDP", n);
+    char remote_addr_str[128] = "";
+    sockaddr_to_string((struct sockaddr *)&remote_addr, remote_addr_str, sizeof(remote_addr_str));
+    log_trace("pbx: received %zd bytes from SIP UDP (from=%s)", n, remote_addr_str);
+    log_hexdump_trace(udata->recv_buf, n);
 
     sip_message_t *msg = sip_parse(udata->recv_buf, (size_t)n);
     if (msg) {

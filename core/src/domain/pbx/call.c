@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "finwo/mindex.h"
 #include "rxi/log.h"
@@ -26,6 +27,8 @@ static void call_purge(void *item, void *udata) {
   free(call->from_tag);
   free(call->to_tag);
   free(call->rtp_session_id);
+  free(call->source_media_ports);
+  free(call->dest_media_ports);
   free(call->source_advertise);
   free(call->dest_advertise);
   log_debug("pbx: call_purge - freeing call struct");
@@ -88,16 +91,32 @@ void pbx_call_delete(const char *call_id) {
   log_debug("pbx: call_delete - call deleted");
 }
 
-void pbx_call_set_rtp_info(const char *call_id, const char *session_id, int src_port, int dst_port, const char *src_adv, const char *dst_adv) {
+void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count, const char *src_adv, const char *dst_adv) {
   pbx_call_t *call = pbx_call_find(call_id);
   if (!call) return;
 
-  call->rtp_session_id = session_id ? strdup(session_id) : NULL;
-  call->source_media_port = src_port;
-  call->dest_media_port = dst_port;
+  call->source_media_ports = src_count > 0 && src_ports ? malloc(src_count * sizeof(int)) : NULL;
+  if (call->source_media_ports && src_ports) {
+    memcpy(call->source_media_ports, src_ports, src_count * sizeof(int));
+  }
+  call->source_media_port_count = src_count;
+
+  call->dest_media_ports = dst_count > 0 && dst_ports ? malloc(dst_count * sizeof(int)) : NULL;
+  if (call->dest_media_ports && dst_ports) {
+    memcpy(call->dest_media_ports, dst_ports, dst_count * sizeof(int));
+  }
+  call->dest_media_port_count = dst_count;
+
   call->source_advertise = src_adv ? strdup(src_adv) : NULL;
   call->dest_advertise = dst_adv ? strdup(dst_adv) : NULL;
 
-  log_debug("pbx: call %s RTP: src=%d->%s:%d dst=%d->%s:%d", 
-            call_id, src_port, src_adv ? src_adv : "?", dst_port, dst_adv ? dst_adv : "?");
+  log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_adv=%s dst_adv=%s",
+            call_id, src_count, dst_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
+}
+
+void pbx_call_set_answered(const char *call_id) {
+  pbx_call_t *call = pbx_call_find(call_id);
+  if (!call) return;
+  call->answered_at = time(NULL);
+  log_debug("pbx: call %s answered at %ld", call_id, (long)call->answered_at);
 }
