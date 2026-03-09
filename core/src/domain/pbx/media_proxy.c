@@ -517,13 +517,15 @@ int pbx_media_proxy_create_connect_socket(const char *session_id, const char *so
 }
 
 int pbx_media_proxy_create_forward(const char *session_id, const char *src_socket_id, const char *dst_socket_id) {
+  log_debug("pbx: media_proxy create forward session=%s src=%s dst=%s", session_id, src_socket_id, dst_socket_id);
   resp_object *resp = pool_command("session.forward.create", session_id, src_socket_id, dst_socket_id, NULL);
   if (!resp) {
     pbx_media_proxy_disconnect();
     return -1;
   }
 
-  int result = resp->type == RESPT_ARRAY ? 0 : -1;
+  int result = resp->type == RESPT_SIMPLE ? 0 : -1;
+  log_debug("pbx: media_proxy create forward result=%d", result);
   resp_free(resp);
   return result;
 }
