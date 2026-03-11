@@ -16,9 +16,9 @@ static void resp_free_internal(resp_object *o);
 int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
   if (!out_obj) return -1;
 
-  const char *start = buf;
-  const char *p = buf;
-  size_t remaining = len;
+  const char *start     = buf;
+  const char *p         = buf;
+  size_t      remaining = len;
 
   // We need at least 1 byte
   if (len <= 0) return -1;
@@ -45,18 +45,17 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
   p++;
 
   // And act accordingly
-  switch((char)type_c) {
-
+  switch ((char)type_c) {
     case '+':
       output->type = output->type ? output->type : RESPT_SIMPLE;
       if (output->type != RESPT_SIMPLE) {
-        return -2; // Mismatching types
+        return -2;  // Mismatching types
       }
       // Read until \r\n, don't include \r\n in string
       {
         size_t i = 0;
-        char line[LINE_BUF];
-        int found_crlf = 0;
+        char   line[LINE_BUF];
+        int    found_crlf = 0;
         while (i + 1 < LINE_BUF && remaining > 0) {
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
@@ -69,7 +68,7 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          return -1; // Incomplete, need more data
+          return -1;  // Incomplete, need more data
         }
         line[i] = '\0';
         if (output->u.s) free(output->u.s);
@@ -80,13 +79,13 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
     case '-':
       output->type = output->type ? output->type : RESPT_ERROR;
       if (output->type != RESPT_ERROR) {
-        return -2; // Mismatching types
+        return -2;  // Mismatching types
       }
       // Read until \r\n, don't include \r\n in string
       {
         size_t i = 0;
-        char line[LINE_BUF];
-        int found_crlf = 0;
+        char   line[LINE_BUF];
+        int    found_crlf = 0;
         while (i + 1 < LINE_BUF && remaining > 0) {
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
@@ -99,7 +98,7 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          return -1; // Incomplete, need more data
+          return -1;  // Incomplete, need more data
         }
         line[i] = '\0';
         if (output->u.s) free(output->u.s);
@@ -110,14 +109,14 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
     case ':':
       output->type = output->type ? output->type : RESPT_INT;
       if (output->type != RESPT_INT) {
-        return -2; // Mismatching types
+        return -2;  // Mismatching types
       }
       // Read until \r\n, don't include \r\n in string
       // value = strtoll(line);
       {
         size_t i = 0;
-        char line[LINE_BUF];
-        int found_crlf = 0;
+        char   line[LINE_BUF];
+        int    found_crlf = 0;
         while (i + 1 < LINE_BUF && remaining > 0) {
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
@@ -130,9 +129,9 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          return -1; // Incomplete, need more data
+          return -1;  // Incomplete, need more data
         }
-        line[i] = '\0';
+        line[i]     = '\0';
         output->u.i = strtoll(line, NULL, 10);
       }
       break;
@@ -140,14 +139,14 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
     case '$':
       output->type = output->type ? output->type : RESPT_BULK;
       if (output->type != RESPT_BULK) {
-        return -2; // Mismatching types
+        return -2;  // Mismatching types
       }
       // Read until \r\n, don't include \r\n in string
       // data_length = strtoll(line);
       {
         size_t i = 0;
-        char line[LINE_BUF];
-        int found_crlf = 0;
+        char   line[LINE_BUF];
+        int    found_crlf = 0;
         while (i + 1 < LINE_BUF && remaining > 0) {
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
@@ -160,9 +159,9 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          return -1; // Incomplete, need more data
+          return -1;  // Incomplete, need more data
         }
-        line[i] = '\0';
+        line[i]          = '\0';
         long data_length = strtol(line, NULL, 10);
 
         if (data_length < 0) {
@@ -170,12 +169,11 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
         } else if (data_length == 0) {
           // Null bulk string or empty string - need \r\n
 
-
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
             remaining -= 2;
           } else {
-            return -1; // Incomplete, need more data
+            return -1;  // Incomplete, need more data
           }
           if (output->u.s) free(output->u.s);
           output->u.s = strdup("");
@@ -198,7 +196,7 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           } else {
             free(output->u.s);
             output->u.s = NULL;
-            return -1; // Incomplete, need more data
+            return -1;  // Incomplete, need more data
           }
         }
       }
@@ -207,14 +205,14 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
     case '*':
       output->type = output->type ? output->type : RESPT_ARRAY;
       if (output->type != RESPT_ARRAY) {
-        return -2; // Mismatching types
+        return -2;  // Mismatching types
       }
       // Read until \r\n, don't include \r\n in string
       // items = strtoll(line);
       {
         size_t i = 0;
-        char line[LINE_BUF];
-        int found_crlf = 0;
+        char   line[LINE_BUF];
+        int    found_crlf = 0;
         while (i + 1 < LINE_BUF && remaining > 0) {
           if (remaining >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
@@ -227,9 +225,9 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           remaining--;
         }
         if (!found_crlf) {
-          return -1; // Incomplete, need more data
+          return -1;  // Incomplete, need more data
         }
-        line[i] = '\0';
+        line[i]    = '\0';
         long items = strtol(line, NULL, 10);
 
         if (items < 0 || items > 65536) {
@@ -238,7 +236,7 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
 
         // Initialize array if needed
         if (!output->u.arr.elem) {
-          output->u.arr.n = 0;
+          output->u.arr.n    = 0;
           output->u.arr.elem = NULL;
         }
 
@@ -246,8 +244,8 @@ int resp_read_buf(const char *buf, size_t len, resp_object **out_obj) {
           if (remaining == 0) {
             return -1;
           }
-          resp_object *element = NULL;
-          int element_consumed = resp_read_buf(p, remaining, &element);
+          resp_object *element          = NULL;
+          int          element_consumed = resp_read_buf(p, remaining, &element);
           if (element_consumed <= 0) {
             return -1;
           }

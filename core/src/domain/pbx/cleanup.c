@@ -1,14 +1,14 @@
-#include "common/scheduler.h"
-#include "common/socket_util.h"
-#include "domain/pbx/registration.h"
-#include "rxi/log.h"
-
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "common/scheduler.h"
+#include "common/socket_util.h"
+#include "domain/pbx/registration.h"
+#include "rxi/log.h"
 
 typedef struct {
   int64_t last_cleanup;
@@ -18,7 +18,7 @@ int registration_cleanup_pt(int64_t timestamp, struct pt_task *task) {
   pbx_cleanup_udata_t *udata = (pbx_cleanup_udata_t *)task->udata;
 
   if (!udata) {
-    udata = calloc(1, sizeof(pbx_cleanup_udata_t));
+    udata       = calloc(1, sizeof(pbx_cleanup_udata_t));
     task->udata = udata;
   }
 
@@ -40,7 +40,7 @@ int udphole_keepalive_pt(int64_t timestamp, struct pt_task *task) {
   pbx_keepalive_udata_t *udata = (pbx_keepalive_udata_t *)task->udata;
 
   if (!udata) {
-    udata = calloc(1, sizeof(pbx_keepalive_udata_t));
+    udata       = calloc(1, sizeof(pbx_keepalive_udata_t));
     task->udata = udata;
   }
 
@@ -56,7 +56,7 @@ int udphole_keepalive_pt(int64_t timestamp, struct pt_task *task) {
 
 typedef struct {
   int64_t last_check;
-  char last_checked[64];
+  char    last_checked[64];
 } pbx_addrmap_cleanup_udata_t;
 
 static void _pbx_cleanup_addr_to_md5(const struct sockaddr *remote_addr, char *md5_out, size_t md5_out_size) {
@@ -78,7 +78,7 @@ int addrmap_cleanup_pt(int64_t timestamp, struct pt_task *task) {
   pbx_addrmap_cleanup_udata_t *udata = (pbx_addrmap_cleanup_udata_t *)task->udata;
 
   if (!udata) {
-    udata = calloc(1, sizeof(pbx_addrmap_cleanup_udata_t));
+    udata       = calloc(1, sizeof(pbx_addrmap_cleanup_udata_t));
     task->udata = udata;
   }
 
@@ -87,15 +87,15 @@ int addrmap_cleanup_pt(int64_t timestamp, struct pt_task *task) {
   }
 
   const char *addrmap_dir = pbx_registration_get_addrmap_dir();
-  DIR *dir = opendir(addrmap_dir);
+  DIR        *dir         = opendir(addrmap_dir);
   if (!dir) {
     udata->last_check = timestamp;
     return SCHED_RUNNING;
   }
 
   struct dirent *entry;
-  char found_name[64] = "";
-  char found_ext[32] = "";
+  char           found_name[64] = "";
+  char           found_ext[32]  = "";
 
   while ((entry = readdir(dir)) != NULL) {
     if (entry->d_type != DT_REG) continue;
@@ -124,8 +124,8 @@ int addrmap_cleanup_pt(int64_t timestamp, struct pt_task *task) {
   closedir(dir);
 
   if (found_name[0] != '\0') {
-    pbx_registration_t *reg = pbx_registration_find(found_ext);
-    int should_remove = 0;
+    pbx_registration_t *reg           = pbx_registration_find(found_ext);
+    int                 should_remove = 0;
 
     if (!reg) {
       should_remove = 1;

@@ -433,7 +433,7 @@ int *merge_fd_arrays(int **arrays, int count) {
   }
 
   merged[0] = 0;
-  int idx = 1;
+  int idx   = 1;
 
   for (int i = 0; i < count; i++) {
     if (arrays[i] && arrays[i][0] > 0) {
@@ -513,7 +513,8 @@ int sockaddr_equal(const struct sockaddr *a, const struct sockaddr *b) {
   } else if (a->sa_family == AF_INET6) {
     struct sockaddr_in6 *sin6_a = (struct sockaddr_in6 *)a;
     struct sockaddr_in6 *sin6_b = (struct sockaddr_in6 *)b;
-    return memcmp(&sin6_a->sin6_addr, &sin6_b->sin6_addr, sizeof(sin6_a->sin6_addr)) == 0 && sin6_a->sin6_port == sin6_b->sin6_port;
+    return memcmp(&sin6_a->sin6_addr, &sin6_b->sin6_addr, sizeof(sin6_a->sin6_addr)) == 0 &&
+           sin6_a->sin6_port == sin6_b->sin6_port;
   }
   return 0;
 }

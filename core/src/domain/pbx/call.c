@@ -35,6 +35,15 @@ static void call_purge(void *item, void *udata) {
   free(call->dest_advertise);
   free(call->source_via);
   free(call->dest_via);
+  free(call->trunk_name);
+  free(call->trunk_original_dialed);
+  free(call->trunk_source_group);
+  free(call->orig_from);
+  free(call->orig_to);
+  free(call->orig_cseq_method);
+  free(call->trunk_from);
+  free(call->trunk_to);
+  free(call->trunk_remote_contact);
   log_debug("pbx: call_purge - freeing call struct");
   free(call);
   log_debug("pbx: call_purge - done");
@@ -55,18 +64,18 @@ void pbx_call_shutdown(void) {
 pbx_call_t *pbx_call_create(const char *call_id, const char *source_ext, const char *dest_ext, const char *from_tag) {
   if (!calls) return NULL;
 
-  pbx_call_t key = { .call_id = (char *)call_id };
+  pbx_call_t  key      = {.call_id = (char *)call_id};
   pbx_call_t *existing = (pbx_call_t *)mindex_get(calls, &key);
   if (existing) {
+    /* mindex_delete already calls the purge callback, don't double-free */
     mindex_delete(calls, existing);
-    call_purge(existing, NULL);
   }
 
-  pbx_call_t *call = calloc(1, sizeof(pbx_call_t));
-  call->call_id = strdup(call_id);
-  call->source_extension = strdup(source_ext);
+  pbx_call_t *call            = calloc(1, sizeof(pbx_call_t));
+  call->call_id               = strdup(call_id);
+  call->source_extension      = strdup(source_ext);
   call->destination_extension = strdup(dest_ext);
-  call->from_tag = from_tag ? strdup(from_tag) : NULL;
+  call->from_tag              = from_tag ? strdup(from_tag) : NULL;
 
   mindex_set(calls, call);
   log_debug("pbx: created call %s: %s -> %s", call_id, source_ext, dest_ext);
@@ -76,14 +85,14 @@ pbx_call_t *pbx_call_create(const char *call_id, const char *source_ext, const c
 
 pbx_call_t *pbx_call_find(const char *call_id) {
   if (!calls) return NULL;
-  pbx_call_t key = { .call_id = (char *)call_id };
+  pbx_call_t key = {.call_id = (char *)call_id};
   return (pbx_call_t *)mindex_get(calls, &key);
 }
 
 void pbx_call_delete(const char *call_id) {
   log_debug("pbx: call_delete - call_id=%s calls=%p", call_id ? call_id : "(null)", calls);
   if (!calls) return;
-  pbx_call_t key = { .call_id = (char *)call_id };
+  pbx_call_t  key  = {.call_id = (char *)call_id};
   pbx_call_t *call = (pbx_call_t *)mindex_get(calls, &key);
   log_debug("pbx: call_delete - call=%p", call);
   if (!call) {
@@ -95,7 +104,9 @@ void pbx_call_delete(const char *call_id) {
   log_debug("pbx: call_delete - call deleted");
 }
 
-void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count, int *src_rtcp_ports, int src_rtcp_count, int *dst_rtcp_ports, int dst_rtcp_count, const char *src_adv, const char *dst_adv) {
+void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count, int *dst_ports, int dst_count,
+                             int *src_rtcp_ports, int src_rtcp_count, int *dst_rtcp_ports, int dst_rtcp_count,
+                             const char *src_adv, const char *dst_adv) {
   pbx_call_t *call = pbx_call_find(call_id);
   if (!call) return;
 
@@ -124,10 +135,10 @@ void pbx_call_set_media_info(const char *call_id, int *src_ports, int src_count,
   call->dest_rtcp_port_count = dst_rtcp_count;
 
   call->source_advertise = src_adv ? strdup(src_adv) : NULL;
-  call->dest_advertise = dst_adv ? strdup(dst_adv) : NULL;
+  call->dest_advertise   = dst_adv ? strdup(dst_adv) : NULL;
 
-  log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_rtcp=%d dst_rtcp=%d src_adv=%s dst_adv=%s",
-            call_id, src_count, dst_count, src_rtcp_count, dst_rtcp_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
+  log_debug("pbx: call %s media: src_ports=%d dst_ports=%d src_rtcp=%d dst_rtcp=%d src_adv=%s dst_adv=%s", call_id,
+            src_count, dst_count, src_rtcp_count, dst_rtcp_count, src_adv ? src_adv : "?", dst_adv ? dst_adv : "?");
 }
 
 void pbx_call_set_via(const char *call_id, const char *src_via, const char *dst_via) {
@@ -143,8 +154,8 @@ void pbx_call_set_via(const char *call_id, const char *src_via, const char *dst_
     call->dest_via = strdup(dst_via);
   }
 
-  log_debug("pbx: call %s via: src_via=%s dst_via=%s",
-            call_id, call->source_via ? call->source_via : "?", call->dest_via ? call->dest_via : "?");
+  log_debug("pbx: call %s via: src_via=%s dst_via=%s", call_id, call->source_via ? call->source_via : "?",
+            call->dest_via ? call->dest_via : "?");
 }
 
 void pbx_call_set_answered(const char *call_id) {

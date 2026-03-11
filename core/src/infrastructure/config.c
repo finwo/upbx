@@ -24,8 +24,8 @@ static int config_compare_strings(const void *a, const void *b) {
 }
 
 static int config_load_directory(resp_object *cfg, const char *dirpath) {
-  char **files    = NULL;
-  size_t file_count = 0;
+  char **files         = NULL;
+  size_t file_count    = 0;
   size_t file_capacity = 0;
 
   DIR *dir = opendir(dirpath);
@@ -48,7 +48,7 @@ static int config_load_directory(resp_object *cfg, const char *dirpath) {
       if (len > 5 && strcmp(entry->d_name + len - 5, ".conf") == 0) {
         if (file_count >= file_capacity) {
           file_capacity = file_capacity == 0 ? 16 : file_capacity * 2;
-          files = realloc(files, file_capacity * sizeof(char *));
+          files         = realloc(files, file_capacity * sizeof(char *));
         }
         char *filepath = malloc(PATH_MAX);
         snprintf(filepath, PATH_MAX, "%s/%s", dirpath, entry->d_name);
@@ -86,11 +86,9 @@ static int config_handler(void *user, const char *section, const char *name, con
     sec = resp_map_get(cfg, section);
   }
 
-  if (strcmp(name, "listen") == 0 ||
-      strcmp(name, "address") == 0 ||
-      strcmp(name, "rtpproxy") == 0 ||
-      strcmp(name, "did") == 0 ||
-      strcmp(name, "group") == 0) {
+  if (strcmp(name, "listen") == 0 || strcmp(name, "address") == 0 || strcmp(name, "rtpproxy") == 0 ||
+      strcmp(name, "did") == 0 || strcmp(name, "group") == 0 || strcmp(name, "rewrite_pattern") == 0 ||
+      strcmp(name, "rewrite_replace") == 0 || strcmp(name, "emergency") == 0) {
     resp_object *arr = resp_map_get(sec, name);
     if (!arr) {
       arr = resp_array_init();

@@ -1,14 +1,13 @@
 #include "domain/pbx/transport_udp.h"
 
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 
 #include "common/hexdump.h"
 #include "common/scheduler.h"
-#include "common/socket_util.h"
 #include "common/socket_util.h"
 #include "domain/config.h"
 #include "domain/pbx/registration.h"
@@ -17,10 +16,17 @@
 #include "rxi/log.h"
 
 typedef struct {
-  int initialized;
+  int  initialized;
   int *fds;
   char recv_buf[4096];
 } pbx_transport_udata_t;
+
+/* Global reference to the first SIP listening fd */
+static int sip_listen_fd = -1;
+
+int pbx_transport_get_sip_fd(void) {
+  return sip_listen_fd;
+}
 
 static char *extract_extension_from_uri(const char *uri) {
   if (!uri) return NULL;
@@ -40,9 +46,9 @@ static char *extract_extension_from_uri(const char *uri) {
     const char *end = strchr(start, '>');
     if (end) {
       size_t len = (size_t)(end - start);
-      char *tmp = malloc(len + 1);
+      char  *tmp = malloc(len + 1);
       memcpy(tmp, start, len);
-      tmp[len] = '\0';
+      tmp[len]     = '\0';
       char *result = extract_extension_from_uri(tmp);
       free(tmp);
       return result;
@@ -50,7 +56,7 @@ static char *extract_extension_from_uri(const char *uri) {
   }
   if (strncmp(start, "sip:", 4) == 0) {
     const char *user = start + 4;
-    const char *at = strchr(user, '@');
+    const char *at   = strchr(user, '@');
     if (at) {
       return strndup(user, at - user);
     }
@@ -114,8 +120,8 @@ static void pbx_sip_context_resolve_registration(pbx_sip_context_t *ctx) {
     }
     ctx->reg = reg;
   } else {
-    log_warn("pbx: registration lookup - From header %s doesn't match registration %s", 
-              from_ext ? from_ext : "(null)", reg->extension);
+    log_warn("pbx: registration lookup - From header %s doesn't match registration %s", from_ext ? from_ext : "(null)",
+             reg->extension);
     free(reg);
     ctx->reg = NULL;
   }
@@ -128,7 +134,7 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
   (void)timestamp;
 
   if (!udata) {
-    udata = calloc(1, sizeof(pbx_transport_udata_t));
+    udata       = calloc(1, sizeof(pbx_transport_udata_t));
     task->udata = udata;
   }
 
@@ -149,6 +155,11 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
       log_info("pbx: SIP UDP listening on fd %d", udata->fds[i]);
     }
 
+    /* Store the first fd for use by trunk response forwarding */
+    if (udata->fds[0] > 0) {
+      sip_listen_fd = udata->fds[1];
+    }
+
     udata->initialized = 1;
   }
 
@@ -158,12 +169,12 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
   }
 
   struct sockaddr_storage remote_addr;
-  socklen_t addr_len = sizeof(remote_addr);
-  ssize_t n = recvfrom(ready_fd, udata->recv_buf, sizeof(udata->recv_buf) - 1, 0,
-                        (struct sockaddr *)&remote_addr, &addr_len);
+  socklen_t               addr_len = sizeof(remote_addr);
+  ssize_t                 n =
+      recvfrom(ready_fd, udata->recv_buf, sizeof(udata->recv_buf) - 1, 0, (struct sockaddr *)&remote_addr, &addr_len);
 
   if (n > 0) {
-    udata->recv_buf[n] = '\0';
+    udata->recv_buf[n]        = '\0';
     char remote_addr_str[128] = "";
     sockaddr_to_string((struct sockaddr *)&remote_addr, remote_addr_str, sizeof(remote_addr_str));
     log_trace("pbx: received %zd bytes from SIP UDP (from=%s)", n, remote_addr_str);
@@ -171,12 +182,7 @@ int sip_transport_udp_pt(int64_t timestamp, struct pt_task *task) {
 
     sip_message_t *msg = sip_parse(udata->recv_buf, (size_t)n);
     if (msg) {
-      pbx_sip_context_t ctx = {
-        .fd = ready_fd,
-        .remote_addr = remote_addr,
-        .msg = msg,
-        .reg = NULL
-      };
+      pbx_sip_context_t ctx = {.fd = ready_fd, .remote_addr = remote_addr, .msg = msg, .reg = NULL};
       pbx_sip_context_resolve_registration(&ctx);
       pbx_sip_handle(&ctx);
       if (ctx.reg) {

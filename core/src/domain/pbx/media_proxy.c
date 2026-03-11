@@ -1,16 +1,16 @@
 #include "domain/pbx/media_proxy.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include "common/resp.h"
 #include "domain/config.h"
@@ -19,16 +19,16 @@
 #include "rxi/log.h"
 
 typedef struct rtpproxy_node {
-  char *url;
-  struct parsed_url *parsed;
+  char                 *url;
+  struct parsed_url    *parsed;
   struct rtpproxy_node *next;
   struct rtpproxy_node *prev;
 } rtpproxy_node_t;
 
-static rtpproxy_node_t *rtpproxy_list = NULL;
+static rtpproxy_node_t *rtpproxy_list    = NULL;
 static rtpproxy_node_t *rtpproxy_current = NULL;
-static int client_fd = -1;
-static int connected = 0;
+static int              client_fd        = -1;
+static int              connected        = 0;
 
 static int authenticate_rtpproxy(int fd, struct parsed_url *parsed);
 
@@ -75,8 +75,8 @@ static int parse_rtpproxy_config(void) {
     if (!url) continue;
 
     rtpproxy_node_t *node = calloc(1, sizeof(rtpproxy_node_t));
-    node->url = strdup(url);
-    node->parsed = parse_url(url);
+    node->url             = strdup(url);
+    node->parsed          = parse_url(url);
 
     if (!head) {
       head = node;
@@ -84,15 +84,15 @@ static int parse_rtpproxy_config(void) {
     } else {
       tail->next = node;
       node->prev = tail;
-      tail = node;
+      tail       = node;
     }
   }
 
   if (head && tail) {
     log_debug("pbx: parse_rtpproxy_config - head=%p tail=%p", head, tail);
-    tail->next = head;
-    head->prev = tail;
-    rtpproxy_list = head;
+    tail->next       = head;
+    head->prev       = tail;
+    rtpproxy_list    = head;
     rtpproxy_current = head;
     return 0;
   }
@@ -107,11 +107,9 @@ static int connect_to_url(struct parsed_url *parsed) {
     return -1;
   }
 
-  log_debug("connect_to_url - scheme=%s host=%s port=%s path=%s",
-    parsed->scheme ? parsed->scheme : "(null)",
-    parsed->host ? parsed->host : "(null)",
-    parsed->port ? parsed->port : "(null)",
-    parsed->path ? parsed->path : "(null)");
+  log_debug("connect_to_url - scheme=%s host=%s port=%s path=%s", parsed->scheme ? parsed->scheme : "(null)",
+            parsed->host ? parsed->host : "(null)", parsed->port ? parsed->port : "(null)",
+            parsed->path ? parsed->path : "(null)");
 
   if (strcmp(parsed->scheme, "unix") == 0) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -121,7 +119,7 @@ static int connect_to_url(struct parsed_url *parsed) {
     }
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
+    addr.sun_family       = AF_UNIX;
     const char *sock_path = parsed->path && parsed->path[0] ? parsed->path : parsed->host;
     if (!sock_path || !sock_path[0]) {
       log_error("connect_to_url - no socket path for unix scheme");
@@ -212,7 +210,7 @@ void pbx_media_proxy_shutdown(void) {
       free(node);
       node = next;
     } while (node && node != rtpproxy_list);
-    rtpproxy_list = NULL;
+    rtpproxy_list    = NULL;
     rtpproxy_current = NULL;
   }
 }
@@ -285,7 +283,7 @@ static int send_command(int fd, const char *cmd, ...) {
   }
   va_end(args);
 
-  char *buf = NULL;
+  char  *buf = NULL;
   size_t len = 0;
   resp_serialize(arr, &buf, &len);
   resp_free(arr);
@@ -300,7 +298,7 @@ static int send_command(int fd, const char *cmd, ...) {
 }
 
 static resp_object *read_response(int fd) {
-  char buf[4096];
+  char    buf[4096];
   ssize_t n = read(fd, buf, sizeof(buf) - 1);
   log_debug("read_response - n=%zd", n);
   if (n <= 0) {
@@ -312,7 +310,7 @@ static resp_object *read_response(int fd) {
 
   resp_object *obj = NULL;
   if (resp_read_buf(buf, n, &obj) > 0 && obj) {
-    char *ser = NULL;
+    char  *ser     = NULL;
     size_t ser_len = 0;
     resp_serialize(obj, &ser, &ser_len);
     log_debug("read_response - parsed: %s", ser ? ser : "(null)");
@@ -352,8 +350,8 @@ static resp_object *pool_command(const char *cmd, ...) {
 
   rtpproxy_node_t *start = rtpproxy_current;
 
-  int count = 0;
-  rtpproxy_node_t *tmp = rtpproxy_list;
+  int              count = 0;
+  rtpproxy_node_t *tmp   = rtpproxy_list;
   while (tmp) {
     count++;
     tmp = tmp->next;
@@ -374,7 +372,7 @@ static resp_object *pool_command(const char *cmd, ...) {
     }
     va_end(args);
 
-    char *buf = NULL;
+    char  *buf = NULL;
     size_t len = 0;
     resp_serialize(arr, &buf, &len);
     resp_free(arr);
@@ -455,17 +453,19 @@ int pbx_media_proxy_session_destroy(const char *session_id) {
   return 0;
 }
 
-int pbx_media_proxy_create_listen_socket(const char *session_id, const char *socket_id, pbx_media_proxy_socket_info_t *info) {
+int pbx_media_proxy_create_listen_socket(const char *session_id, const char *socket_id,
+                                         pbx_media_proxy_socket_info_t *info) {
   log_debug("pbx: media_proxy create listen socket session=%s id=%s", session_id, socket_id);
   resp_object *resp = pool_command("session.socket.create.listen", session_id, socket_id, NULL);
-  log_debug("pbx: media_proxy resp=%p type=%d n=%zu", (void*)resp, resp ? resp->type : -1, resp && resp->type == RESPT_ARRAY ? resp->u.arr.n : 0);
+  log_debug("pbx: media_proxy resp=%p type=%d n=%zu", (void *)resp, resp ? resp->type : -1,
+            resp && resp->type == RESPT_ARRAY ? resp->u.arr.n : 0);
   if (!resp || resp->type != RESPT_ARRAY || resp->u.arr.n < 1) {
     if (resp) resp_free(resp);
     pbx_media_proxy_disconnect();
     return -1;
   }
 
-  int port = 0;
+  int         port    = 0;
   const char *adv_str = NULL;
 
   if (resp->u.arr.n >= 1) {

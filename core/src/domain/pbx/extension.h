@@ -5,8 +5,8 @@
 
 typedef struct {
   char *prefix;
-  int allow_incoming_cross_group;
-  int allow_outgoing_cross_group;
+  int   allow_incoming_cross_group;
+  int   allow_outgoing_cross_group;
 } pbx_group_t;
 
 typedef struct {
@@ -20,6 +20,6 @@ void pbx_extension_init(void);
 void pbx_extension_shutdown(void);
 
 pbx_extension_t *pbx_extension_find(const char *number);
-pbx_group_t *pbx_group_find(const char *prefix);
+pbx_group_t     *pbx_group_find(const char *prefix);
 
 #endif

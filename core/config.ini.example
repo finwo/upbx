@@ -4,6 +4,9 @@ daemonize = 0
 secret = <32-char-hex-for-nonce-signing>
 data_dir = /var/lib/upbx
 rtpproxy = unix:///var/run/udphole.sock
+# Emergency numbers: calls to these skip ext-to-ext and route via trunks
+emergency = 911
+emergency = 112
 
 [api]
 address = :6379
@@ -36,3 +39,16 @@ did = 15559876543
 cid = 15559876543
 group = 08540
 # group = 3
+# Rewrite rules: consecutive alternating pattern/replace pairs
+# First matching pattern wins; replacement supports \1-\9 backreferences
+rewrite_pattern = ^00(.*)$
+rewrite_replace = +\1
+rewrite_pattern = ^0(.*)$
+rewrite_replace = +49\1
+
+# [trunk:backup-carrier]
+# address = udp://user2:pass2@sip.backup.com:5060
+# cid = 15559876543
+# group = 08540
+# rewrite_pattern = ^(.*)$
+# rewrite_replace = \1

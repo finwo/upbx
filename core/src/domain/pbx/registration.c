@@ -15,12 +15,12 @@
 #include "domain/pbx/extension.h"
 #include "rxi/log.h"
 
-static char data_dir[512] = "/var/lib/upbx";
+static char data_dir[512]    = "/var/lib/upbx";
 static char addrmap_dir[512] = "";
 
 static void _pbx_registration_addr_to_md5(const struct sockaddr *remote_addr, char *md5_out, size_t md5_out_size);
-void _pbx_registration_write_addr_map(const struct sockaddr *remote_addr, const char *extension);
-void _pbx_registration_remove_addr_map(const struct sockaddr *remote_addr);
+void        _pbx_registration_write_addr_map(const struct sockaddr *remote_addr, const char *extension);
+void        _pbx_registration_remove_addr_map(const struct sockaddr *remote_addr);
 
 static const char *pbx_config_get_data_dir(void) {
   if (!domain_cfg) return data_dir;
@@ -56,10 +56,10 @@ void pbx_registration_shutdown(void) {
 
 pbx_registration_t *pbx_registration_find(const char *extension) {
   char *path = registration_filepath(extension);
-  FILE *fp = fopen(path, "r");
+  FILE *fp   = fopen(path, "r");
   if (!fp) return NULL;
 
-  char buf[1024];
+  char   buf[1024];
   size_t total = 0;
   while (fgets(buf, sizeof(buf), fp)) {
     total += strlen(buf);
@@ -67,14 +67,14 @@ pbx_registration_t *pbx_registration_find(const char *extension) {
   rewind(fp);
 
   char *data = malloc(total + 1);
-  data[0] = '\0';
+  data[0]    = '\0';
   while (fgets(buf, sizeof(buf), fp)) {
     strcat(data, buf);
   }
   fclose(fp);
 
   resp_object *obj = NULL;
-  int r = resp_read_buf(data, total, &obj);
+  int          r   = resp_read_buf(data, total, &obj);
   free(data);
 
   if (r <= 0 || !obj) return NULL;
@@ -113,25 +113,26 @@ pbx_registration_t *pbx_registration_find(const char *extension) {
   return reg;
 }
 
-pbx_registration_t *pbx_registration_create(const char *extension, const char *contact, int fd, const struct sockaddr *remote_addr, int expires, const char *pbx_addr) {
+pbx_registration_t *pbx_registration_create(const char *extension, const char *contact, int fd,
+                                            const struct sockaddr *remote_addr, int expires, const char *pbx_addr) {
   (void)fd;
 
   pbx_extension_t *ext = pbx_extension_find(extension);
 
   char *path = registration_filepath(extension);
-  char dirpath[512];
+  char  dirpath[512];
   snprintf(dirpath, sizeof(dirpath), "%s/registrations", pbx_config_get_data_dir());
   mkdir(dirpath, 0755);
 
   resp_object *obj = resp_array_init();
   resp_map_set(obj, "extension", resp_simple_init(extension));
-  
+
   if (ext && ext->group_prefix) {
     resp_map_set(obj, "group_prefix", resp_simple_init(ext->group_prefix));
   }
   resp_map_set(obj, "contact", resp_simple_init(contact ? contact : ""));
 
-  char exp_str[32];
+  char    exp_str[32];
   int64_t exp_time = expires > 0 ? (time(NULL) + expires) : 0;
   snprintf(exp_str, sizeof(exp_str), "%lld", (long long)exp_time);
   resp_map_set(obj, "expires", resp_simple_init(exp_str));
@@ -144,7 +145,7 @@ pbx_registration_t *pbx_registration_create(const char *extension, const char *c
 
   resp_map_set(obj, "pbx_addr", resp_simple_init(pbx_addr ? pbx_addr : ""));
 
-  char *out_buf = NULL;
+  char  *out_buf = NULL;
   size_t out_len = 0;
   resp_serialize(obj, &out_buf, &out_len);
 
@@ -286,7 +287,7 @@ int pbx_registration_update_pbx_addr(const char *extension, const char *pbx_addr
 
   resp_map_set(obj, "pbx_addr", resp_simple_init(pbx_addr));
 
-  char *out_buf = NULL;
+  char  *out_buf = NULL;
   size_t out_len = 0;
   resp_serialize(obj, &out_buf, &out_len);
 
@@ -312,9 +313,9 @@ int pbx_registration_update_pbx_addr(const char *extension, const char *pbx_addr
 int pbx_registration_cleanup(void) {
   char regdir[512];
   snprintf(regdir, sizeof(regdir), "%s/registrations", data_dir);
-  
-  int cleaned = 0;
-  int64_t now = time(NULL);
+
+  int     cleaned = 0;
+  int64_t now     = time(NULL);
 
   DIR *dir = opendir(regdir);
   if (!dir) return 0;

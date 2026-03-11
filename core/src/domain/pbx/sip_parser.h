@@ -11,11 +11,11 @@ typedef struct {
   char *to;
   char *call_id;
   char *contact;
-  int cseq;
+  int   cseq;
   char *cseq_method;
   char *from_tag;
   char *to_tag;
-  int content_length;
+  int   content_length;
   char *authorization;
   char *www_authenticate;
   char *content_type;
@@ -23,11 +23,11 @@ typedef struct {
   char *raw_request_line;
 } sip_message_t;
 
-void sip_message_free(sip_message_t *msg);
+void           sip_message_free(sip_message_t *msg);
 sip_message_t *sip_parse(const char *buf, size_t len);
 
-int sip_is_request(const sip_message_t *msg);
-int sip_response_status_code(const sip_message_t *msg);
+int         sip_is_request(const sip_message_t *msg);
+int         sip_response_status_code(const sip_message_t *msg);
 const char *sip_header_get(const sip_message_t *msg, const char *name);
 
 char *sip_request_uri_user(const sip_message_t *msg);

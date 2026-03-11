@@ -61,7 +61,7 @@ typedef struct {
   domain_cmd_fn func;
 } domain_cmd_entry;
 
-static char           *current_listen = NULL;
+static char            *current_listen = NULL;
 static struct mindex_t *cmd_map        = NULL;
 static struct mindex_t *domain_cmd_map = NULL;
 
@@ -227,8 +227,8 @@ static void cmd_purge(void *item, void *udata) {
 void api_register_cmd(const char *name, char (*func)(api_client_t *, char **, int)) {
   if (!cmd_map) cmd_map = mindex_init(cmd_compare, cmd_purge, NULL);
   api_cmd_entry *entry = malloc(sizeof(api_cmd_entry));
-  entry->name = name;
-  entry->func = func;
+  entry->name          = name;
+  entry->func          = func;
   mindex_set(cmd_map, entry);
   log_trace("api: registered command '%s'", name);
 }
@@ -246,11 +246,10 @@ static void domain_cmd_purge(void *item, void *udata) {
 }
 
 void api_register_domain_cmd(const char *name, domain_cmd_fn func) {
-  if (!domain_cmd_map)
-    domain_cmd_map = mindex_init(domain_cmd_compare, domain_cmd_purge, NULL);
+  if (!domain_cmd_map) domain_cmd_map = mindex_init(domain_cmd_compare, domain_cmd_purge, NULL);
   domain_cmd_entry *entry = malloc(sizeof(domain_cmd_entry));
-  entry->name = name;
-  entry->func = func;
+  entry->name             = name;
+  entry->func             = func;
   mindex_set(domain_cmd_map, entry);
   log_trace("api: registered domain command '%s'", name);
 }
@@ -493,8 +492,8 @@ int api_server_pt(int64_t timestamp, struct pt_task *task) {
 
     init_builtins();
 
-    int **fd_arrays = malloc(sizeof(int *) * addr_arr->u.arr.n);
-    int valid_count = 0;
+    int **fd_arrays   = malloc(sizeof(int *) * addr_arr->u.arr.n);
+    int   valid_count = 0;
 
     for (size_t i = 0; i < addr_arr->u.arr.n; i++) {
       const char *addr = addr_arr->u.arr.elem[i].u.s;
@@ -569,8 +568,8 @@ int api_client_pt(int64_t timestamp, struct pt_task *task) {
   }
   state->rlen += (size_t)n;
 
-  resp_object *cmd = NULL;
-  int consumed = resp_read_buf(state->rbuf, state->rlen, &cmd);
+  resp_object *cmd      = NULL;
+  int          consumed = resp_read_buf(state->rbuf, state->rlen, &cmd);
   if (consumed > 0) {
     memmove(state->rbuf, state->rbuf + consumed, state->rlen - consumed);
     state->rlen -= consumed;

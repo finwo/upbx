@@ -6,26 +6,43 @@
 
 static const char *status_reason(int code) {
   switch (code) {
-    case 100: return "Trying";
-    case 180: return "Ringing";
-    case 181: return "Call Is Being Forwarded";
-    case 182: return "Queued";
-    case 200: return "OK";
-    case 401: return "Unauthorized";
-    case 403: return "Forbidden";
-    case 404: return "Not Found";
-    case 408: return "Request Timeout";
-    case 486: return "Busy Here";
-    case 487: return "Request Terminated";
-    case 488: return "Not Acceptable Here";
-    case 500: return "Server Internal Error";
-    case 501: return "Not Implemented";
-    case 503: return "Service Unavailable";
-    default:  return "Unknown";
+    case 100:
+      return "Trying";
+    case 180:
+      return "Ringing";
+    case 181:
+      return "Call Is Being Forwarded";
+    case 182:
+      return "Queued";
+    case 200:
+      return "OK";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "Not Found";
+    case 408:
+      return "Request Timeout";
+    case 486:
+      return "Busy Here";
+    case 487:
+      return "Request Terminated";
+    case 488:
+      return "Not Acceptable Here";
+    case 500:
+      return "Server Internal Error";
+    case 501:
+      return "Not Implemented";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return "Unknown";
   }
 }
 
-char *sip_build_message(int status_code, const char *reason, const sip_message_t *req, const char *extra_headers, const char *body) {
+char *sip_build_message(int status_code, const char *reason, const sip_message_t *req, const char *extra_headers,
+                        const char *body) {
   if (!req) return NULL;
 
   if (!reason) reason = status_reason(status_code);

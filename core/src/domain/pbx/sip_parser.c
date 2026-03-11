@@ -10,7 +10,7 @@
 static char *strdup_slice(const char *start, const char *end) {
   if (!start || !end || end <= start) return NULL;
   size_t len = (size_t)(end - start);
-  char *s = malloc(len + 1);
+  char  *s   = malloc(len + 1);
   if (!s) return NULL;
   memcpy(s, start, len);
   s[len] = '\0';
@@ -98,10 +98,10 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
     }
   }
 
-  char *line, *saveptr;
-  char *header_end = body_start ? body_start - (body_start[0] == '\r' ? 4 : 2) : data + len;
-  size_t header_len = (size_t)(header_end - data);
-  char *header_data = malloc(header_len + 1);
+  char  *line, *saveptr;
+  char  *header_end  = body_start ? body_start - (body_start[0] == '\r' ? 4 : 2) : data + len;
+  size_t header_len  = (size_t)(header_end - data);
+  char  *header_data = malloc(header_len + 1);
   if (!header_data) {
     free(data);
     free(msg->body);
@@ -117,9 +117,9 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
 
     char *method_end = strchr(line, ' ');
     if (method_end) {
-      msg->method = strdup_slice(line, method_end);
+      msg->method     = strdup_slice(line, method_end);
       char *uri_start = method_end + 1;
-      char *uri_end = strchr(uri_start, ' ');
+      char *uri_end   = strchr(uri_start, ' ');
       if (uri_end) {
         msg->uri = strdup_slice(uri_start, uri_end);
       } else {
@@ -131,17 +131,17 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
   while ((line = strtok_r(NULL, "\r\n", &saveptr)) != NULL) {
     char *colon = strchr(line, ':');
     if (!colon) continue;
-    *colon = '\0';
-    char *name = trim(line);
+    *colon      = '\0';
+    char *name  = trim(line);
     char *value = trim(colon + 1);
 
     if (strcasecmp(name, "Via") == 0) {
       msg->via = strdup(value);
     } else if (strcasecmp(name, "From") == 0) {
-      msg->from = strdup(value);
+      msg->from     = strdup(value);
       msg->from_tag = extract_tag(value);
     } else if (strcasecmp(name, "To") == 0) {
-      msg->to = strdup(value);
+      msg->to     = strdup(value);
       msg->to_tag = extract_tag(value);
     } else if (strcasecmp(name, "Call-ID") == 0 || strcasecmp(name, "Call-Id") == 0) {
       msg->call_id = strdup(value);
@@ -150,7 +150,7 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
     } else if (strcasecmp(name, "CSeq") == 0) {
       char *cseq_end = strchr(value, ' ');
       if (cseq_end) {
-        msg->cseq = atoi(value);
+        msg->cseq        = atoi(value);
         msg->cseq_method = strdup(trim(cseq_end + 1));
       } else {
         msg->cseq = atoi(value);
@@ -180,22 +180,17 @@ sip_message_t *sip_parse(const char *buf, size_t len) {
 
 int sip_is_request(const sip_message_t *msg) {
   if (!msg || !msg->method) return 0;
-  return strcmp(msg->method, "INVITE") == 0 ||
-         strcmp(msg->method, "ACK") == 0 ||
-         strcmp(msg->method, "BYE") == 0 ||
-         strcmp(msg->method, "CANCEL") == 0 ||
-         strcmp(msg->method, "REGISTER") == 0 ||
-         strcmp(msg->method, "OPTIONS") == 0 ||
-         strcmp(msg->method, "INFO") == 0 ||
-         strcmp(msg->method, "NOTIFY") == 0 ||
-         strcmp(msg->method, "MESSAGE") == 0 ||
-         strcmp(msg->method, "PRACK") == 0 ||
-         strcmp(msg->method, "UPDATE") == 0;
+  return strcmp(msg->method, "INVITE") == 0 || strcmp(msg->method, "ACK") == 0 || strcmp(msg->method, "BYE") == 0 ||
+         strcmp(msg->method, "CANCEL") == 0 || strcmp(msg->method, "REGISTER") == 0 ||
+         strcmp(msg->method, "OPTIONS") == 0 || strcmp(msg->method, "INFO") == 0 ||
+         strcmp(msg->method, "NOTIFY") == 0 || strcmp(msg->method, "MESSAGE") == 0 ||
+         strcmp(msg->method, "PRACK") == 0 || strcmp(msg->method, "UPDATE") == 0;
 }
 
 int sip_response_status_code(const sip_message_t *msg) {
   if (!msg || !msg->uri) return 0;
-  if (isdigit((unsigned char)msg->uri[0]) && isdigit((unsigned char)msg->uri[1]) && isdigit((unsigned char)msg->uri[2])) {
+  if (isdigit((unsigned char)msg->uri[0]) && isdigit((unsigned char)msg->uri[1]) &&
+      isdigit((unsigned char)msg->uri[2])) {
     return atoi(msg->uri);
   }
   return 0;
@@ -209,10 +204,10 @@ char *sip_request_uri_user(const sip_message_t *msg) {
   if (!msg || !msg->uri) return NULL;
   if (strncmp(msg->uri, "sip:", 4) == 0) {
     const char *user_start = msg->uri + 4;
-    const char *at = strchr(user_start, '@');
+    const char *at         = strchr(user_start, '@');
     if (at) {
       const char *port = strchr(user_start, ':');
-      const char *end = at;
+      const char *end  = at;
       if (port && port < at) end = port;
       return strdup_slice(user_start, end);
     }
@@ -229,9 +224,9 @@ char *sip_request_uri_user_from_to(const sip_message_t *msg) {
     const char *end = strchr(to, '>');
     if (end) {
       size_t len = (size_t)(end - to);
-      char *tmp = malloc(len + 1);
+      char  *tmp = malloc(len + 1);
       memcpy(tmp, to, len);
-      tmp[len] = '\0';
+      tmp[len]     = '\0';
       char *result = sip_request_uri_user(&(sip_message_t){.uri = tmp});
       free(tmp);
       return result;
@@ -239,10 +234,10 @@ char *sip_request_uri_user_from_to(const sip_message_t *msg) {
   }
   if (strncmp(to, "sip:", 4) == 0) {
     const char *user_start = to + 4;
-    const char *at = strchr(user_start, '@');
+    const char *at         = strchr(user_start, '@');
     if (at) {
       const char *port = strchr(user_start, ':');
-      const char *end = at;
+      const char *end  = at;
       if (port && port < at) end = port;
       return strdup_slice(user_start, end);
     }
@@ -254,7 +249,7 @@ char *sip_request_uri_host_port(const sip_message_t *msg) {
   if (!msg || !msg->uri) return NULL;
   const char *host_start;
   if (strncmp(msg->uri, "sip:", 4) == 0) {
-    host_start = msg->uri + 4;
+    host_start     = msg->uri + 4;
     const char *at = strchr(host_start, '@');
     if (at) host_start = at + 1;
   } else {
@@ -288,7 +283,7 @@ void sip_prepend_via(sip_message_t *msg, const char *via) {
   if (!msg || !via) return;
   if (msg->via) {
     char *old_via = msg->via;
-    msg->via = malloc(strlen(via) + strlen(old_via) + 3);
+    msg->via      = malloc(strlen(via) + strlen(old_via) + 3);
     sprintf(msg->via, "%s\r\n%s", via, old_via);
     free(old_via);
   } else {
@@ -330,14 +325,14 @@ void sip_update_to_tag(sip_message_t *msg, const char *tag) {
   const char *existing_tag = strstr(msg->to, "tag=");
   if (existing_tag) {
     size_t base_len = existing_tag - msg->to;
-    char *new_to = malloc(base_len + strlen(tag) + 6);
+    char  *new_to   = malloc(base_len + strlen(tag) + 6);
     memcpy(new_to, msg->to, base_len);
     snprintf(new_to + base_len, strlen(tag) + 6, "tag=%s", tag);
     free(msg->to);
     msg->to = new_to;
   } else {
-    char *new_to = malloc(strlen(msg->to) + strlen(tag) + 8);
-    const char *gt = strchr(msg->to, '>');
+    char       *new_to = malloc(strlen(msg->to) + strlen(tag) + 8);
+    const char *gt     = strchr(msg->to, '>');
     if (gt) {
       size_t prefix_len = gt - msg->to;
       memcpy(new_to, msg->to, prefix_len);
@@ -364,11 +359,11 @@ static char *parse_auth_param(const char *auth_header, const char *param) {
 int sip_security_check_raw(const char *auth_header, const char *method, const char *uri, const char *password) {
   if (!auth_header || !method || !uri || !password) return -1;
 
-  char *username = parse_auth_param(auth_header, "username=");
-  char *realm = parse_auth_param(auth_header, "realm=");
-  char *nonce = parse_auth_param(auth_header, "nonce=");
+  char *username    = parse_auth_param(auth_header, "username=");
+  char *realm       = parse_auth_param(auth_header, "realm=");
+  char *nonce       = parse_auth_param(auth_header, "nonce=");
   char *uri_in_auth = parse_auth_param(auth_header, "uri=");
-  char *response = parse_auth_param(auth_header, "response=");
+  char *response    = parse_auth_param(auth_header, "response=");
 
   if (!username || !realm || !nonce || !uri_in_auth || !response) {
     free(username);
