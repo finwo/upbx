@@ -9,6 +9,7 @@ extern "C" {
 #include <strings.h>
 
 #include "cofyc/argparse.h"
+#include "domain/pbx/trunk.h"
 #include "infrastructure/config.h"
 #include "interface/cli/command/daemon.h"
 #include "interface/cli/command/list_commands.h"
@@ -85,6 +86,7 @@ static void logfile_callback(log_Event *ev) {
       log_file = fopen(log_path, "a");
     }
     config_reload();
+    pbx_trunk_reload();
   }
   if (log_file) {
     char buf[64];

@@ -97,7 +97,7 @@ static void handle_register(pbx_sip_context_t *ctx) {
   log_info("pbx: REGISTER user=%s uri=%s to=%s", user ? user : "(null)", msg->uri ? msg->uri : "(null)", msg->to ? msg->to : "(null)");
   if (!user) {
     log_warn("pbx: REGISTER - no user in URI, returning 400");
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -107,7 +107,7 @@ static void handle_register(pbx_sip_context_t *ctx) {
   log_info("pbx: REGISTER extension lookup: user=%s found=%p", user, ext);
   if (!ext || !ext->secret) {
     log_warn("pbx: REGISTER - extension not found or no secret, returning 404");
-    char *resp = sip_build_response(404, "Not Found", msg, NULL, NULL);
+    char *resp = sip_build_message(404, "Not Found", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -121,7 +121,7 @@ static void handle_register(pbx_sip_context_t *ctx) {
 
     log_info("pbx: REGISTER - %s", www_auth);
 
-    char *resp = sip_build_response(401, "Unauthorized", msg, www_auth, NULL);
+    char *resp = sip_build_message(401, "Unauthorized", msg, www_auth, NULL);
     log_info("pbx: REGISTER - response:\n%s", resp);
     send_response(ctx, resp);
     free(resp);
@@ -140,7 +140,7 @@ static void handle_register(pbx_sip_context_t *ctx) {
   if (sip_security_check_raw(msg->authorization, msg->method, req_uri, ext->secret) != 0) {
     free(req_uri);
     log_warn("pbx: REGISTER - auth failed, returning 403");
-    char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+    char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -168,7 +168,7 @@ static void handle_register(pbx_sip_context_t *ctx) {
 
   char expires_header[64];
   snprintf(expires_header, sizeof(expires_header), "Expires: %d", expires);
-  char *resp = sip_build_response(200, "OK", msg, expires_header, NULL);
+  char *resp = sip_build_message(200, "OK", msg, expires_header, NULL);
   send_response(ctx, resp);
   free(resp);
   free(user);
@@ -281,7 +281,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
 
   if (!ctx->reg) {
     log_warn("pbx: INVITE - no valid registration, returning 403");
-    char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+    char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -290,7 +290,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   char *user = sip_request_uri_user(msg);
   if (!user) {
     log_warn("pbx: INVITE - no user in URI, returning 400");
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -314,7 +314,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
 
   if (!source_ext) {
     log_warn("pbx: INVITE - no source extension in From header, returning 400");
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -328,7 +328,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   pbx_registration_t *dst_reg = pbx_route(source_ext, user, source_group);
   log_debug("pbx: INVITE - dst_reg=%p", dst_reg);
   if (!dst_reg) {
-    char *resp = sip_build_response(404, "Not Found", msg, NULL, NULL);
+    char *resp = sip_build_message(404, "Not Found", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -344,7 +344,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
     pbx_group_t *dst_grp = pbx_group_find(dst_group);
 
     if (src_grp && !src_grp->allow_outgoing_cross_group) {
-      char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+      char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
       send_response(ctx, resp);
       free(resp);
       free(user);
@@ -353,7 +353,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
     }
 
     if (dst_grp && !dst_grp->allow_incoming_cross_group) {
-      char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+      char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
       send_response(ctx, resp);
       free(resp);
       free(user);
@@ -363,7 +363,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   }
 
   if (!msg->call_id) {
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -377,7 +377,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
 
   if (!call) {
     log_error("pbx: INVITE - failed to create call");
-    char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL);
+    char *resp = sip_build_message(500, "Server Internal Error", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     free(user);
@@ -391,7 +391,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
   log_debug("pbx: INVITE - creating media proxy session");
   if (pbx_media_proxy_session_create(msg->call_id) != 0) {
     log_error("pbx: INVITE - media proxy session create failed");
-    char *resp = sip_build_response(503, "Service Unavailable", msg, NULL, NULL);
+    char *resp = sip_build_message(503, "Service Unavailable", msg, NULL, NULL);
     log_error("pbx: INVITE - built response");
     send_response(ctx, resp);
     log_error("pbx: INVITE - sent response");
@@ -494,7 +494,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
            "Contact: <%s>\r\n"
            "Content-Type: application/sdp", contact);
 
-  char *resp2 = sip_build_response(180, "Ringing", msg, extra_headers, ring_sdp);
+  char *resp2 = sip_build_message(180, "Ringing", msg, extra_headers, ring_sdp);
   send_response(ctx, resp2);
   free(resp2);
   free(ring_sdp);
@@ -522,7 +522,7 @@ static void handle_invite(pbx_sip_context_t *ctx) {
            "Contact: <%s>\r\n"
            "Content-Type: application/sdp", forward_contact);
 
-  char *invite = sip_build_response(0, "INVITE", msg, fwd_headers, fwd_sdp);
+  char *invite = sip_build_message(0, "INVITE", msg, fwd_headers, fwd_sdp);
 
   free(fwd_sdp);
 
@@ -576,7 +576,7 @@ static void handle_ack(pbx_sip_context_t *ctx) {
         char extra_hdrs[256];
         snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
 
-        char *ack = sip_build_response(0, "ACK", msg, extra_hdrs, NULL);
+        char *ack = sip_build_message(0, "ACK", msg, extra_hdrs, NULL);
         char dst_addr_str[128] = "";
         sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
         log_debug("pbx: ACK - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -594,14 +594,14 @@ static void handle_bye(pbx_sip_context_t *ctx) {
 
   if (!ctx->reg) {
     log_warn("pbx: BYE - no valid registration, returning 403");
-    char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+    char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
   }
 
   if (!msg->call_id) {
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -609,7 +609,7 @@ static void handle_bye(pbx_sip_context_t *ctx) {
 
   pbx_call_t *call = pbx_call_find(msg->call_id);
   if (!call) {
-    char *resp = sip_build_response(481, "Call/Transaction Does Not Exist", msg, NULL, NULL);
+    char *resp = sip_build_message(481, "Call/Transaction Does Not Exist", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -645,7 +645,7 @@ static void handle_bye(pbx_sip_context_t *ctx) {
     char extra_hdrs[256];
     snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
 
-    char *bye = sip_build_response(0, "BYE", msg, extra_hdrs, NULL);
+    char *bye = sip_build_message(0, "BYE", msg, extra_hdrs, NULL);
     char dst_addr_str[128] = "";
     sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
     log_debug("pbx: BYE - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -658,7 +658,7 @@ static void handle_bye(pbx_sip_context_t *ctx) {
   pbx_media_proxy_session_destroy(msg->call_id);
   pbx_call_delete(msg->call_id);
 
-  char *resp = sip_build_response(200, "OK", msg, NULL, NULL);
+  char *resp = sip_build_message(200, "OK", msg, NULL, NULL);
   send_response(ctx, resp);
   free(resp);
 }
@@ -668,14 +668,14 @@ static void handle_cancel(pbx_sip_context_t *ctx) {
 
   if (!ctx->reg) {
     log_warn("pbx: CANCEL - no valid registration, returning 403");
-    char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL);
+    char *resp = sip_build_message(403, "Forbidden", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
   }
 
   if (!msg->call_id) {
-    char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL);
+    char *resp = sip_build_message(400, "Bad Request", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
     return;
@@ -713,7 +713,7 @@ static void handle_cancel(pbx_sip_context_t *ctx) {
       char extra_hdrs[256];
       snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <%s>", contact_header);
 
-      char *cancel = sip_build_response(0, "CANCEL", msg, extra_hdrs, NULL);
+      char *cancel = sip_build_message(0, "CANCEL", msg, extra_hdrs, NULL);
       char dst_addr_str[128] = "";
       sockaddr_to_string((struct sockaddr *)&other_reg->remote_addr, dst_addr_str, sizeof(dst_addr_str));
       log_debug("pbx: CANCEL - forwarding to %s at %s", other_ext, dst_addr_str);
@@ -724,7 +724,7 @@ static void handle_cancel(pbx_sip_context_t *ctx) {
     }
   }
 
-  char *resp = sip_build_response(487, "Request Terminated", msg, NULL, NULL);
+  char *resp = sip_build_message(487, "Request Terminated", msg, NULL, NULL);
   send_response(ctx, resp);
   free(resp);
 }
@@ -815,7 +815,7 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
                      "Contact: <%s>", contact_header);
           }
 
-          char *response = sip_build_response(status_code, NULL, msg, extra_hdrs, rewritten_sdp ? rewritten_sdp : msg->body);
+          char *response = sip_build_message(status_code, NULL, msg, extra_hdrs, rewritten_sdp ? rewritten_sdp : msg->body);
           free(rewritten_sdp);
 
           char dst_addr_str[128] = "";
@@ -858,7 +858,7 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
   } else if (strcmp(msg->method, "CANCEL") == 0) {
     handle_cancel(ctx);
   } else {
-    char *resp = sip_build_response(501, "Not Implemented", msg, NULL, NULL);
+    char *resp = sip_build_message(501, "Not Implemented", msg, NULL, NULL);
     send_response(ctx, resp);
     free(resp);
   }

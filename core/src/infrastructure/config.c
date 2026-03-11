@@ -88,7 +88,9 @@ static int config_handler(void *user, const char *section, const char *name, con
 
   if (strcmp(name, "listen") == 0 ||
       strcmp(name, "address") == 0 ||
-      strcmp(name, "rtpproxy") == 0) {
+      strcmp(name, "rtpproxy") == 0 ||
+      strcmp(name, "did") == 0 ||
+      strcmp(name, "group") == 0) {
     resp_object *arr = resp_map_get(sec, name);
     if (!arr) {
       arr = resp_array_init();

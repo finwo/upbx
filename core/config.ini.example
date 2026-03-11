@@ -31,9 +31,8 @@ secret = my-secret
 secret = pattern-secret
 
 [trunk:mycarrier]
-address = udp://sip.example.com:5060
-username = myuser
-password = mypass
+address = udp://myuser:mypass@sip.example.com:5060
 did = 15559876543
 cid = 15559876543
 group = 08540
+# group = 3

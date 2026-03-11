@@ -25,7 +25,7 @@ static const char *status_reason(int code) {
   }
 }
 
-char *sip_build_response(int status_code, const char *reason, const sip_message_t *req, const char *extra_headers, const char *body) {
+char *sip_build_message(int status_code, const char *reason, const sip_message_t *req, const char *extra_headers, const char *body) {
   if (!req) return NULL;
 
   if (!reason) reason = status_reason(status_code);
