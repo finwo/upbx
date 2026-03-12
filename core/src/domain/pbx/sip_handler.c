@@ -11,6 +11,7 @@
 #include "common/socket_util.h"
 #include "domain/pbx/call.h"
 #include "domain/pbx/extension.h"
+#include "domain/pbx/inbound_call.h"
 #include "domain/pbx/media_proxy.h"
 #include "domain/pbx/registration.h"
 #include "domain/pbx/routing.h"
@@ -1213,6 +1214,15 @@ void pbx_sip_handle(pbx_sip_context_t *ctx) {
         log_debug("pbx: trunk call response %d for call %s, dispatching to trunk '%s'", status_code, msg->call_id,
                   trunk_call->trunk_name);
         pbx_trunk_dispatch_call_response(trunk_call->trunk_name, msg);
+        return;
+      }
+
+      /* Check if this is a response to an inbound call leg (forked from trunk). */
+      inbound_call_t *inbound = inbound_call_find(msg->call_id);
+      if (inbound && ctx->reg) {
+        log_debug("pbx: inbound call leg response %d for call %s from extension %s",
+                  status_code, msg->call_id, ctx->reg->extension);
+        pbx_trunk_dispatch_inbound_leg_response(msg, ctx->reg->extension);
         return;
       }
     }

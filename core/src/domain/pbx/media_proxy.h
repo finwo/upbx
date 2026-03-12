@@ -20,6 +20,9 @@ typedef struct {
 int pbx_media_proxy_create_listen_socket(const char *session_id, const char *socket_id,
                                          pbx_media_proxy_socket_info_t *info);
 int pbx_media_proxy_create_connect_socket(const char *session_id, const char *socket_id, const char *ip, int port);
+int pbx_media_proxy_create_connect_socket_ex(const char *session_id, const char *socket_id, const char *ip, int port,
+                                             pbx_media_proxy_socket_info_t *info);
 int pbx_media_proxy_create_forward(const char *session_id, const char *src_socket_id, const char *dst_socket_id);
+int pbx_media_proxy_destroy_socket(const char *session_id, const char *socket_id);
 
 #endif

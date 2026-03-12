@@ -89,4 +89,12 @@ char *pbx_trunk_apply_rewrite(const trunk_config_t *cfg, const char *dialed_numb
  * Returns 0 if handled, -1 if trunk not found. */
 int pbx_trunk_dispatch_call_response(const char *trunk_name, sip_message_t *msg);
 
+/* Handle a response from an extension to a forked inbound call leg.
+ * Returns 0 if handled (was an inbound call leg response), -1 otherwise. */
+int pbx_trunk_dispatch_inbound_leg_response(sip_message_t *msg, const char *extension);
+
+/* Find trunk name for an inbound call by call_id.
+ * Returns trunk name or NULL if not found. Caller must not free. */
+const char *pbx_trunk_find_name_for_inbound_call(const char *call_id);
+
 #endif

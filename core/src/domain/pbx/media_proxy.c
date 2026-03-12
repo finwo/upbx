@@ -502,16 +502,46 @@ int pbx_media_proxy_create_listen_socket(const char *session_id, const char *soc
 }
 
 int pbx_media_proxy_create_connect_socket(const char *session_id, const char *socket_id, const char *ip, int port) {
+  return pbx_media_proxy_create_connect_socket_ex(session_id, socket_id, ip, port, NULL);
+}
+
+int pbx_media_proxy_create_connect_socket_ex(const char *session_id, const char *socket_id, const char *ip, int port,
+                                             pbx_media_proxy_socket_info_t *info) {
   char port_str[16];
   snprintf(port_str, sizeof(port_str), "%d", port);
 
+  log_debug("pbx: media_proxy create connect socket session=%s id=%s -> %s:%s", session_id, socket_id, ip, port_str);
   resp_object *resp = pool_command("session.socket.create.connect", session_id, socket_id, ip, port_str, NULL);
   if (!resp) {
     pbx_media_proxy_disconnect();
     return -1;
   }
 
-  int result = resp->type == RESPT_ARRAY ? 0 : -1;
+  int result = -1;
+  
+  if (resp->type == RESPT_ARRAY && resp->u.arr.n >= 1 && info) {
+    resp_object *port_elem = &resp->u.arr.elem[0];
+    if (port_elem->type == RESPT_INT) {
+      info->port = port_elem->u.i;
+    } else if (port_elem->type == RESPT_SIMPLE) {
+      info->port = atoi(port_elem->u.s);
+    }
+
+    if (resp->u.arr.n >= 2) {
+      resp_object *adv_elem = &resp->u.arr.elem[1];
+      if (adv_elem->type == RESPT_SIMPLE) {
+        strncpy(info->advertise_addr, adv_elem->u.s, sizeof(info->advertise_addr) - 1);
+      } else if (adv_elem->type == RESPT_BULK) {
+        strncpy(info->advertise_addr, adv_elem->u.s, sizeof(info->advertise_addr) - 1);
+      }
+    }
+    result = 0;
+  } else if (resp->type == RESPT_ARRAY) {
+    result = 0;
+  }
+  
+  log_debug("pbx: media_proxy connect socket port=%d adv=%s", info ? info->port : 0, info && info->advertise_addr[0] ? info->advertise_addr : "null");
+  
   resp_free(resp);
   return result;
 }
@@ -526,6 +556,22 @@ int pbx_media_proxy_create_forward(const char *session_id, const char *src_socke
 
   int result = resp->type == RESPT_SIMPLE ? 0 : -1;
   log_debug("pbx: media_proxy create forward result=%d", result);
+  resp_free(resp);
+  return result;
+}
+
+int pbx_media_proxy_destroy_socket(const char *session_id, const char *socket_id) {
+  if (!connected || client_fd < 0) return -1;
+  if (!session_id || !socket_id) return -1;
+
+  log_debug("pbx: media_proxy destroy socket session=%s socket=%s", session_id, socket_id);
+  resp_object *resp = pool_command("session.socket.destroy", session_id, socket_id, NULL);
+  if (!resp) {
+    pbx_media_proxy_disconnect();
+    return -1;
+  }
+
+  int result = resp->type == RESPT_SIMPLE ? 0 : -1;
   resp_free(resp);
   return result;
 }

@@ -16,7 +16,9 @@
 #include "common/socket_util.h"
 #include "domain/config.h"
 #include "domain/pbx/call.h"
+#include "domain/pbx/inbound_call.h"
 #include "domain/pbx/media_proxy.h"
+#include "domain/pbx/registration.h"
 #include "domain/pbx/sip_builder.h"
 #include "domain/pbx/sip_handler.h"
 #include "domain/pbx/sip_parser.h"
@@ -205,6 +207,11 @@ static char *parse_auth_param(const char *hdr, const char *param) {
 }
 
 static void trunk_handle_call_response(trunk_state_t *s, sip_message_t *msg);
+static void handle_inbound_trunk_invite(trunk_state_t *s, sip_message_t *msg);
+static void handle_inbound_trunk_reinvite(trunk_state_t *s, sip_message_t *msg, inbound_call_t *call);
+static void handle_inbound_leg_response(trunk_state_t *s, sip_message_t *msg, const char *extension);
+
+static int count_media_streams(const char *sdp);
 
 static void trunk_handle_response(trunk_state_t *s, time_t now) {
   sip_message_t *msg = sip_parse(s->recv_buf, strlen(s->recv_buf));
@@ -372,8 +379,132 @@ static void trunk_handle_call_response(trunk_state_t *s, sip_message_t *msg) {
       return;
     }
 
+    inbound_call_t *inbound = inbound_call_find(msg->call_id);
+    if (msg->method && strcmp(msg->method, "INVITE") == 0) {
+      if (inbound && inbound->answered) {
+        handle_inbound_trunk_reinvite(s, msg, inbound);
+      } else {
+        handle_inbound_trunk_invite(s, msg);
+      }
+      return;
+    }
+
+    if (msg->method && strcmp(msg->method, "ACK") == 0) {
+      log_debug("trunk[%s]: ACK from trunk for call %s", s->cfg->name, msg->call_id);
+      return;
+    }
+
+    if (msg->method && strcmp(msg->method, "CANCEL") == 0) {
+      log_info("trunk[%s]: CANCEL from trunk for call %s", s->cfg->name, msg->call_id);
+      if (inbound) {
+        for (size_t i = 0; i < inbound->leg_count; i++) {
+          inbound_leg_t *leg = inbound->legs[i];
+          if (leg && (leg->state == INBOUND_LEG_PENDING || leg->state == INBOUND_LEG_RINGING)) {
+            pbx_registration_t *leg_reg = pbx_registration_find(leg->extension);
+            if (leg_reg) {
+              char uri[256];
+              snprintf(uri, sizeof(uri), "sip:%s@%s", leg->extension, leg_reg->pbx_addr[0] ? leg_reg->pbx_addr : "127.0.0.1");
+              char via_hdr[256];
+              snprintf(via_hdr, sizeof(via_hdr), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+                       inbound->trunk_advertise_addr ? inbound->trunk_advertise_addr : "127.0.0.1",
+                       leg->branch ? leg->branch : "z9hG4bKcancel");
+              sip_message_t cancel_msg;
+              memset(&cancel_msg, 0, sizeof(cancel_msg));
+              cancel_msg.method = "CANCEL";
+              cancel_msg.uri = uri;
+              cancel_msg.via = via_hdr;
+              cancel_msg.from = inbound->trunk_from;
+              cancel_msg.to = leg->leg_to;
+              cancel_msg.call_id = msg->call_id;
+              cancel_msg.cseq = leg->cseq;
+              cancel_msg.cseq_method = "CANCEL";
+              char *cancel = sip_build_message(0, NULL, &cancel_msg, NULL, NULL);
+              if (cancel) {
+                sendto(pbx_transport_get_sip_fd(), cancel, strlen(cancel), 0,
+                       (struct sockaddr *)&leg_reg->remote_addr, sizeof(leg_reg->remote_addr));
+                free(cancel);
+              }
+              free(leg_reg);
+            }
+            leg->state = INBOUND_LEG_CANCELLED;
+          }
+        }
+        char *resp = sip_build_message(200, "OK", msg, NULL, NULL);
+        if (resp) {
+          sendto(s->fd, resp, strlen(resp), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+          free(resp);
+        }
+        inbound_call_delete(msg->call_id);
+      }
+      return;
+    }
+
+    if (msg->method && strcmp(msg->method, "BYE") == 0 && inbound) {
+      log_info("trunk[%s]: BYE from trunk for inbound call %s", s->cfg->name, msg->call_id);
+      char *ok = sip_build_message(200, "OK", msg, NULL, NULL);
+      if (ok) {
+        sendto(s->fd, ok, strlen(ok), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+        free(ok);
+      }
+      if (inbound->answered && inbound->answered_extension) {
+        inbound_leg_t *leg = inbound_call_find_leg(inbound, inbound->answered_extension);
+        if (leg) {
+          pbx_registration_t *leg_reg = pbx_registration_find(leg->extension);
+          if (leg_reg) {
+            char uri[256];
+            snprintf(uri, sizeof(uri), "sip:%s@%s", leg->extension, leg_reg->pbx_addr[0] ? leg_reg->pbx_addr : "127.0.0.1");
+            char via_hdr[256];
+            snprintf(via_hdr, sizeof(via_hdr), "SIP/2.0/UDP %s:5060;branch=z9hG4bKbye%d;rport",
+                     inbound->trunk_advertise_addr ? inbound->trunk_advertise_addr : "127.0.0.1",
+                     (int)time(NULL));
+            
+            char to_with_tag[512];
+            if (leg->leg_to && leg->to_tag) {
+              char *tag_start = strstr(leg->leg_to, ";tag=");
+              if (tag_start) {
+                size_t prefix_len = (size_t)(tag_start - leg->leg_to);
+                snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, leg->leg_to, leg->to_tag);
+              } else {
+                snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", leg->leg_to, leg->to_tag);
+              }
+            } else if (leg->leg_to) {
+              snprintf(to_with_tag, sizeof(to_with_tag), "%s", leg->leg_to);
+            } else {
+              to_with_tag[0] = '\0';
+            }
+            
+            sip_message_t bye_msg;
+            memset(&bye_msg, 0, sizeof(bye_msg));
+            bye_msg.method = "BYE";
+            bye_msg.uri = uri;
+            bye_msg.via = via_hdr;
+            bye_msg.from = inbound->trunk_from;
+            bye_msg.to = to_with_tag;
+            bye_msg.call_id = msg->call_id;
+            bye_msg.cseq = ++leg->cseq;
+            bye_msg.cseq_method = "BYE";
+            char *bye = sip_build_message(0, NULL, &bye_msg, NULL, NULL);
+            if (bye) {
+              sendto(pbx_transport_get_sip_fd(), bye, strlen(bye), 0,
+                     (struct sockaddr *)&leg_reg->remote_addr, sizeof(leg_reg->remote_addr));
+              free(bye);
+            }
+            free(leg_reg);
+          }
+        }
+      }
+      inbound_call_delete(msg->call_id);
+      return;
+    }
+
     log_debug("trunk[%s]: received in-dialog request (method=%s call_id=%s)", s->cfg->name,
               msg->method ? msg->method : "?", msg->call_id);
+    return;
+  }
+
+  inbound_call_t *inbound = inbound_call_find(msg->call_id);
+  if (inbound) {
+    handle_inbound_leg_response(s, msg, NULL);
     return;
   }
 
@@ -883,6 +1014,776 @@ static void trunk_handle_call_response(trunk_state_t *s, sip_message_t *msg) {
   }
 
   free(src_reg);
+}
+
+/* ------------------------------------------------------------------ */
+/* Inbound call handling (trunk -> extensions)                        */
+/* ------------------------------------------------------------------ */
+
+static int count_media_streams(const char *sdp) {
+  if (!sdp) return 1;
+  int count = 0;
+  const char *p = sdp;
+  while ((p = strstr(p, "m=")) != NULL) {
+    count++;
+    p++;
+  }
+  return count > 0 ? count : 1;
+}
+
+static void handle_inbound_trunk_invite(trunk_state_t *s, sip_message_t *msg) {
+  if (!s || !msg || !msg->call_id) return;
+
+  log_info("trunk[%s]: inbound INVITE from trunk, call_id=%s", s->cfg->name, msg->call_id);
+
+  inbound_call_t *call = inbound_call_create(msg->call_id, s->cfg->name);
+  if (!call) {
+    log_error("trunk[%s]: failed to create inbound call record", s->cfg->name);
+    char *resp = sip_build_message(500, "Server Internal Error", msg, NULL, NULL);
+    if (resp) {
+      sendto(s->fd, resp, strlen(resp), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+      free(resp);
+    }
+    return;
+  }
+
+  call->trunk_from = msg->from ? strdup(msg->from) : NULL;
+  call->trunk_to   = msg->to ? strdup(msg->to) : NULL;
+  call->trunk_via  = msg->via ? strdup(msg->via) : NULL;
+  call->trunk_cseq = msg->cseq;
+  call->trunk_contact = msg->contact ? strdup(msg->contact) : NULL;
+  call->trunk_sdp  = msg->body ? strdup(msg->body) : NULL;
+
+  char trunk_to_tag[32];
+  snprintf(trunk_to_tag, sizeof(trunk_to_tag), "upbx%08x", (unsigned int)rand());
+  call->trunk_to_tag = strdup(trunk_to_tag);
+
+  char *did_user = sip_request_uri_user(msg);
+  if (did_user) {
+    for (size_t d = 0; d < s->cfg->did_count; d++) {
+      if (s->cfg->dids[d] && strcmp(did_user, s->cfg->dids[d]) == 0) {
+        call->did = strdup(did_user);
+        log_debug("trunk[%s]: inbound INVITE matched DID %s", s->cfg->name, did_user);
+        break;
+      }
+    }
+    free(did_user);
+  }
+
+  char **extensions = NULL;
+  size_t ext_count = 0;
+  extensions = pbx_registration_find_by_groups(s->cfg->groups, s->cfg->group_count, &ext_count);
+
+  if (!extensions || ext_count == 0) {
+    log_warn("trunk[%s]: no extensions found for trunk groups, returning 480", s->cfg->name);
+    char *resp = sip_build_message(480, "Temporarily Unavailable", msg, NULL, NULL);
+    if (resp) {
+      sendto(s->fd, resp, strlen(resp), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+      free(resp);
+    }
+    inbound_call_delete(msg->call_id);
+    return;
+  }
+
+  log_debug("trunk[%s]: found %zu extensions for inbound call", s->cfg->name, ext_count);
+
+  if (pbx_media_proxy_session_create(msg->call_id) != 0) {
+    log_error("trunk[%s]: failed to create media proxy session", s->cfg->name);
+    char *resp = sip_build_message(500, "Server Internal Error", msg, NULL, NULL);
+    if (resp) {
+      sendto(s->fd, resp, strlen(resp), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+      free(resp);
+    }
+    for (size_t i = 0; i < ext_count; i++) free(extensions[i]);
+    free(extensions);
+    inbound_call_delete(msg->call_id);
+    return;
+  }
+  call->rtp_session_id = strdup(msg->call_id);
+
+  int num_streams = count_media_streams(msg->body);
+  if (num_streams < 1) num_streams = 1;
+  if (num_streams > 16) num_streams = 16;
+
+  char trunk_media_ip[64] = {0};
+  int  trunk_media_port = 0;
+  int  trunk_rtcp_port = 0;
+  int  trunk_has_conn = 0;
+
+  if (msg->body) {
+    const char *cline = strstr(msg->body, "c=IN IP4 ");
+    if (cline) {
+      cline += 9;
+      const char *end = cline;
+      while (*end && *end != '\r' && *end != '\n' && *end != ' ') end++;
+      size_t ip_len = (size_t)(end - cline);
+      if (ip_len > 0 && ip_len < sizeof(trunk_media_ip)) {
+        memcpy(trunk_media_ip, cline, ip_len);
+        trunk_media_ip[ip_len] = '\0';
+      }
+    }
+
+    const char *mline = strstr(msg->body, "m=audio ");
+    if (mline) {
+      mline += 8;
+      trunk_media_port = atoi(mline);
+    }
+
+    const char *rtcp_line = strstr(msg->body, "a=rtcp:");
+    if (rtcp_line) {
+      rtcp_line += 7;
+      trunk_rtcp_port = atoi(rtcp_line);
+    } else {
+      trunk_rtcp_port = trunk_media_port + 1;
+    }
+
+    if (trunk_media_ip[0] && trunk_media_port > 0) {
+      trunk_has_conn = 1;
+    }
+  }
+
+  call->trunk_media_ports = calloc(num_streams, sizeof(int));
+  call->trunk_rtcp_ports = calloc(num_streams, sizeof(int));
+  call->trunk_media_port_count = num_streams;
+  call->trunk_remote_media_ports = calloc(num_streams, sizeof(int));
+  call->trunk_remote_media_port_count = num_streams;
+  if (trunk_media_ip[0]) {
+    call->trunk_remote_ip = strdup(trunk_media_ip);
+  }
+
+  for (int i = 0; i < num_streams; i++) {
+    char socket_id[128], rtcp_socket_id[128];
+
+    if (trunk_has_conn) {
+      pbx_media_proxy_socket_info_t info = {0}, rtcp_info = {0};
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-%d", msg->call_id, i);
+      snprintf(rtcp_socket_id, sizeof(rtcp_socket_id), "%s-trunk-conn-rtcp-%d", msg->call_id, i);
+      pbx_media_proxy_create_connect_socket_ex(msg->call_id, socket_id, trunk_media_ip,
+                                               trunk_media_port + (i * 2), &info);
+      pbx_media_proxy_create_connect_socket_ex(msg->call_id, rtcp_socket_id, trunk_media_ip,
+                                               trunk_rtcp_port + (i * 2), &rtcp_info);
+      call->trunk_media_ports[i] = info.port;
+      call->trunk_rtcp_ports[i] = rtcp_info.port;
+      log_debug("trunk[%s]: created connect socket %s -> port %d, rtcp port %d, advertise %s",
+                s->cfg->name, socket_id, info.port, rtcp_info.port, info.advertise_addr);
+      if (info.advertise_addr[0] && !call->trunk_advertise_addr) {
+        call->trunk_advertise_addr = strdup(info.advertise_addr);
+      }
+      strncpy(call->trunk_socket_type, "connect", sizeof(call->trunk_socket_type) - 1);
+      call->trunk_remote_media_ports[i] = trunk_media_port + (i * 2);
+    } else {
+      pbx_media_proxy_socket_info_t info = {0}, rtcp_info = {0};
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-%d", msg->call_id, i);
+      snprintf(rtcp_socket_id, sizeof(rtcp_socket_id), "%s-trunk-rtcp-%d", msg->call_id, i);
+      pbx_media_proxy_create_listen_socket(msg->call_id, socket_id, &info);
+      pbx_media_proxy_create_listen_socket(msg->call_id, rtcp_socket_id, &rtcp_info);
+      call->trunk_media_ports[i] = info.port;
+      call->trunk_rtcp_ports[i] = rtcp_info.port;
+      log_debug("trunk[%s]: created listen socket %s -> port %d, rtcp port %d, advertise %s",
+                s->cfg->name, socket_id, info.port, rtcp_info.port, info.advertise_addr);
+      if (info.advertise_addr[0] && !call->trunk_advertise_addr) {
+        call->trunk_advertise_addr = strdup(info.advertise_addr);
+      }
+      strncpy(call->trunk_socket_type, "listen", sizeof(call->trunk_socket_type) - 1);
+    }
+  }
+
+  for (size_t e = 0; e < ext_count; e++) {
+    const char *ext = extensions[e];
+    inbound_leg_t *leg = inbound_call_add_leg(call, ext);
+    if (!leg) continue;
+
+    pbx_registration_t *reg = pbx_registration_find(ext);
+    if (!reg) continue;
+
+    leg->media_ports = calloc(num_streams, sizeof(int));
+    leg->rtcp_ports = calloc(num_streams, sizeof(int));
+    leg->media_port_count = num_streams;
+    leg->rtcp_port_count = num_streams;
+
+    for (int i = 0; i < num_streams; i++) {
+      char socket_id[128], rtcp_socket_id[128];
+      pbx_media_proxy_socket_info_t info = {0}, rtcp_info = {0};
+
+      snprintf(socket_id, sizeof(socket_id), "%s-leg-%s-%d", msg->call_id, ext, i);
+      snprintf(rtcp_socket_id, sizeof(rtcp_socket_id), "%s-leg-%s-rtcp-%d", msg->call_id, ext, i);
+      pbx_media_proxy_create_listen_socket(msg->call_id, socket_id, &info);
+      pbx_media_proxy_create_listen_socket(msg->call_id, rtcp_socket_id, &rtcp_info);
+      leg->media_ports[i] = info.port;
+      leg->rtcp_ports[i] = info.port;
+
+      if (info.advertise_addr[0] && !leg->advertise_addr) {
+        leg->advertise_addr = strdup(info.advertise_addr);
+      }
+
+      char trunk_socket_id[128], trunk_rtcp_id[128];
+      if (trunk_has_conn) {
+        snprintf(trunk_socket_id, sizeof(trunk_socket_id), "%s-trunk-conn-%d", msg->call_id, i);
+        snprintf(trunk_rtcp_id, sizeof(trunk_rtcp_id), "%s-trunk-conn-rtcp-%d", msg->call_id, i);
+      } else {
+        snprintf(trunk_socket_id, sizeof(trunk_socket_id), "%s-trunk-%d", msg->call_id, i);
+        snprintf(trunk_rtcp_id, sizeof(trunk_rtcp_id), "%s-trunk-rtcp-%d", msg->call_id, i);
+      }
+
+      pbx_media_proxy_create_forward(msg->call_id, trunk_socket_id, socket_id);
+      pbx_media_proxy_create_forward(msg->call_id, socket_id, trunk_socket_id);
+      pbx_media_proxy_create_forward(msg->call_id, trunk_rtcp_id, rtcp_socket_id);
+      pbx_media_proxy_create_forward(msg->call_id, rtcp_socket_id, trunk_rtcp_id);
+    }
+
+    char *leg_sdp = NULL;
+    if (msg->body) {
+      leg_sdp = pbx_rewrite_sdp_for_proxy(msg->body,
+                                          leg->advertise_addr ? leg->advertise_addr : "127.0.0.1",
+                                          leg->media_ports, num_streams,
+                                          leg->rtcp_ports, num_streams);
+    }
+
+    char branch[64];
+    snprintf(branch, sizeof(branch), "z9hG4bK%08x%08x", (unsigned int)rand(), (unsigned int)time(NULL));
+    leg->branch = strdup(branch);
+
+    char from_tag[32];
+    snprintf(from_tag, sizeof(from_tag), "upbx%08x", (unsigned int)rand());
+    leg->from_tag = strdup(from_tag);
+
+    leg->cseq = call->leg_cseq_counter++;
+
+    char via_hdr[256];
+    const char *via_addr = leg->advertise_addr ? leg->advertise_addr : "127.0.0.1";
+    snprintf(via_hdr, sizeof(via_hdr), "SIP/2.0/UDP %s:5060;branch=%s;rport", via_addr, branch);
+
+    char uri[256];
+    snprintf(uri, sizeof(uri), "sip:%s@%s", ext, reg->pbx_addr[0] ? reg->pbx_addr : "127.0.0.1");
+
+    char to_hdr[256];
+    snprintf(to_hdr, sizeof(to_hdr), "<sip:%s@%s>", ext, reg->pbx_addr[0] ? reg->pbx_addr : "127.0.0.1");
+    leg->leg_to = strdup(to_hdr);
+
+    sip_message_t inv;
+    memset(&inv, 0, sizeof(inv));
+    inv.method = "INVITE";
+    inv.uri = uri;
+    inv.via = via_hdr;
+    inv.from = call->trunk_from;
+    inv.to = to_hdr;
+    inv.call_id = msg->call_id;
+    inv.cseq = leg->cseq;
+    inv.cseq_method = "INVITE";
+
+    char extra_hdrs[512];
+    snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <sip:upbx@%s:5060>\r\nContent-Type: application/sdp", via_addr);
+
+    char *invite = sip_build_message(0, NULL, &inv, extra_hdrs, leg_sdp);
+    free(leg_sdp);
+
+    if (invite) {
+      log_debug("trunk[%s]: sending INVITE to extension %s", s->cfg->name, ext);
+      sendto(pbx_transport_get_sip_fd(), invite, strlen(invite), 0,
+             (struct sockaddr *)&reg->remote_addr, sizeof(reg->remote_addr));
+      free(invite);
+    }
+
+    free(reg);
+  }
+
+  char to_with_tag[512];
+  if (call->trunk_to && call->trunk_to_tag) {
+    char *tag_start = strstr(call->trunk_to, ";tag=");
+    if (tag_start) {
+      size_t prefix_len = (size_t)(tag_start - call->trunk_to);
+      snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, call->trunk_to, call->trunk_to_tag);
+    } else {
+      snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", call->trunk_to, call->trunk_to_tag);
+    }
+  } else if (call->trunk_to) {
+    snprintf(to_with_tag, sizeof(to_with_tag), "%s", call->trunk_to);
+  } else {
+    to_with_tag[0] = '\0';
+  }
+
+  sip_message_t trying_msg;
+  memset(&trying_msg, 0, sizeof(trying_msg));
+  trying_msg.via = call->trunk_via;
+  trying_msg.from = call->trunk_from;
+  trying_msg.to = to_with_tag;
+  trying_msg.call_id = msg->call_id;
+  trying_msg.cseq = call->trunk_cseq;
+  trying_msg.cseq_method = "INVITE";
+
+  char *trying = sip_build_message(100, "Trying", &trying_msg, NULL, NULL);
+  if (trying) {
+    sendto(s->fd, trying, strlen(trying), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+    free(trying);
+  }
+
+  for (size_t i = 0; i < ext_count; i++) free(extensions[i]);
+  free(extensions);
+}
+
+static void handle_inbound_trunk_reinvite(trunk_state_t *s, sip_message_t *msg, inbound_call_t *call) {
+  if (!s || !msg || !call) return;
+
+  log_info("trunk[%s]: re-INVITE/UPDATE for established call %s", s->cfg->name, msg->call_id);
+
+  char trunk_media_ip[64] = {0};
+  int  trunk_media_port = 0;
+  int  trunk_has_conn = 0;
+
+  if (msg->body) {
+    const char *cline = strstr(msg->body, "c=IN IP4 ");
+    if (cline) {
+      cline += 9;
+      const char *end = cline;
+      while (*end && *end != '\r' && *end != '\n' && *end != ' ') end++;
+      size_t ip_len = (size_t)(end - cline);
+      if (ip_len > 0 && ip_len < sizeof(trunk_media_ip)) {
+        memcpy(trunk_media_ip, cline, ip_len);
+        trunk_media_ip[ip_len] = '\0';
+      }
+    }
+
+    const char *mline = strstr(msg->body, "m=audio ");
+    if (mline) {
+      mline += 8;
+      trunk_media_port = atoi(mline);
+    }
+
+    if (trunk_media_ip[0] && trunk_media_port > 0) {
+      trunk_has_conn = 1;
+    }
+  }
+
+  int needs_rewire = 0;
+
+  if (trunk_has_conn && strcmp(call->trunk_socket_type, "listen") == 0) {
+    log_debug("trunk[%s]: switching from listen to connect mode for trunk", s->cfg->name);
+
+    for (int i = 0; i < call->trunk_media_port_count; i++) {
+      char socket_id[128];
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-%d", call->rtp_session_id, i);
+      pbx_media_proxy_destroy_socket(call->rtp_session_id, socket_id);
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-rtcp-%d", call->rtp_session_id, i);
+      pbx_media_proxy_destroy_socket(call->rtp_session_id, socket_id);
+
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-%d", call->rtp_session_id, i);
+      pbx_media_proxy_create_connect_socket(call->rtp_session_id, socket_id, trunk_media_ip,
+                                            trunk_media_port + (i * 2));
+      snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-rtcp-%d", call->rtp_session_id, i);
+      pbx_media_proxy_create_connect_socket(call->rtp_session_id, socket_id, trunk_media_ip,
+                                            trunk_media_port + 1 + (i * 2));
+    }
+
+    free(call->trunk_remote_ip);
+    call->trunk_remote_ip = strdup(trunk_media_ip);
+    strncpy(call->trunk_socket_type, "connect", sizeof(call->trunk_socket_type) - 1);
+    needs_rewire = 1;
+  } else if (trunk_has_conn && call->trunk_remote_ip) {
+    if (strcmp(call->trunk_remote_ip, trunk_media_ip) != 0 ||
+        call->trunk_remote_media_ports[0] != trunk_media_port) {
+      log_debug("trunk[%s]: trunk media address changed, updating", s->cfg->name);
+
+      for (int i = 0; i < call->trunk_media_port_count; i++) {
+        char socket_id[128];
+        snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-%d", call->rtp_session_id, i);
+        pbx_media_proxy_destroy_socket(call->rtp_session_id, socket_id);
+        snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-rtcp-%d", call->rtp_session_id, i);
+        pbx_media_proxy_destroy_socket(call->rtp_session_id, socket_id);
+
+        snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-%d", call->rtp_session_id, i);
+        pbx_media_proxy_create_connect_socket(call->rtp_session_id, socket_id, trunk_media_ip,
+                                              trunk_media_port + (i * 2));
+        snprintf(socket_id, sizeof(socket_id), "%s-trunk-conn-rtcp-%d", call->rtp_session_id, i);
+        pbx_media_proxy_create_connect_socket(call->rtp_session_id, socket_id, trunk_media_ip,
+                                              trunk_media_port + 1 + (i * 2));
+      }
+
+      free(call->trunk_remote_ip);
+      call->trunk_remote_ip = strdup(trunk_media_ip);
+      call->trunk_remote_media_ports[0] = trunk_media_port;
+      needs_rewire = 1;
+    }
+  }
+
+  if (needs_rewire && call->answered_extension) {
+    inbound_leg_t *leg = inbound_call_find_leg(call, call->answered_extension);
+    if (leg) {
+      for (int i = 0; i < call->trunk_media_port_count; i++) {
+        char trunk_socket_id[128], leg_socket_id[128];
+        char trunk_rtcp_id[128], leg_rtcp_id[128];
+
+        snprintf(trunk_socket_id, sizeof(trunk_socket_id), "%s-trunk-conn-%d", call->rtp_session_id, i);
+        snprintf(trunk_rtcp_id, sizeof(trunk_rtcp_id), "%s-trunk-conn-rtcp-%d", call->rtp_session_id, i);
+        snprintf(leg_socket_id, sizeof(leg_socket_id), "%s-leg-%s-%d", call->rtp_session_id, leg->extension, i);
+        snprintf(leg_rtcp_id, sizeof(leg_rtcp_id), "%s-leg-%s-rtcp-%d", call->rtp_session_id, leg->extension, i);
+
+        pbx_media_proxy_create_forward(call->rtp_session_id, trunk_socket_id, leg_socket_id);
+        pbx_media_proxy_create_forward(call->rtp_session_id, leg_socket_id, trunk_socket_id);
+        pbx_media_proxy_create_forward(call->rtp_session_id, trunk_rtcp_id, leg_rtcp_id);
+        pbx_media_proxy_create_forward(call->rtp_session_id, leg_rtcp_id, trunk_rtcp_id);
+      }
+    }
+  }
+
+  char *ok_sdp = NULL;
+  if (msg->body && call->trunk_media_ports && call->trunk_media_port_count > 0) {
+    ok_sdp = pbx_rewrite_sdp_for_proxy(msg->body,
+                                       call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1",
+                                       call->trunk_media_ports, call->trunk_media_port_count,
+                                       call->trunk_rtcp_ports, call->trunk_media_port_count);
+  }
+
+  char to_with_tag[512];
+  if (call->trunk_to && call->trunk_to_tag) {
+    char *tag_start = strstr(call->trunk_to, ";tag=");
+    if (tag_start) {
+      size_t prefix_len = (size_t)(tag_start - call->trunk_to);
+      snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, call->trunk_to, call->trunk_to_tag);
+    } else {
+      snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", call->trunk_to, call->trunk_to_tag);
+    }
+  } else if (call->trunk_to) {
+    snprintf(to_with_tag, sizeof(to_with_tag), "%s", call->trunk_to);
+  } else {
+    to_with_tag[0] = '\0';
+  }
+
+  sip_message_t ok_msg;
+  memset(&ok_msg, 0, sizeof(ok_msg));
+  ok_msg.via = call->trunk_via;
+  ok_msg.from = call->trunk_from;
+  ok_msg.to = to_with_tag;
+  ok_msg.call_id = msg->call_id;
+  ok_msg.cseq = msg->cseq;
+  ok_msg.cseq_method = msg->cseq_method;
+
+  char extra_hdrs[256] = "";
+  if (ok_sdp) {
+    snprintf(extra_hdrs, sizeof(extra_hdrs), "Content-Type: application/sdp");
+  }
+
+  char *ok = sip_build_message(200, "OK", &ok_msg, extra_hdrs[0] ? extra_hdrs : NULL, ok_sdp);
+  free(ok_sdp);
+
+  if (ok) {
+    sendto(s->fd, ok, strlen(ok), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+    free(ok);
+  }
+}
+
+static void handle_inbound_leg_response(trunk_state_t *s, sip_message_t *msg, const char *extension) {
+  if (!s || !msg) return;
+
+  inbound_call_t *call = inbound_call_find(msg->call_id);
+  if (!call) return;
+
+  int status = sip_response_status_code(msg);
+  if (status <= 0) return;
+
+  inbound_leg_t *leg = NULL;
+  if (extension) {
+    leg = inbound_call_find_leg(call, extension);
+  }
+  
+  if (!leg) {
+    char *from_tag_str = NULL;
+    if (msg->from) {
+      const char *tag_start = strstr(msg->from, ";tag=");
+      if (tag_start) {
+        tag_start += 5;
+        const char *tag_end = tag_start;
+        while (*tag_end && *tag_end != ';' && *tag_end != '>') tag_end++;
+        from_tag_str = strndup(tag_start, (size_t)(tag_end - tag_start));
+      }
+    }
+
+    for (size_t i = 0; i < call->leg_count; i++) {
+      if (call->legs[i] && call->legs[i]->from_tag && from_tag_str &&
+          strcmp(call->legs[i]->from_tag, from_tag_str) == 0) {
+        leg = call->legs[i];
+        break;
+      }
+    }
+    free(from_tag_str);
+  }
+
+  if (!leg) {
+    log_debug("trunk[%s]: response %d for unknown leg of call %s", s->cfg->name, status, msg->call_id);
+    return;
+  }
+
+  log_info("trunk[%s]: leg %s response %d for inbound call %s", s->cfg->name, leg->extension, status, msg->call_id);
+
+  if (status >= 100 && status < 200) {
+    if (leg->state == INBOUND_LEG_PENDING) {
+      leg->state = INBOUND_LEG_RINGING;
+    }
+
+    if (msg->to_tag && !leg->to_tag) {
+      leg->to_tag = strdup(msg->to_tag);
+    }
+
+    if (!call->first_180_sent) {
+      char to_with_tag[512];
+      if (call->trunk_to && call->trunk_to_tag) {
+        char *tag_start = strstr(call->trunk_to, ";tag=");
+        if (tag_start) {
+          size_t prefix_len = (size_t)(tag_start - call->trunk_to);
+          snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, call->trunk_to, call->trunk_to_tag);
+        } else {
+          snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", call->trunk_to, call->trunk_to_tag);
+        }
+      } else if (call->trunk_to) {
+        snprintf(to_with_tag, sizeof(to_with_tag), "%s", call->trunk_to);
+      } else {
+        to_with_tag[0] = '\0';
+      }
+
+      sip_message_t ringing_msg;
+      memset(&ringing_msg, 0, sizeof(ringing_msg));
+      ringing_msg.via = call->trunk_via;
+      ringing_msg.from = call->trunk_from;
+      ringing_msg.to = to_with_tag;
+      ringing_msg.call_id = msg->call_id;
+      ringing_msg.cseq = call->trunk_cseq;
+      ringing_msg.cseq_method = "INVITE";
+
+      char *ringing = sip_build_message(status, NULL, &ringing_msg, NULL, NULL);
+      if (ringing) {
+        sendto(s->fd, ringing, strlen(ringing), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+        free(ringing);
+      }
+      call->first_180_sent = 1;
+    }
+    return;
+  }
+
+  if (status >= 200 && status < 300) {
+    if (call->answered) {
+      log_warn("trunk[%s]: late 200 OK from %s (already answered by %s) - ACK+BYE",
+               s->cfg->name, leg->extension, call->answered_extension);
+
+      pbx_registration_t *leg_reg = pbx_registration_find(leg->extension);
+      if (leg_reg) {
+        char uri[256];
+        snprintf(uri, sizeof(uri), "sip:%s@%s", leg->extension,
+                 leg_reg->pbx_addr[0] ? leg_reg->pbx_addr : "127.0.0.1");
+
+        char via_hdr[256];
+        snprintf(via_hdr, sizeof(via_hdr), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+                 call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1",
+                 leg->branch ? leg->branch : "z9hG4bKack");
+
+        sip_message_t ack_msg;
+        memset(&ack_msg, 0, sizeof(ack_msg));
+        ack_msg.method = "ACK";
+        ack_msg.uri = uri;
+        ack_msg.via = via_hdr;
+        ack_msg.from = call->trunk_from;
+        ack_msg.to = msg->to;
+        ack_msg.call_id = msg->call_id;
+        ack_msg.cseq = leg->cseq;
+        ack_msg.cseq_method = "ACK";
+        char *ack = sip_build_message(0, NULL, &ack_msg, NULL, NULL);
+        if (ack) {
+          sendto(pbx_transport_get_sip_fd(), ack, strlen(ack), 0,
+                 (struct sockaddr *)&leg_reg->remote_addr, sizeof(leg_reg->remote_addr));
+          free(ack);
+        }
+
+        sip_message_t bye_msg;
+        memset(&bye_msg, 0, sizeof(bye_msg));
+        bye_msg.method = "BYE";
+        bye_msg.uri = uri;
+        bye_msg.via = via_hdr;
+        bye_msg.from = call->trunk_from;
+        bye_msg.to = msg->to;
+        bye_msg.call_id = msg->call_id;
+        bye_msg.cseq = ++leg->cseq;
+        bye_msg.cseq_method = "BYE";
+        char *bye = sip_build_message(0, NULL, &bye_msg, NULL, NULL);
+        if (bye) {
+          sendto(pbx_transport_get_sip_fd(), bye, strlen(bye), 0,
+                 (struct sockaddr *)&leg_reg->remote_addr, sizeof(leg_reg->remote_addr));
+          free(bye);
+        }
+
+        free(leg_reg);
+      }
+
+      leg->state = INBOUND_LEG_FAILED;
+      leg->final_status = 200;
+      return;
+    }
+
+    log_info("trunk[%s]: extension %s answered inbound call %s", s->cfg->name, leg->extension, msg->call_id);
+    if (msg->body) {
+      log_debug("trunk[%s]: extension SDP:\n%s", s->cfg->name, msg->body);
+    } else {
+      log_warn("trunk[%s]: extension answered without SDP!", s->cfg->name);
+    }
+
+    leg->state = INBOUND_LEG_ANSWERED;
+    call->answered = 1;
+    call->answered_extension = strdup(leg->extension);
+
+    if (msg->to_tag && !leg->to_tag) {
+      leg->to_tag = strdup(msg->to_tag);
+    }
+
+    for (size_t i = 0; i < call->leg_count; i++) {
+      inbound_leg_t *other_leg = call->legs[i];
+      if (other_leg == leg) continue;
+      if (other_leg->state == INBOUND_LEG_FAILED) continue;
+      if (other_leg->state == INBOUND_LEG_ANSWERED) continue;
+
+      if (other_leg->state == INBOUND_LEG_PENDING || other_leg->state == INBOUND_LEG_RINGING) {
+        pbx_registration_t *other_reg = pbx_registration_find(other_leg->extension);
+        if (other_reg) {
+          char uri[256];
+          snprintf(uri, sizeof(uri), "sip:%s@%s", other_leg->extension,
+                   other_reg->pbx_addr[0] ? other_reg->pbx_addr : "127.0.0.1");
+
+          char via_hdr[256];
+          snprintf(via_hdr, sizeof(via_hdr), "SIP/2.0/UDP %s:5060;branch=%s;rport",
+                   call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1",
+                   other_leg->branch ? other_leg->branch : "z9hG4bKcancel");
+
+          sip_message_t cancel_msg;
+          memset(&cancel_msg, 0, sizeof(cancel_msg));
+          cancel_msg.method = "CANCEL";
+          cancel_msg.uri = uri;
+          cancel_msg.via = via_hdr;
+          cancel_msg.from = call->trunk_from;
+          cancel_msg.to = other_leg->leg_to;
+          cancel_msg.call_id = msg->call_id;
+          cancel_msg.cseq = other_leg->cseq;
+          cancel_msg.cseq_method = "CANCEL";
+          char *cancel = sip_build_message(0, NULL, &cancel_msg, NULL, NULL);
+          if (cancel) {
+            sendto(pbx_transport_get_sip_fd(), cancel, strlen(cancel), 0,
+                   (struct sockaddr *)&other_reg->remote_addr, sizeof(other_reg->remote_addr));
+            free(cancel);
+          }
+          free(other_reg);
+        }
+        other_leg->state = INBOUND_LEG_CANCELLED;
+      }
+
+      inbound_call_destroy_leg_sockets(call, other_leg);
+    }
+
+    char *ok_sdp = NULL;
+    if (msg->body && call->trunk_media_ports && call->trunk_media_port_count > 0) {
+      ok_sdp = pbx_rewrite_sdp_for_proxy(msg->body,
+                                         call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1",
+                                         call->trunk_media_ports, call->trunk_media_port_count,
+                                         call->trunk_rtcp_ports, call->trunk_media_port_count);
+      if (ok_sdp) {
+        log_debug("trunk[%s]: rewritten SDP for trunk:\n%s", s->cfg->name, ok_sdp);
+      } else {
+        log_warn("trunk[%s]: failed to rewrite SDP for trunk", s->cfg->name);
+      }
+    } else {
+      log_warn("trunk[%s]: no SDP to send to trunk (body=%p, ports=%p, count=%d)",
+               s->cfg->name, msg->body, call->trunk_media_ports, call->trunk_media_port_count);
+    }
+
+    char to_with_tag[512];
+    if (call->trunk_to && call->trunk_to_tag) {
+      char *tag_start = strstr(call->trunk_to, ";tag=");
+      if (tag_start) {
+        size_t prefix_len = (size_t)(tag_start - call->trunk_to);
+        snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, call->trunk_to, call->trunk_to_tag);
+      } else {
+        snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", call->trunk_to, call->trunk_to_tag);
+      }
+    } else if (call->trunk_to) {
+      snprintf(to_with_tag, sizeof(to_with_tag), "%s", call->trunk_to);
+    } else {
+      to_with_tag[0] = '\0';
+    }
+
+    sip_message_t ok_msg;
+    memset(&ok_msg, 0, sizeof(ok_msg));
+    ok_msg.via = call->trunk_via;
+    ok_msg.from = call->trunk_from;
+    ok_msg.to = to_with_tag;
+    ok_msg.call_id = msg->call_id;
+    ok_msg.cseq = call->trunk_cseq;
+    ok_msg.cseq_method = "INVITE";
+
+    char extra_hdrs[512];
+    if (ok_sdp) {
+      snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <sip:upbx@%s:5060>\r\nContent-Type: application/sdp",
+               call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1");
+    } else {
+      snprintf(extra_hdrs, sizeof(extra_hdrs), "Contact: <sip:upbx@%s:5060>",
+               call->trunk_advertise_addr ? call->trunk_advertise_addr : "127.0.0.1");
+    }
+
+    char *ok = sip_build_message(200, "OK", &ok_msg, extra_hdrs, ok_sdp);
+    free(ok_sdp);
+
+    if (ok) {
+      log_info("trunk[%s]: sending 200 OK to trunk for call %s", s->cfg->name, msg->call_id);
+      log_debug("trunk[%s]: 200 OK content:\n%s", s->cfg->name, ok);
+      sendto(s->fd, ok, strlen(ok), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+      free(ok);
+    }
+
+    return;
+  }
+
+  if (status >= 300) {
+    leg->state = INBOUND_LEG_FAILED;
+    leg->final_status = status;
+
+    inbound_call_destroy_leg_sockets(call, leg);
+
+    if (inbound_call_all_legs_terminated(call)) {
+      int final_status = inbound_call_select_final_status(call);
+      log_info("trunk[%s]: all legs failed, sending %d to trunk for call %s",
+               s->cfg->name, final_status, msg->call_id);
+
+      char reason[64] = "Temporarily Unavailable";
+      if (final_status == 486) strcpy(reason, "Busy Here");
+      else if (final_status == 487) strcpy(reason, "Request Terminated");
+      else if (final_status == 408) strcpy(reason, "Request Timeout");
+
+      char to_with_tag[512];
+      if (call->trunk_to && call->trunk_to_tag) {
+        char *tag_start = strstr(call->trunk_to, ";tag=");
+        if (tag_start) {
+          size_t prefix_len = (size_t)(tag_start - call->trunk_to);
+          snprintf(to_with_tag, sizeof(to_with_tag), "%.*s;tag=%s", (int)prefix_len, call->trunk_to, call->trunk_to_tag);
+        } else {
+          snprintf(to_with_tag, sizeof(to_with_tag), "%s;tag=%s", call->trunk_to, call->trunk_to_tag);
+        }
+      } else if (call->trunk_to) {
+        snprintf(to_with_tag, sizeof(to_with_tag), "%s", call->trunk_to);
+      } else {
+        to_with_tag[0] = '\0';
+      }
+
+      sip_message_t err_msg;
+      memset(&err_msg, 0, sizeof(err_msg));
+      err_msg.via = call->trunk_via;
+      err_msg.from = call->trunk_from;
+      err_msg.to = to_with_tag;
+      err_msg.call_id = msg->call_id;
+      err_msg.cseq = call->trunk_cseq;
+      err_msg.cseq_method = "INVITE";
+
+      char *resp = sip_build_message(final_status, reason, &err_msg, NULL, NULL);
+      if (resp) {
+        sendto(s->fd, resp, strlen(resp), 0, (struct sockaddr *)&s->remote_addr, s->remote_addr_len);
+        free(resp);
+      }
+
+      inbound_call_delete(msg->call_id);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1427,4 +2328,35 @@ int pbx_trunk_dispatch_call_response(const char *trunk_name, sip_message_t *msg)
 
   log_warn("trunk: dispatch - trunk '%s' not found", trunk_name);
   return -1;
+}
+
+int pbx_trunk_dispatch_inbound_leg_response(sip_message_t *msg, const char *extension) {
+  if (!msg || !msg->call_id) return -1;
+
+  inbound_call_t *inbound = inbound_call_find(msg->call_id);
+  if (!inbound) return -1;
+
+  trunk_entry_t *entry = trunk_list;
+  while (entry) {
+    if (entry->cfg.name && strcmp(entry->cfg.name, inbound->trunk_name) == 0) {
+      trunk_state_t *state = entry->task ? (trunk_state_t *)entry->task->udata : NULL;
+      if (state) {
+        handle_inbound_leg_response(state, msg, extension);
+        return 0;
+      }
+      log_warn("trunk[%s]: no state available for inbound leg dispatch", inbound->trunk_name);
+      return -1;
+    }
+    entry = entry->next;
+  }
+
+  log_warn("trunk: dispatch - trunk '%s' not found for inbound leg", inbound->trunk_name);
+  return -1;
+}
+
+const char *pbx_trunk_find_name_for_inbound_call(const char *call_id) {
+  if (!call_id) return NULL;
+  inbound_call_t *inbound = inbound_call_find(call_id);
+  if (!inbound) return NULL;
+  return inbound->trunk_name;
 }

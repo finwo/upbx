@@ -24,6 +24,8 @@ void                pbx_registration_delete(const char *extension);
 pbx_registration_t *pbx_registration_find_by_remote_addr(const struct sockaddr *remote_addr);
 int                 pbx_registration_update_pbx_addr(const char *extension, const char *pbx_addr);
 
+char             **pbx_registration_find_by_groups(char **groups, size_t group_count, size_t *out_count);
+
 int         pbx_registration_cleanup(void);
 const char *pbx_registration_get_addrmap_dir(void);
 

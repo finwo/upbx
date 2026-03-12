@@ -347,3 +347,71 @@ int pbx_registration_cleanup(void) {
 const char *pbx_registration_get_addrmap_dir(void) {
   return addrmap_dir;
 }
+
+char **pbx_registration_find_by_groups(char **groups, size_t group_count, size_t *out_count) {
+  if (!groups || group_count == 0 || !out_count) {
+    if (out_count) *out_count = 0;
+    return NULL;
+  }
+
+  *out_count = 0;
+
+  char regdir[512];
+  snprintf(regdir, sizeof(regdir), "%s/registrations", data_dir);
+
+  DIR *dir = opendir(regdir);
+  if (!dir) return NULL;
+
+  size_t capacity = 16;
+  char **result = calloc(capacity, sizeof(char *));
+  if (!result) {
+    closedir(dir);
+    return NULL;
+  }
+
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_type != DT_REG) continue;
+    size_t len = strlen(entry->d_name);
+    if (len <= 5 || strcmp(entry->d_name + len - 5, ".resp") != 0) continue;
+
+    char ext[32];
+    snprintf(ext, sizeof(ext), "%.*s", (int)(len - 5), entry->d_name);
+
+    pbx_registration_t *reg = pbx_registration_find(ext);
+    if (!reg) continue;
+
+    int matches = 0;
+    for (size_t g = 0; g < group_count && !matches; g++) {
+      if (groups[g] && reg->group_prefix[0] && strcmp(reg->group_prefix, groups[g]) == 0) {
+        matches = 1;
+      }
+    }
+
+    if (matches) {
+      if (*out_count >= capacity) {
+        size_t new_capacity = capacity * 2;
+        char **new_result = realloc(result, new_capacity * sizeof(char *));
+        if (!new_result) {
+          free(reg);
+          break;
+        }
+        result   = new_result;
+        capacity = new_capacity;
+      }
+      result[*out_count] = strdup(ext);
+      (*out_count)++;
+    }
+
+    free(reg);
+  }
+
+  closedir(dir);
+
+  if (*out_count == 0) {
+    free(result);
+    return NULL;
+  }
+
+  return result;
+}
