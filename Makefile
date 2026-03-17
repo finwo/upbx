@@ -1,7 +1,7 @@
 # Top-level upbx Makefile: unified version management across core and plugins.
-# Updates VERSION?= in core/Makefile and plugin/*/Makefile via sed (portable: temp file + mv).
+# Updates VERSION?= in component/core/Makefile and plugin/*/Makefile via sed (portable: temp file + mv).
 
-VERSION_MAKEFILES := core/Makefile $(wildcard plugin/*/Makefile)
+VERSION_MAKEFILES := $(wildcard component/*/Makefile)
 
 # Sync version to all component Makefiles. Call from targets with version in VER.
 # Usage: make set-version VERSION=x.y.z  OR  version-sync / version-bump-* (VER from core).
@@ -31,24 +31,24 @@ set-version:
 	$(call version_sync,$(VERSION))
 
 version-sync:
-	@v=$$(grep '^VERSION?=' core/Makefile | sed 's/.*=//'); \
-	if [ -z "$$v" ]; then echo "Could not read VERSION from core/Makefile"; exit 1; fi; \
+	@v=$$(grep '^VERSION?=' component/core/Makefile | sed 's/.*=//'); \
+	if [ -z "$$v" ]; then echo "Could not read VERSION from component/core/Makefile"; exit 1; fi; \
 	$(call version_sync,$$v)
 
 version-bump-patch:
-	@v=$$(grep '^VERSION?=' core/Makefile | sed 's/.*=//'); \
+	@v=$$(grep '^VERSION?=' component/core/Makefile | sed 's/.*=//'); \
 	maj=$$(echo "$$v" | cut -d. -f1); min=$$(echo "$$v" | cut -d. -f2); patch=$$(echo "$$v" | cut -d. -f3); \
 	new="$$maj.$$min.$$((patch + 1))"; \
 	$(call version_sync,$$new)
 
 version-bump-minor:
-	@v=$$(grep '^VERSION?=' core/Makefile | sed 's/.*=//'); \
+	@v=$$(grep '^VERSION?=' component/core/Makefile | sed 's/.*=//'); \
 	maj=$$(echo "$$v" | cut -d. -f1); min=$$(echo "$$v" | cut -d. -f2); \
 	new="$$maj.$$((min + 1)).0"; \
 	$(call version_sync,$$new)
 
 version-bump-major:
-	@v=$$(grep '^VERSION?=' core/Makefile | sed 's/.*=//'); \
+	@v=$$(grep '^VERSION?=' component/core/Makefile | sed 's/.*=//'); \
 	maj=$$(echo "$$v" | cut -d. -f1); \
 	new="$$((maj + 1)).0.0"; \
 	$(call version_sync,$$new)
