@@ -1,0 +1,4 @@
+/lib/
+/license.c
+*.o
+/upbx

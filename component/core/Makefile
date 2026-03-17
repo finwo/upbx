@@ -1,144 +1,67 @@
-lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst J,j,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(subst Y,y,$(subst Z,z,$1))))))))))))))))))))))))))
-
-LIBS:=
-SRC:=
-
-# UNAME_MACHINE=$(call lc,$(shell uname -m))
-# UNAME_SYSTEM=$(call lc,$(shell uname -s))
-
-BIN?=upbx
-VERSION?=0.1.0
-
-CC:=gcc
-CPP:=g++
+CC?=clang
 
 FIND=$(shell which gfind find | head -1)
-SRC+=$(shell $(FIND) src/ -type f -name '*.c')
-# Exclude standalone test programs from main binary
-SRC:=$(filter-out $(wildcard src/test/test_*.c),$(SRC))
-# Exclude plugin module (not compatible with new scheduler)
-SRC:=$(filter-out src/PluginModule/plugin.c,$(SRC))
 
+UNAME_S:=$(shell uname -s)
+UNAME_M:=$(shell uname -m)
+
+SRC:=
 INCLUDES:=
+CFLAGS:=
+LDFLAGS:=
+DESTDIR?=/usr/local
 
-override CFLAGS?=-Wall -O2
-override CFLAGS+=-I src -D INI_HANDLER_LINENO=1 -D'UPBX_VERSION_STR="$(VERSION)"'
-override LDFLAGS?=
-
-override LDFLAGS+=-lresolv
-
-override CPPFLAGS?=
-
-ifeq ($(OS),Windows_NT)
-    # CFLAGS += -D WIN32
-    override CPPFLAGS+=-lstdc++
-    override CPPFLAGS+=
-    ifeq ($(PROCESSOR_ARCHITEW6432),AMD64)
-        # CFLAGS += -D AMD64
-    else
-        ifeq ($(PROCESSOR_ARCHITECTURE),AMD64)
-            # CFLAGS += -D AMD64
-        endif
-        ifeq ($(PROCESSOR_ARCHITECTURE),x86)
-            # CFLAGS += -D IA32
-        endif
-    endif
+ifeq ($(UNAME_S),Darwin)
+  OBJCOPY:=$(shell echo "echo 'Not using objcopy'")
+  LD:=$(shell which ld)
+  LICENSE_OBJ:=license.c
+  LDFLAGS+=-lobjc
 else
-    UNAME_S := $(shell uname -s)
-    ifeq ($(UNAME_S),Linux)
-        # CFLAGS += -D LINUX
-        override CPPFLAGS+=-lstdc++
-        # override CFLAGS+=$(shell pkg-config --cflags glib-2.0)
-        # override LDFLAGS+=$(shell pkg-config --libs glib-2.0)
-        override CFLAGS+=-D _GNU_SOURCE
-    endif
-    ifeq ($(UNAME_S),Darwin)
-        # CFLAGS += -D OSX
-        override CPPFLAGS+=-std=c++14
-        override CFLAGS+=-D _BSD_SOURCE
-    endif
-    UNAME_P := $(shell uname -p)
-    ifeq ($(UNAME_P),x86_64)
-        # CFLAGS += -D AMD64
-    endif
-    ifneq ($(filter %86,$(UNAME_P)),)
-        # CFLAGS += -D IA32
-    endif
-    ifneq ($(filter arm%,$(UNAME_P)),)
-        # CFLAGS += -D ARM
-    endif
-    # TODO: flags for riscv
+  OBJCOPY?=objcopy
+  OBJCOPY:=$(shell which objcopy)
+  LICENSE_OBJ:=license.o
 endif
+
+ARCH_TARGET?=$(shell echo $(UNAME_M) | sed -e 's/x86_64/elf64-x86-64/' -e 's/arm64/elf64-littleaarch64/' -e 's/aarch64/elf64-littleaarch64/')
+ARCH_BIN?=$(shell echo $(UNAME_M) | sed -e 's/x86_64/i386/' -e 's/arm64/aarch64/' -e 's/aarch64/aarch64/')
+
+SRC+=$(shell $(FIND) src/ -type f -name '*.c')
+INCLUDES+=-Isrc
 
 include lib/.dep/config.mk
 
 OBJ:=$(SRC:.c=.o)
 OBJ:=$(OBJ:.cc=.o)
+OBJ+=$(LICENSE_OBJ)
 
-override CFLAGS+=$(INCLUDES)
-override CPPFLAGS+=$(INCLUDES)
-override CPPFLAGS+=$(CFLAGS)
+CFLAGS+=${INCLUDES}
 
 .PHONY: default
-default: $(BIN) $(BIN).1
+default: upbx
 
-# Stddoc: extract /// documentation from source to markdown for manpage
-STDDOC ?= stddoc
-doc/cli_doc.md: $(SRC)
-	@mkdir -p doc
-	cat $(SRC) | $(STDDOC) > doc/cli_doc.md
+license.o: LICENSE.md
+	$(OBJCOPY) --input binary --output $(ARCH_TARGET) --binary-architecture $(ARCH_BIN) $< $@
 
-# Manpage: template + stddoc fragment (markdown -> man) + envsubst for VERSION
-doc/cli_doc.man: doc/cli_doc.md
-	pandoc doc/cli_doc.md -f markdown -t man -o doc/cli_doc.man
-
-doc/license.man: LICENSE.md
-	@mkdir -p doc
-	pandoc LICENSE.md -f markdown -t man --standalone=false -o doc/license.man
-
-$(BIN).1: doc/upbx.1.in doc/cli_doc.man doc/license.man
-	VERSION=$(VERSION) envsubst '$$VERSION' < doc/upbx.1.in | sed '/__COMMANDS_MAN__/r doc/cli_doc.man' | sed '/__COMMANDS_MAN__/d' | sed '/__LICENSE_MAN__/r doc/license.man' | sed '/__LICENSE_MAN__/d' > $(BIN).1
-
-# .cc.o:
-# 	$(CPP) $< $(CPPFLAGS) -c -o $@
+license.c: LICENSE.md
+	(echo "static const unsigned char _license_md_data[] = {"; xxd -i < LICENSE.md; echo "};") > license.c
+	(echo "static const unsigned char * const _license_md_end = _license_md_data + sizeof(_license_md_data);" >> license.c)
+	(echo "const unsigned char * const _binary_LICENSE_md_start = _license_md_data;" >> license.c)
+	(echo "const unsigned char * const _binary_LICENSE_md_end = _license_md_end;" >> license.c)
 
 .c.o:
 	${CC} $< ${CFLAGS} -c -o $@
 
-$(BIN): $(OBJ)
+upbx: $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
+	strip -u -r $@ 2>/dev/null || true
 
-# ---- Test targets (finwo/assert) ----
-TEST_BINS:=test_md5 test_resp test_pattern test_group test_config
-
-test_md5: src/test/test_md5.o src/common/md5.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_resp: src/test/test_resp.o src/common/resp.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_pattern: test/test_pattern.o src/domain/pbx/registration.o src/common/resp.o src/common/socket_util.o lib/rxi/log/src/log.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_group: test/test_group.o src/domain/pbx/group.o src/infrastructure/config.o src/domain/config.o src/common/resp.o src/common/socket_util.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-test_config: test/test_config.o src/infrastructure/config.o src/domain/config.o src/common/resp.o src/common/socket_util.o lib/benhoyt/inih/ini.o lib/rxi/log/src/log.o
-	$(CC) $^ $(CFLAGS) -o $@
-
-.PHONY: test
-test: $(TEST_BINS)
-	@for t in $(TEST_BINS); do echo "--- $$t ---"; ./$$t || exit 1; done
-	@echo "All tests passed."
+.PHONY: install
+install: upbx
+	install upbx ${DESTDIR}/bin
 
 .PHONY: clean
 clean:
-	rm -rf $(BIN) $(BIN).1 $(TEST_BINS)
-	rm -rf $(OBJ)
-	rm -rf $(patsubst %,src/test/%.o,$(TEST_BINS:test_%=test_%))
-	rm -rf src/test/*.o
-	rm -rf test/*.o
-	rm -rf doc/cli_doc.md doc/cli_doc.man doc/license.man
+	rm -f $(OBJ)
 
 .PHONY: format
 format:
