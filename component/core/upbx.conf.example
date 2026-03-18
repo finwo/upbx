@@ -1,0 +1,42 @@
+[upbx]
+address = :5060
+daemonize = 0
+data_dir = /var/lib/upbx
+rtpproxy = unix:///var/run/udphole.sock
+rtpproxy = tcp://username:password@192.0.2.55:6379
+# Emergency numbers: calls to these skip ext-to-ext and route via trunks
+emergency = 911
+emergency = 112
+
+[group:08540]
+allow_outgoing_cross_group = true
+allow_incoming_cross_group = true
+
+[group:08550]
+allow_outgoing_cross_group = false
+allow_incoming_cross_group = true
+
+[ext:08540200]
+name = Front desk
+secret = my-secret
+
+[ext:08540201]
+secret = my-secret
+
+[ext:08540210]
+secret = supers3cret
+
+[ext:085402xx]
+secret = pattern-secret
+
+[trunk:mycarrier]
+address = sip://myuser:mypass@sip.example.com:5060
+did = 31123456789
+did = 15559876543
+cid = 15559876543
+group = 08540
+
+rewrite_pattern = ^00(.*)$
+rewrite_replace = +\1
+rewrite_pattern = ^0(.*)$
+rewrite_replace = +31\1

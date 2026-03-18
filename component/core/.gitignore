@@ -2,3 +2,5 @@
 /license.c
 *.o
 /upbx
+/data/
+*.conf
