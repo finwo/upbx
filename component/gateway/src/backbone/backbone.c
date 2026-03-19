@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 
 #include "rxi/log.h"
@@ -245,9 +246,24 @@ static int backbone_task(int64_t timestamp, pt_task_t *task) {
         if (bs->current->host) strncpy(host_buf, bs->current->host, sizeof(host_buf) - 1);
         if (bs->current->port) port_val = atoi(bs->current->port);
 
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        char port_buf[16];
+        snprintf(port_buf, sizeof(port_buf), "%d", port_val);
+
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        if (getaddrinfo(host_buf, port_buf, &hints, &res) != 0 || !res) {
+            log_error("backbone: DNS resolution failed for %s:%s", host_buf, port_buf);
+            advance_backbone(bs);
+            return SCHED_RUNNING;
+        }
+
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) {
             log_error("backbone: socket() failed: %s", strerror(errno));
+            freeaddrinfo(res);
             advance_backbone(bs);
             return SCHED_RUNNING;
         }
@@ -255,18 +271,8 @@ static int backbone_task(int64_t timestamp, pt_task_t *task) {
         // Non-blocking connect
         fcntl(fd, F_SETFL, O_NONBLOCK);
 
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t)port_val);
-        if (inet_pton(AF_INET, host_buf, &addr.sin_addr) <= 0) {
-            log_error("backbone: inet_pton failed for %s", host_buf);
-            close(fd);
-            advance_backbone(bs);
-            return SCHED_RUNNING;
-        }
-
-        int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+        int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+        freeaddrinfo(res);
         if (rc < 0 && errno != EINPROGRESS) {
             log_debug("backbone: connect to %s:%d failed: %s",
                       host_buf, port_val, strerror(errno));

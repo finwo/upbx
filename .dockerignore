@@ -3,6 +3,8 @@
 *.so
 *.so.*
 upbx
+upbx-gw
+upbx-backbone
 upbx.1
 doc/cli_doc.md
 doc/cli_doc.man

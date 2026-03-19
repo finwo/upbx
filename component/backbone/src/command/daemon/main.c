@@ -97,7 +97,13 @@ int cmd_daemon(int argc, const char **argv) {
         if (la->scheme && strcmp(la->scheme, "unix") == 0) {
             fds = unix_listen(la->path, SOCK_STREAM, NULL);
         } else {
-            fds = tcp_listen(la->url, NULL, NULL);
+            char addr_buf[512];
+            if (la->host && la->host[0]) {
+                snprintf(addr_buf, sizeof(addr_buf), "%s:%s", la->host, la->port ? la->port : "");
+            } else {
+                snprintf(addr_buf, sizeof(addr_buf), ":%s", la->port ? la->port : "");
+            }
+            fds = tcp_listen(addr_buf, NULL, NULL);
         }
         if (fds && fds[0] > 0) {
             arrays[count++] = fds;
