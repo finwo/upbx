@@ -1,6 +1,9 @@
+*.dSYM/
 /lib/
-/license.c
 *.o
+/license.c
+*.log
 /upbx
-/data/
-*.conf
+/test_cross_peer
+/test_edge_cases
+/test_same_node

@@ -1,42 +1,37 @@
+; UPBX example configuration
+;
+; Copy this file to /etc/upbx.conf and adjust to your needs.
+; Run with: upbx daemon -c /path/to/upbx.conf
+
 [upbx]
-address = :5060
-daemonize = 0
-data_dir = /var/lib/upbx
-rtpproxy = unix:///var/run/udphole.sock
-rtpproxy = tcp://username:password@192.0.2.55:6379
-# Emergency numbers: calls to these skip ext-to-ext and route via trunks
-emergency = 911
-emergency = 112
 
-[group:08540]
-allow_outgoing_cross_group = true
-allow_incoming_cross_group = true
+; Listen addresses (repeatable)
+; Clients and peers connect to these addresses.
+listen = tcp://:5070
+; listen = unix:///var/run/upbx.sock
 
-[group:08550]
-allow_outgoing_cross_group = false
-allow_incoming_cross_group = true
+; Peer addresses (repeatable)
+; Other UPBX nodes to connect to for call routing.
+; Only one side needs to list the other as a peer;
+; the connection is bidirectional once established.
+; peer = tcp://192.168.1.10:5070
+; peer = unix:///var/run/peer.sock
 
-[ext:08540200]
-name = Front desk
-secret = my-secret
+; Cluster secret
+; All nodes in the cluster must share the same secret.
+; Used to derive the ed25519 keypair for peer authentication.
+cluster_secret = change-me
 
-[ext:08540201]
-secret = my-secret
+; User accounts
+; Each user section defines a client that can authenticate.
+; Provide either a secret (for key derivation) or a pubkey (direct).
 
-[ext:08540210]
-secret = supers3cret
+[user:alice]
+secret = alice-secret
 
-[ext:085402xx]
-secret = pattern-secret
+[user:bob]
+secret = bob-secret
 
-[trunk:mycarrier]
-address = sip://myuser:mypass@sip.example.com:5060
-did = 31123456789
-did = 15559876543
-cid = 15559876543
-group = 08540
-
-rewrite_pattern = ^00(.*)$
-rewrite_replace = +\1
-rewrite_pattern = ^0(.*)$
-rewrite_replace = +31\1
+; Example using a direct public key (32 bytes, hex-encoded):
+; [user:carol]
+; pubkey = abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
