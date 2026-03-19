@@ -1,0 +1,1145 @@
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#include "pbx/pbx.h"
+#include "sip/parser.h"
+#include "sip/message.h"
+#include "sdp/sdp.h"
+#include "md5/md5.h"
+#include "backbone/backbone.h"
+#include "rtp/rtp.h"
+#include "config/config.h"
+#include "finwo/scheduler.h"
+#include "rxi/log.h"
+
+#define MAX_EXPIRY   300
+#define DEFAULT_EXPIRY 60
+#define NONCE_WINDOW 10
+#define BUSY_RETRY_SEC 30
+#define CLEANUP_INTERVAL 5
+
+/* ── helpers ─────────────────────────────────────────────────── */
+
+static void generate_hex_id(char *out, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) { out[0] = '\0'; return; }
+    size_t need = (len - 1) / 2;
+    uint8_t buf[32];
+    if (need > 32) need = 32;
+    fread(buf, 1, need, f);
+    fclose(f);
+    for (size_t i = 0; i < need && i * 2 + 1 < len; i++) {
+        out[i * 2]     = hex[(buf[i] >> 4) & 0xf];
+        out[i * 2 + 1] = hex[buf[i] & 0xf];
+    }
+    out[need * 2] = '\0';
+}
+
+static void send_sip(struct pbx_state *ps, struct sockaddr_storage *dst,
+                     const char *data, int len) {
+    sendto(ps->sip_fd, data, (size_t)len, 0,
+           (struct sockaddr *)dst, sizeof(*dst));
+}
+
+static char *addr_to_str(struct sockaddr_storage *ss) {
+    char ip[INET6_ADDRSTRLEN];
+    int port;
+    if (ss->ss_family == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *)ss;
+        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
+        port = ntohs(s->sin_port);
+    } else {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)ss;
+        inet_ntop(AF_INET6, &s->sin6_addr, ip, sizeof(ip));
+        port = ntohs(s->sin6_port);
+    }
+    char *out = malloc(256);
+    snprintf(out, 256, "%s:%d", ip, port);
+    return out;
+}
+
+/* ── call lookup ─────────────────────────────────────────────── */
+
+struct pbx_call *pbx_find_by_sip_id(struct pbx_state *s, const char *sip_call_id) {
+    for (struct pbx_call *c = s->calls; c; c = c->next) {
+        if (c->sip_call_id && strcmp(c->sip_call_id, sip_call_id) == 0) return c;
+    }
+    return NULL;
+}
+
+struct pbx_call *pbx_find_by_backbone_id(struct pbx_state *s, const char *bb_call_id) {
+    for (struct pbx_call *c = s->calls; c; c = c->next) {
+        if (strcmp(c->backbone_call_id, bb_call_id) == 0) return c;
+    }
+    return NULL;
+}
+
+static struct pbx_call *pbx_find_by_branch_sip_id(struct pbx_state *s, const char *sip_id) {
+    for (struct pbx_call *c = s->calls; c; c = c->next) {
+        for (struct fork_branch *b = c->branches; b; b = b->next) {
+            if (b->sip_call_id && strcmp(b->sip_call_id, sip_id) == 0) return c;
+        }
+    }
+    return NULL;
+}
+
+/* ── call cleanup ────────────────────────────────────────────── */
+
+static void free_branches(struct fork_branch *b) {
+    while (b) {
+        struct fork_branch *next = b->next;
+        free(b->sip_call_id);
+        rtp_free(b->rtp);
+        free(b);
+        b = next;
+    }
+}
+
+static void pbx_call_free(struct pbx_call *call) {
+    free(call->sip_call_id);
+    free(call->caller_ext);
+    free(call->callee_did);
+    rtp_free(call->rtp_caller);
+    rtp_free(call->rtp_callee);
+    free_branches(call->branches);
+    free(call);
+}
+
+void pbx_call_remove(struct pbx_state *s, struct pbx_call *call) {
+    struct pbx_call **prev = &s->calls;
+    while (*prev && *prev != call) prev = &(*prev)->next;
+    if (*prev == call) *prev = call->next;
+    pbx_call_free(call);
+}
+
+/* ── REGISTER handler ────────────────────────────────────────── */
+
+static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
+                            struct sip_msg *msg) {
+    char *ext_num = sip_extract_uri_user(msg->to);
+    if (!ext_num) {
+        char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL, 0);
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        return;
+    }
+
+    struct gw_ext *ext = gw_config_find_ext(ps->config, ext_num);
+    if (!ext) {
+        char *resp = sip_build_response(404, "Not Found", msg, NULL, NULL, 0);
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        free(ext_num);
+        return;
+    }
+
+    /* Detect pbx_addr from request-uri */
+    char *pbx_addr = sip_extract_uri_host(msg->uri);
+    if (pbx_addr) {
+        free(ext->pbx_addr);
+        ext->pbx_addr = strdup(pbx_addr);
+        free(pbx_addr);
+    }
+
+    /* Check for unregister */
+    if (msg->expires == 0) {
+        ext->registered = 0;
+        memset(&ext->remote_addr, 0, sizeof(ext->remote_addr));
+        free(ext->contact);
+        ext->contact = NULL;
+        ext->expires = 0;
+        log_info("pbx: extension %s unregistered", ext_num);
+        char *resp = sip_build_response(200, "OK", msg, NULL, NULL, 0);
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        free(ext_num);
+        return;
+    }
+
+    /* No auth header → send 401 challenge */
+    if (!msg->authorization) {
+        char nonce[32];
+        snprintf(nonce, sizeof(nonce), "%ld", (long)time(NULL));
+        char *resp = sip_build_401(msg, nonce, "upbx");
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        free(ext_num);
+        return;
+    }
+
+    /* Parse auth header */
+    struct sip_auth *auth = sip_parse_auth(msg->authorization);
+    if (!auth || !auth->nonce || !auth->response || !auth->uri) {
+        char nonce[32];
+        snprintf(nonce, sizeof(nonce), "%ld", (long)time(NULL));
+        char *resp = sip_build_401(msg, nonce, "upbx");
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        sip_auth_free(auth);
+        free(ext_num);
+        return;
+    }
+
+    /* Validate nonce */
+    long nonce_val = atol(auth->nonce);
+    long now = time(NULL);
+    if (nonce_val < now - NONCE_WINDOW || nonce_val > now + NONCE_WINDOW) {
+        char nonce[32];
+        snprintf(nonce, sizeof(nonce), "%ld", (long)now);
+        char *resp = sip_build_401(msg, nonce, "upbx");
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        sip_auth_free(auth);
+        free(ext_num);
+        return;
+    }
+
+    /* Compute expected response:
+     * HA1 = MD5(ext:upbx:secret)
+     * HA2 = MD5(REGISTER:auth_uri)
+     * expected = MD5(HA1:nonce:HA2)
+     */
+    char ha1_buf[256];
+    int ha1_len = snprintf(ha1_buf, sizeof(ha1_buf), "%s:upbx:%s", ext_num, ext->secret);
+    uint8_t ha1_raw[16];
+    gw_md5((const uint8_t *)ha1_buf, (size_t)ha1_len, ha1_raw);
+    char ha1[33];
+    gw_md5_hex(ha1_raw, ha1);
+
+    char ha2_buf[512];
+    int ha2_len = snprintf(ha2_buf, sizeof(ha2_buf), "REGISTER:%s", auth->uri);
+    uint8_t ha2_raw[16];
+    gw_md5((const uint8_t *)ha2_buf, (size_t)ha2_len, ha2_raw);
+    char ha2[33];
+    gw_md5_hex(ha2_raw, ha2);
+
+    char resp_buf[512];
+    int resp_len = snprintf(resp_buf, sizeof(resp_buf), "%s:%s:%s", ha1, auth->nonce, ha2);
+    uint8_t resp_raw[16];
+    gw_md5((const uint8_t *)resp_buf, (size_t)resp_len, resp_raw);
+    char expected[33];
+    gw_md5_hex(resp_raw, expected);
+
+    if (strcmp(expected, auth->response) != 0) {
+        log_warn("pbx: auth failed for extension %s", ext_num);
+        char nonce[32];
+        snprintf(nonce, sizeof(nonce), "%ld", (long)now);
+        char *resp = sip_build_401(msg, nonce, "upbx");
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        sip_auth_free(auth);
+        free(ext_num);
+        return;
+    }
+
+    /* Auth succeeded */
+    ext->remote_addr = *src;
+    if (msg->contact) {
+        free(ext->contact);
+        ext->contact = strdup(msg->contact);
+    }
+    int expiry = DEFAULT_EXPIRY;
+    if (msg->expires > 0) {
+        expiry = msg->expires;
+        if (expiry > MAX_EXPIRY) expiry = MAX_EXPIRY;
+    }
+    ext->expires = time(NULL) + expiry;
+    ext->registered = 1;
+
+    log_info("pbx: extension %s registered from %s, pbx_addr=%s, expires=%ds",
+             ext_num, addr_to_str(src), ext->pbx_addr ? ext->pbx_addr : "?", expiry);
+
+    char extra[128];
+    snprintf(extra, sizeof(extra), "Expires: %d\r\n", expiry);
+    char *resp = sip_build_response(200, "OK", msg, extra, NULL, 0);
+    send_sip(ps, src, resp, (int)strlen(resp));
+    free(resp);
+    sip_auth_free(auth);
+    free(ext_num);
+}
+
+/* ── DID rewrite ─────────────────────────────────────────────── */
+
+static char *apply_rewrite(struct gw_config *cfg, const char *number) {
+    regmatch_t pmatch[10];
+    for (struct gw_rewrite_rule *r = cfg->rewrite_rules; r; r = r->next) {
+        if (regexec(&r->compiled, number, 10, pmatch, 0) == 0) {
+            /* Match found — apply replacement with backreferences */
+            char result[512];
+            const char *rp = r->replace_str;
+            char *w = result;
+            char *wend = result + sizeof(result) - 1;
+
+            while (*rp && w < wend) {
+                if (*rp == '\\' && rp[1] >= '1' && rp[1] <= '9') {
+                    int idx = rp[1] - '0';
+                    if (pmatch[idx].rm_so >= 0) {
+                        int slen = pmatch[idx].rm_eo - pmatch[idx].rm_so;
+                        if (w + slen <= wend) {
+                            memcpy(w, number + pmatch[idx].rm_so, slen);
+                            w += slen;
+                        }
+                    }
+                    rp += 2;
+                } else {
+                    *w++ = *rp++;
+                }
+            }
+            *w = '\0';
+            return strdup(result);
+        }
+    }
+    return strdup(number);
+}
+
+/* ── SIP INVITE handler ──────────────────────────────────────── */
+
+static void send_trying(struct pbx_state *ps, struct sockaddr_storage *dst, struct sip_msg *msg) {
+    char *resp = sip_build_response(100, "Trying", msg, NULL, NULL, 0);
+    send_sip(ps, dst, resp, (int)strlen(resp));
+    free(resp);
+}
+
+static void ext_to_ext(struct pbx_state *ps, struct sockaddr_storage *caller_addr,
+                       struct gw_ext *caller_ext, struct gw_ext *callee_ext,
+                       struct sip_msg *msg) {
+    if (!callee_ext->registered) {
+        char *resp = sip_build_response(480, "Temporarily Unavailable", msg, NULL, NULL, 0);
+        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        free(resp);
+        return;
+    }
+
+    /* Allocate two RTP pairs */
+    struct rtp_pair *rtp_a = rtp_alloc(&ps->rtp_ctx);
+    struct rtp_pair *rtp_b = rtp_alloc(&ps->rtp_ctx);
+    if (!rtp_a || !rtp_b) {
+        char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
+        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        free(resp);
+        rtp_free(rtp_a);
+        rtp_free(rtp_b);
+        return;
+    }
+    rtp_a->peer = rtp_b;
+    rtp_b->peer = rtp_a;
+
+    /* Rewrite caller's SDP to point to rtp_a port */
+    char *new_sdp = NULL;
+    int new_sdp_len = 0;
+    if (msg->body && msg->body_len > 0 && caller_ext->pbx_addr) {
+        new_sdp = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr, rtp_a->port, &new_sdp_len);
+    }
+
+    /* Create call */
+    struct pbx_call *call = calloc(1, sizeof(struct pbx_call));
+    call->sip_call_id = strdup(msg->call_id);
+    call->caller_addr = *caller_addr;
+    call->caller_ext = strdup(caller_ext->extension);
+    call->callee_did = strdup(callee_ext->extension);
+    call->cseq_num = msg->cseq_num;
+    call->rtp_caller = rtp_a;
+    call->rtp_callee = rtp_b;
+    call->is_backbone_call = 0;
+    call->state = CALL_PENDING;
+    call->next = ps->calls;
+    ps->calls = call;
+
+    /* Build INVITE for callee with callee's pbx_addr and rtp_b port */
+    char callee_sdp[4096] = "";
+    int callee_sdp_len = 0;
+    if (new_sdp && callee_ext->pbx_addr) {
+        char *callee_rewrite = sdp_rewrite(msg->body, msg->body_len, callee_ext->pbx_addr, rtp_b->port, &callee_sdp_len);
+        if (callee_rewrite) {
+            if (callee_sdp_len < (int)sizeof(callee_sdp)) {
+                memcpy(callee_sdp, callee_rewrite, callee_sdp_len);
+            }
+            free(callee_rewrite);
+        }
+    }
+
+    char cseq_method[256];
+    snprintf(cseq_method, sizeof(cseq_method), "%d INVITE", msg->cseq_num + 1);
+
+    char invite[4096];
+    int ilen = snprintf(invite, sizeof(invite),
+        "INVITE sip:%s@%s SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+        "From: %s\r\n"
+        "To: <sip:%s@%s>\r\n"
+        "Call-ID: %s\r\n"
+        "CSeq: %s\r\n"
+        "Contact: <sip:gw@%s>\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n",
+        callee_ext->extension, callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+        callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0", call->backbone_call_id,
+        msg->from ? msg->from : "",
+        callee_ext->extension, callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+        msg->call_id,
+        cseq_method,
+        callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+        callee_sdp_len);
+
+    if (ilen > 0 && callee_sdp_len > 0 && ilen + callee_sdp_len < (int)sizeof(invite)) {
+        memcpy(invite + ilen, callee_sdp, callee_sdp_len);
+        ilen += callee_sdp_len;
+    }
+
+    send_sip(ps, &callee_ext->remote_addr, invite, ilen);
+    free(new_sdp);
+}
+
+static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *caller_addr,
+                            struct gw_ext *caller_ext, const char *dialed,
+                            struct sip_msg *msg) {
+    if (!ps->backbone || ps->backbone->phase != BACKBONE_CONNECTED) {
+        char *resp = sip_build_response(503, "Service Unavailable", msg, NULL, NULL, 0);
+        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        free(resp);
+        return;
+    }
+
+    /* Apply rewrite rules */
+    char *rewritten = apply_rewrite(ps->config, dialed);
+
+    /* Allocate one RTP pair */
+    struct rtp_pair *rtp = rtp_alloc(&ps->rtp_ctx);
+    if (!rtp) {
+        char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
+        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        free(resp);
+        free(rewritten);
+        return;
+    }
+    rtp->is_backbone_dir = 1;
+    rtp->backbone = ps->backbone;
+
+    /* Generate backbone call_id */
+    struct pbx_call *call = calloc(1, sizeof(struct pbx_call));
+    call->sip_call_id = strdup(msg->call_id);
+    generate_hex_id(call->backbone_call_id, 33);
+    strncpy(rtp->call_id, call->backbone_call_id, sizeof(rtp->call_id) - 1);
+
+    call->caller_addr = *caller_addr;
+    call->caller_ext = strdup(caller_ext->extension);
+    call->callee_did = rewritten;
+    call->cseq_num = msg->cseq_num;
+    call->rtp_caller = rtp;
+    call->is_backbone_call = 1;
+    call->state = CALL_PENDING;
+    call->next = ps->calls;
+    ps->calls = call;
+
+    /* Rewrite caller's SDP to point to RTP port */
+    if (msg->body && msg->body_len > 0 && caller_ext->pbx_addr) {
+        char *new_sdp = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr, rtp->port, NULL);
+        /* We don't send SDP to backbone, just need the port for RTP */
+        free(new_sdp);
+    }
+
+    /* Send invite to backbone */
+    backbone_send_invite(ps->backbone, call->backbone_call_id, rewritten, ps->config->cid);
+
+    log_info("pbx: ext %s calling backbone: %s (rewritten: %s), bb_call_id=%s",
+             caller_ext->extension, dialed, rewritten, call->backbone_call_id);
+}
+
+static void handle_invite(struct pbx_state *ps, struct sockaddr_storage *src,
+                          struct sip_msg *msg) {
+    send_trying(ps, src, msg);
+
+    char *dialed = sip_extract_uri_user(msg->uri);
+    if (!dialed) {
+        char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL, 0);
+        send_sip(ps, src, resp, (int)strlen(resp));
+        free(resp);
+        return;
+    }
+
+    /* Find caller extension by source address */
+    struct gw_ext *caller_ext = NULL;
+    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
+        if (e->registered && memcmp(&e->remote_addr, src, sizeof(*src)) == 0) {
+            caller_ext = e;
+            break;
+        }
+    }
+
+    /* Check if dialed number matches a registered extension */
+    struct gw_ext *callee_ext = NULL;
+    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
+        if (e->registered && strcmp(e->extension, dialed) == 0) {
+            callee_ext = e;
+            break;
+        }
+    }
+
+    if (callee_ext && callee_ext != caller_ext) {
+        ext_to_ext(ps, src, caller_ext, callee_ext, msg);
+    } else {
+        ext_to_backbone(ps, src, caller_ext, dialed, msg);
+    }
+
+    free(dialed);
+}
+
+/* ── SIP BYE handler ─────────────────────────────────────────── */
+
+static void handle_bye(struct pbx_state *ps, struct sockaddr_storage *src,
+                       struct sip_msg *msg) {
+    struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
+    if (!call) {
+        /* Could be a branch SIP call-id */
+        call = pbx_find_by_branch_sip_id(ps, msg->call_id);
+    }
+
+    char *ok = sip_build_response(200, "OK", msg, NULL, NULL, 0);
+    send_sip(ps, src, ok, (int)strlen(ok));
+    free(ok);
+
+    if (!call) return;
+
+    if (call->is_backbone_call) {
+        backbone_send_bye(ps->backbone, call->backbone_call_id);
+    }
+
+    pbx_call_remove(ps, call);
+}
+
+/* ── SIP CANCEL handler ──────────────────────────────────────── */
+
+static void handle_cancel(struct pbx_state *ps, struct sockaddr_storage *src,
+                          struct sip_msg *msg) {
+    char *ok = sip_build_response(200, "OK", msg, NULL, NULL, 0);
+    send_sip(ps, src, ok, (int)strlen(ok));
+    free(ok);
+
+    struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
+    if (!call) call = pbx_find_by_branch_sip_id(ps, msg->call_id);
+    if (!call) return;
+
+    /* Send CANCEL to all pending branches (backbone→ext) */
+    for (struct fork_branch *b = call->branches; b; b = b->next) {
+        if (!b->answered && !b->finished) {
+            char cancel[512];
+            int clen = snprintf(cancel, sizeof(cancel),
+                "CANCEL sip:%s@%s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                "From: <sip:gw@pbx>\r\n"
+                "To: <sip:%s@%s>\r\n"
+                "Call-ID: %s\r\n"
+                "CSeq: 1 CANCEL\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n",
+                b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0", b->sip_call_id,
+                b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                b->sip_call_id);
+            send_sip(ps, &b->ext->remote_addr, cancel, clen);
+            b->finished = 1;
+        }
+    }
+
+    if (call->is_backbone_call) {
+        backbone_send_cancel(ps->backbone, call->backbone_call_id);
+    }
+
+    pbx_call_remove(ps, call);
+}
+
+/* ── SIP ACK handler ─────────────────────────────────────────── */
+
+static void handle_ack(struct pbx_state *ps, struct sockaddr_storage *src,
+                       struct sip_msg *msg) {
+    (void)ps;
+    (void)src;
+    (void)msg;
+    /* ACK is handled implicitly — no response needed */
+}
+
+/* ── SIP OPTIONS handler ─────────────────────────────────────── */
+
+static void handle_options(struct pbx_state *ps, struct sockaddr_storage *src,
+                           struct sip_msg *msg) {
+    char *resp = sip_build_response(200, "OK", msg, NULL, NULL, 0);
+    send_sip(ps, src, resp, (int)strlen(resp));
+    free(resp);
+}
+
+/* ── SIP response handler (from extensions) ──────────────────── */
+
+static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *src,
+                                struct sip_msg *msg) {
+    (void)src;
+
+    /* Find the call — could be a direct call or a fork branch */
+    struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
+    struct fork_branch *branch = NULL;
+
+    if (!call) {
+        /* Check if this is a fork branch response */
+        call = pbx_find_by_branch_sip_id(ps, msg->call_id);
+        if (call) {
+            for (struct fork_branch *b = call->branches; b; b = b->next) {
+                if (b->sip_call_id && strcmp(b->sip_call_id, msg->call_id) == 0) {
+                    branch = b;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!call) return;
+
+    int code = msg->status_code;
+
+    /* Handle ext-to-ext responses */
+    if (!call->is_backbone_call && !branch) {
+        /* Callee's response to our ext-to-ext INVITE */
+        if (code == 180) {
+            /* Forward ringing to caller */
+            char *resp = sip_build_response(180, "Ringing", msg, NULL, NULL, 0);
+            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            free(resp);
+        } else if (code == 200) {
+            /* Forward 200 OK to caller with rewritten SDP */
+            char *body = NULL;
+            int body_len = 0;
+            struct gw_ext *caller_ext = gw_config_find_ext(ps->config, call->caller_ext);
+            if (msg->body && msg->body_len > 0 && caller_ext && caller_ext->pbx_addr) {
+                body = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr,
+                                   call->rtp_caller->port, &body_len);
+            }
+            char *resp = sip_build_response(200, "OK", msg, NULL, body, body_len);
+            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            free(resp);
+            free(body);
+            call->state = CALL_ACTIVE;
+        } else if (code >= 400) {
+            /* Forward error to caller */
+            char *resp = sip_build_response(code, msg->reason ? msg->reason : "Error", msg, NULL, NULL, 0);
+            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            free(resp);
+            pbx_call_remove(ps, call);
+        }
+        return;
+    }
+
+    /* Handle ext-to-backbone responses — shouldn't happen from ext side normally */
+    if (call->is_backbone_call && !branch) return;
+
+    /* Handle backbone→ext fork branch responses */
+    if (!branch) return;
+
+    if (code == 180) {
+        /* First ringing → send ringing to backbone */
+        if (call->state < CALL_RINGING && ps->backbone) {
+            backbone_send_ringing(ps->backbone, call->backbone_call_id);
+            call->state = CALL_RINGING;
+        }
+    } else if (code == 200) {
+        if (call->state >= CALL_ACTIVE) {
+            /* Double pickup race — send BYE to late answerer */
+            char bye[512];
+            int blen = snprintf(bye, sizeof(bye),
+                "BYE sip:%s@%s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                "From: <sip:gw@pbx>\r\n"
+                "To: <sip:%s@%s>\r\n"
+                "Call-ID: %s\r\n"
+                "CSeq: 2 BYE\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n",
+                branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0", branch->sip_call_id,
+                branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                branch->sip_call_id);
+            send_sip(ps, &branch->ext->remote_addr, bye, blen);
+            return;
+        }
+
+        branch->answered = 1;
+        call->state = CALL_ACTIVE;
+
+        /* Send answer to backbone */
+        backbone_send_answer(ps->backbone, call->backbone_call_id);
+
+        /* Set up RTP for this branch */
+        if (branch->rtp) {
+            call->rtp_caller = branch->rtp;
+            branch->rtp = NULL; /* ownership transferred */
+        }
+
+        /* Send ACK to answering extension */
+        if (msg->contact) {
+            char ack[512];
+            int alen = snprintf(ack, sizeof(ack),
+                "ACK %s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwack%s\r\n"
+                "From: <sip:gw@pbx>\r\n"
+                "To: %s\r\n"
+                "Call-ID: %s\r\n"
+                "CSeq: 1 ACK\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n",
+                msg->contact,
+                branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                branch->sip_call_id,
+                msg->to ? msg->to : "",
+                branch->sip_call_id);
+            send_sip(ps, &branch->ext->remote_addr, ack, alen);
+        }
+
+        /* Cancel all other pending branches */
+        for (struct fork_branch *b = call->branches; b; b = b->next) {
+            if (b != branch && !b->answered && !b->finished) {
+                char cancel[512];
+                int clen = snprintf(cancel, sizeof(cancel),
+                    "CANCEL sip:%s@%s SIP/2.0\r\n"
+                    "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                    "From: <sip:gw@pbx>\r\n"
+                    "To: <sip:%s@%s>\r\n"
+                    "Call-ID: %s\r\n"
+                    "CSeq: 1 CANCEL\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n",
+                    b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                    b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0", b->sip_call_id,
+                    b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                    b->sip_call_id);
+                send_sip(ps, &b->ext->remote_addr, cancel, clen);
+                b->finished = 1;
+            }
+        }
+
+        log_info("pbx: backbone call %s answered by ext %s",
+                 call->backbone_call_id, branch->ext->extension);
+    } else if (code == 486) {
+        /* Busy — queue for retry */
+        branch->busy = 1;
+        branch->retry_at = time(NULL) + BUSY_RETRY_SEC;
+        log_debug("pbx: ext %s busy, retry at T+%ds", branch->ext->extension, BUSY_RETRY_SEC);
+    } else if (code >= 400) {
+        /* Other failure — mark finished */
+        branch->finished = 1;
+    }
+}
+
+/* ── Backbone INVITE handler ─────────────────────────────────── */
+
+void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id) {
+    struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
+    if (!call) return;
+
+    /* Send 180 Ringing to the extension */
+    char ringing[1024];
+    int rlen = snprintf(ringing, sizeof(ringing),
+        "SIP/2.0 180 Ringing\r\n"
+        "From: <sip:gw@pbx>\r\n"
+        "To: <sip:%s@%s>\r\n"
+        "Call-ID: %s\r\n"
+        "CSeq: %d INVITE\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n",
+        call->callee_did ? call->callee_did : "?",
+        "0.0.0.0",
+        call->sip_call_id,
+        call->cseq_num);
+    send_sip(s, &call->caller_addr, ringing, rlen);
+    call->state = CALL_RINGING;
+}
+
+void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id) {
+    struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
+    if (!call) return;
+
+    /* Send 200 OK to extension with SDP pointing to our RTP port */
+    char sdp_body[512];
+    int sdp_len = 0;
+    struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
+    if (caller_ext && caller_ext->pbx_addr && call->rtp_caller) {
+        sdp_len = snprintf(sdp_body, sizeof(sdp_body),
+            "v=0\r\n"
+            "o=- 0 0 IN IP4 %s\r\n"
+            "s=session\r\n"
+            "c=IN IP4 %s\r\n"
+            "t=0 0\r\n"
+            "m=audio %d RTP/AVP 0 8 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            caller_ext->pbx_addr, caller_ext->pbx_addr, call->rtp_caller->port);
+    }
+
+    char ok[2048];
+    int olen = snprintf(ok, sizeof(ok),
+        "SIP/2.0 200 OK\r\n"
+        "From: <sip:gw@pbx>\r\n"
+        "To: <sip:%s@%s>\r\n"
+        "Call-ID: %s\r\n"
+        "CSeq: %d INVITE\r\n"
+        "Contact: <sip:gw@%s>\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n",
+        call->callee_did ? call->callee_did : "?",
+        "0.0.0.0",
+        call->sip_call_id,
+        call->cseq_num,
+        caller_ext && caller_ext->pbx_addr ? caller_ext->pbx_addr : "0.0.0.0",
+        sdp_len);
+
+    if (olen > 0 && sdp_len > 0 && olen + sdp_len < (int)sizeof(ok)) {
+        memcpy(ok + olen, sdp_body, sdp_len);
+        olen += sdp_len;
+    }
+
+    send_sip(s, &call->caller_addr, ok, olen);
+    call->state = CALL_ACTIVE;
+}
+
+void pbx_on_backbone_cancel(struct pbx_state *s, const char *call_id) {
+    struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
+    if (!call) return;
+    pbx_call_remove(s, call);
+}
+
+void pbx_on_backbone_media(struct pbx_state *s, const char *call_id,
+                           const uint8_t *data, size_t len) {
+    struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
+    if (!call || call->state != CALL_ACTIVE) return;
+    if (!call->rtp_caller) return;
+
+    /* Send decoded RTP to extension */
+    rtp_send_to_ext(call->rtp_caller, data, len);
+}
+
+void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
+    struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
+    if (!call) return;
+
+    /* Send BYE to the connected extension */
+    if (call->rtp_caller) {
+        char bye[512];
+        int blen = snprintf(bye, sizeof(bye),
+            "BYE sip:%s@%s SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwbye\r\n"
+            "From: <sip:gw@pbx>\r\n"
+            "To: <sip:%s@%s>\r\n"
+            "Call-ID: %s\r\n"
+            "CSeq: 2 BYE\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n",
+            call->caller_ext ? call->caller_ext : "?",
+            "0.0.0.0",
+            "0.0.0.0",
+            call->caller_ext ? call->caller_ext : "?",
+            "0.0.0.0",
+            call->sip_call_id);
+        send_sip(s, &call->caller_addr, bye, blen);
+    }
+
+    pbx_call_remove(s, call);
+}
+
+/* ── Backbone INVITE (incoming call from backbone) ───────────── */
+
+/* Called by the backbone module when it receives "invite <call_id> <did> <cid>" */
+static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
+                                   const char *did, const char *cid) {
+    /* Check if DID matches any configured DID */
+    int did_match = 0;
+    for (struct gw_did *d = ps->config->dids; d; d = d->next) {
+        if (strcmp(d->did, did) == 0) {
+            did_match = 1;
+            break;
+        }
+    }
+    if (!did_match) {
+        log_debug("pbx: backbone invite DID %s not in our list, ignoring", did);
+        return;
+    }
+
+    /* Find all registered extensions */
+    int n_ext = 0;
+    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
+        if (e->registered) n_ext++;
+    }
+
+    if (n_ext == 0) {
+        log_debug("pbx: no registered extensions for backbone call %s", call_id);
+        backbone_send_cancel(ps->backbone, call_id);
+        return;
+    }
+
+    /* Create call */
+    struct pbx_call *call = calloc(1, sizeof(struct pbx_call));
+    call->backbone_call_id[0] = '\0';
+    strncpy(call->backbone_call_id, call_id, sizeof(call->backbone_call_id) - 1);
+    call->is_backbone_call = 1;
+    call->callee_did = strdup(did);
+    call->caller_ext = strdup(cid);
+    call->state = CALL_PENDING;
+    call->next = ps->calls;
+    ps->calls = call;
+
+    /* Fork to all registered extensions */
+    int ringing_sent = 0;
+    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
+        if (!e->registered) continue;
+
+        struct fork_branch *branch = calloc(1, sizeof(struct fork_branch));
+        branch->ext = e;
+        branch->sip_call_id = malloc(64);
+        generate_hex_id(branch->sip_call_id, 64);
+        branch->rtp = rtp_alloc(&ps->rtp_ctx);
+
+        if (!branch->rtp) {
+            free(branch->sip_call_id);
+            free(branch);
+            continue;
+        }
+
+        /* Build SDP offer pointing to PBX's RTP port */
+        char sdp_body[512];
+        int sdp_len = 0;
+        if (e->pbx_addr) {
+            sdp_len = snprintf(sdp_body, sizeof(sdp_body),
+                "v=0\r\n"
+                "o=- 0 0 IN IP4 %s\r\n"
+                "s=session\r\n"
+                "c=IN IP4 %s\r\n"
+                "t=0 0\r\n"
+                "m=audio %d RTP/AVP 0 8 101\r\n"
+                "a=rtpmap:0 PCMU/8000\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=rtpmap:101 telephone-event/8000\r\n",
+                e->pbx_addr, e->pbx_addr, branch->rtp->port);
+        }
+
+        /* Send INVITE to extension */
+        char invite[2048];
+        int ilen = snprintf(invite, sizeof(invite),
+            "INVITE sip:%s@%s SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+            "From: <sip:%s@pbx>;tag=gw%s\r\n"
+            "To: <sip:%s@%s>\r\n"
+            "Call-ID: %s\r\n"
+            "CSeq: 1 INVITE\r\n"
+            "Contact: <sip:gw@%s>\r\n"
+            "Content-Type: application/sdp\r\n"
+            "Content-Length: %d\r\n"
+            "\r\n",
+            e->extension, e->pbx_addr ? e->pbx_addr : "0.0.0.0",
+            e->pbx_addr ? e->pbx_addr : "0.0.0.0", branch->sip_call_id,
+            cid, call_id,
+            e->extension, e->pbx_addr ? e->pbx_addr : "0.0.0.0",
+            branch->sip_call_id,
+            e->pbx_addr ? e->pbx_addr : "0.0.0.0",
+            sdp_len);
+
+        if (ilen > 0 && sdp_len > 0 && ilen + sdp_len < (int)sizeof(invite)) {
+            memcpy(invite + ilen, sdp_body, sdp_len);
+            ilen += sdp_len;
+        }
+
+        send_sip(ps, &e->remote_addr, invite, ilen);
+        branch->invite_sent = 1;
+        branch->next = call->branches;
+        call->branches = branch;
+
+        if (!ringing_sent) {
+            backbone_send_ringing(ps->backbone, call_id);
+            ringing_sent = 1;
+        }
+    }
+
+    log_info("pbx: backbone call %s (DID=%s, CID=%s) forked to %d extensions",
+             call_id, did, cid, n_ext);
+}
+
+/* Expose backbone invite for the backbone module to call */
+void pbx_handle_backbone_invite(struct pbx_state *ps, const char *call_id,
+                                const char *did, const char *cid) {
+    handle_backbone_invite(ps, call_id, did, cid);
+}
+
+/* ── Busy retry task ─────────────────────────────────────────── */
+
+int busy_retry_task(int64_t ts, struct pt_task *pt) {
+    (void)ts;
+    struct pbx_state *ps = pt->udata;
+    time_t now = time(NULL);
+
+    for (struct pbx_call *call = ps->calls; call; call = call->next) {
+        if (call->state >= CALL_ACTIVE) continue;
+
+        for (struct fork_branch *b = call->branches; b; b = b->next) {
+            if (b->busy && !b->answered && !b->finished && b->retry_at <= now && b->ext->registered) {
+                /* Re-send INVITE to this busy extension */
+                char *new_sip_id = malloc(64);
+                generate_hex_id(new_sip_id, 64);
+                free(b->sip_call_id);
+                b->sip_call_id = new_sip_id;
+
+                struct rtp_pair *new_rtp = rtp_alloc(&ps->rtp_ctx);
+                if (new_rtp) {
+                    rtp_free(b->rtp);
+                    b->rtp = new_rtp;
+                }
+
+                char sdp_body[512];
+                int sdp_len = 0;
+                if (b->ext->pbx_addr && b->rtp) {
+                    sdp_len = snprintf(sdp_body, sizeof(sdp_body),
+                        "v=0\r\n"
+                        "o=- 0 0 IN IP4 %s\r\n"
+                        "s=session\r\n"
+                        "c=IN IP4 %s\r\n"
+                        "t=0 0\r\n"
+                        "m=audio %d RTP/AVP 0 8 101\r\n"
+                        "a=rtpmap:0 PCMU/8000\r\n"
+                        "a=rtpmap:8 PCMA/8000\r\n"
+                        "a=rtpmap:101 telephone-event/8000\r\n",
+                        b->ext->pbx_addr, b->ext->pbx_addr, b->rtp->port);
+                }
+
+                char invite[2048];
+                int ilen = snprintf(invite, sizeof(invite),
+                    "INVITE sip:%s@%s SIP/2.0\r\n"
+                    "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                    "From: <sip:%s@pbx>;tag=gw%s\r\n"
+                    "To: <sip:%s@%s>\r\n"
+                    "Call-ID: %s\r\n"
+                    "CSeq: 1 INVITE\r\n"
+                    "Contact: <sip:gw@%s>\r\n"
+                    "Content-Type: application/sdp\r\n"
+                    "Content-Length: %d\r\n"
+                    "\r\n",
+                    b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                    b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0", b->sip_call_id,
+                    call->caller_ext ? call->caller_ext : "?", call->backbone_call_id,
+                    b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                    b->sip_call_id,
+                    b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
+                    sdp_len);
+
+                if (ilen > 0 && sdp_len > 0 && ilen + sdp_len < (int)sizeof(invite)) {
+                    memcpy(invite + ilen, sdp_body, sdp_len);
+                    ilen += sdp_len;
+                }
+
+                send_sip(ps, &b->ext->remote_addr, invite, ilen);
+                b->busy = 0;
+                b->invite_sent = 1;
+                b->retry_at = now + BUSY_RETRY_SEC;
+
+                log_debug("pbx: retrying ext %s for call %s", b->ext->extension, call->backbone_call_id);
+            }
+        }
+    }
+
+    return SCHED_RUNNING;
+}
+
+/* ── Extension cleanup task ───────────────────────────────────── */
+
+int cleanup_task(int64_t ts, struct pt_task *pt) {
+    (void)ts;
+    struct pbx_state *ps = pt->udata;
+    time_t now = time(NULL);
+
+    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
+        if (e->registered && e->expires > 0 && e->expires < now) {
+            e->registered = 0;
+            memset(&e->remote_addr, 0, sizeof(e->remote_addr));
+            log_info("pbx: extension %s registration expired", e->extension);
+        }
+    }
+
+    return SCHED_RUNNING;
+}
+
+/* ── SIP receive task ────────────────────────────────────────── */
+
+int sip_recv_task(int64_t ts, struct pt_task *pt) {
+    (void)ts;
+    struct pbx_state *ps = pt->udata;
+
+    int fds[2] = {1, ps->sip_fd};
+    if (sched_has_data(fds) < 0) return SCHED_RUNNING;
+
+    char buf[4096];
+    struct sockaddr_storage src;
+    socklen_t src_len = sizeof(src);
+    ssize_t n = recvfrom(ps->sip_fd, buf, sizeof(buf) - 1, 0,
+                         (struct sockaddr *)&src, &src_len);
+    if (n <= 0) return SCHED_RUNNING;
+
+    buf[n] = '\0';
+
+    struct sip_msg *msg = sip_parse_request(buf, (int)n);
+    if (!msg) return SCHED_RUNNING;
+
+    if (msg->status_code > 0) {
+        handle_sip_response(ps, &src, msg);
+    } else {
+        switch (msg->method) {
+        case SIP_METHOD_REGISTER:
+            handle_register(ps, &src, msg);
+            break;
+        case SIP_METHOD_INVITE:
+            handle_invite(ps, &src, msg);
+            break;
+        case SIP_METHOD_BYE:
+            handle_bye(ps, &src, msg);
+            break;
+        case SIP_METHOD_CANCEL:
+            handle_cancel(ps, &src, msg);
+            break;
+        case SIP_METHOD_ACK:
+            handle_ack(ps, &src, msg);
+            break;
+        case SIP_METHOD_OPTIONS:
+            handle_options(ps, &src, msg);
+            break;
+        default:
+            break;
+        }
+    }
+
+    sip_msg_free(msg);
+    return SCHED_RUNNING;
+}
+
+/* ── Public API ──────────────────────────────────────────────── */
+
+struct pbx_state *pbx_create(struct gw_config *cfg) {
+    struct pbx_state *ps = calloc(1, sizeof(struct pbx_state));
+    if (!ps) return NULL;
+    ps->config = cfg;
+    ps->sip_fd = -1;
+    rtp_ctx_init(&ps->rtp_ctx, cfg->rtp_min, cfg->rtp_max);
+    return ps;
+}
+
+void pbx_free(struct pbx_state *ps) {
+    if (!ps) return;
+    if (ps->sip_task) sched_remove(ps->sip_task);
+    if (ps->busy_retry_task) sched_remove(ps->busy_retry_task);
+    if (ps->cleanup_task) sched_remove(ps->cleanup_task);
+    while (ps->calls) {
+        struct pbx_call *next = ps->calls->next;
+        pbx_call_free(ps->calls);
+        ps->calls = next;
+    }
+    free(ps);
+}

@@ -1,0 +1,21 @@
+[gw]
+sip_port = 5060
+rtp_range = 10000-20000
+cid = 15551234567
+did = 15559876543
+backbone = tcp://alice:alice-secret@backbone.example.com:5070
+
+; Rewrite rules: first match wins, POSIX ERE, supports \1-\9 backreferences
+rewrite_desc    = International
+rewrite_pattern  = ^00(.*)$
+rewrite_replace  = +\1
+
+rewrite_desc    = National
+rewrite_pattern  = ^0(.*)$
+rewrite_replace  = +31\1
+
+[ext:100]
+secret = my-secret
+
+[ext:101]
+secret = other-secret
