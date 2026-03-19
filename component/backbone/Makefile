@@ -41,7 +41,7 @@ OBJ+=$(LICENSE_OBJ)
 CFLAGS+=${INCLUDES} -O0 -g
 
 .PHONY: default
-default: upbx
+default: upbx-backbone
 
 license.o: LICENSE.md
 	$(OBJCOPY) --input binary --output $(ARCH_TARGET) --binary-architecture $(ARCH_BIN) $< $@
@@ -55,12 +55,12 @@ license.c: LICENSE.md
 .c.o:
 	${CC} $< ${CFLAGS} -c -o $@
 
-upbx: $(OBJ)
+upbx-backbone: $(OBJ)
 	${CC} ${OBJ} ${CFLAGS} ${LDFLAGS} -o $@
 
 .PHONY: install
-install: upbx
-	install upbx ${DESTDIR}/bin
+install: upbx-backbone
+	install upbx-backbone ${DESTDIR}/bin
 
 .PHONY: clean
 clean:
@@ -76,7 +76,7 @@ TEST_LIBS=lib/orlp/ed25519/src/fe.o lib/orlp/ed25519/src/ge.o \
 	lib/orlp/ed25519/src/verify.o lib/finwo/pbkdf2/src/pbkdf2.o \
 	lib/rxi/log/src/log.o
 
-$(TEST_BIN): $(TEST_OBJ) $(TEST_LIBS) upbx
+$(TEST_BIN): $(TEST_OBJ) $(TEST_LIBS) upbx-backbone
 	${CC} ${TEST_OBJ} ${TEST_LIBS} ${CFLAGS} ${LDFLAGS} -o $@
 	strip -u -r $@ 2>/dev/null || true
 
@@ -89,7 +89,7 @@ test/testutil.o: test/testutil.c
 CROSS_OBJ=test/cross_peer.o test/testutil.o
 CROSS_BIN=test_cross_peer
 
-$(CROSS_BIN): $(CROSS_OBJ) $(TEST_LIBS) upbx
+$(CROSS_BIN): $(CROSS_OBJ) $(TEST_LIBS) upbx-backbone
 	${CC} ${CROSS_OBJ} ${TEST_LIBS} ${CFLAGS} ${LDFLAGS} -o $@
 	strip -u -r $@ 2>/dev/null || true
 
@@ -107,7 +107,7 @@ test-cross-peer: $(CROSS_BIN)
 EDGE_OBJ=test/edge_cases.o test/testutil.o
 EDGE_BIN=test_edge_cases
 
-$(EDGE_BIN): $(EDGE_OBJ) $(TEST_LIBS) upbx
+$(EDGE_BIN): $(EDGE_OBJ) $(TEST_LIBS) upbx-backbone
 	${CC} ${EDGE_OBJ} ${TEST_LIBS} ${CFLAGS} ${LDFLAGS} -o $@
 	strip -u -r $@ 2>/dev/null || true
 

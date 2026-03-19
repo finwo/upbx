@@ -3,7 +3,7 @@
 *.o
 /license.c
 *.log
-/upbx
+/upbx-backbone
 /test_cross_peer
 /test_edge_cases
 /test_same_node

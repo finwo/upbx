@@ -40,7 +40,7 @@ int testutil_daemon_start_idx(int idx, const char *config_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        execlp("./upbx", "./upbx", "daemon", "-c", config_path, NULL);
+        execlp("./upbx-backbone", "./upbx-backbone", "daemon", "-c", config_path, NULL);
         _exit(1);
     }
     g_daemon_pids[idx] = pid;
