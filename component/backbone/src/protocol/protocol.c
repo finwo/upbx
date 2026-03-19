@@ -227,10 +227,18 @@ static void handle_ringing(struct conn *c, char *line) {
     struct upbx_call *call = mindex_get(c->proto->calls, &key);
     if (!call) return;
 
-    /* Only forward first ringing to caller */
+    /* Collapse on first ringing: select callee, cancel all others */
     if (call->state < UPBX_CALL_RINGING && call->caller_fd >= 0 && call->caller_fd != c->fd) {
+        call->callee_fd = c->fd;
         call->state = UPBX_CALL_RINGING;
         conn_sendf(call->caller_fd, "ringing %s\n", call_id);
+
+        /* Cancel all other connections (except caller and ringing sender) */
+        for (struct conn *pc = c->proto->conns; pc; pc = pc->next) {
+            if (pc->authenticated && pc->fd != c->fd && pc->fd != call->caller_fd) {
+                conn_sendf(pc->fd, "cancel %s\n", call_id);
+            }
+        }
     }
 }
 
@@ -258,13 +266,6 @@ static void handle_answer(struct conn *c, char *line) {
     if (call->caller_fd >= 0) {
         conn_sendf(call->caller_fd, "answer %s\n", call_id);
     }
-
-    /* Send cancel to all other connections (everyone except caller and answerer) */
-    for (struct conn *pc = c->proto->conns; pc; pc = pc->next) {
-        if (pc->authenticated && pc->fd != c->fd && pc->fd != call->caller_fd) {
-            conn_sendf(pc->fd, "cancel %s\n", call_id);
-        }
-    }
 }
 
 struct delayed_cancel {
@@ -281,8 +282,8 @@ static int delayed_cancel_task(int64_t ts, struct pt_task *pt) {
     struct call_key key = {dc->call_id, strlen(dc->call_id)};
     struct upbx_call *call = mindex_get(dc->proto->calls, &key);
 
-    /* Call gone or already active/ended: drop */
-    if (!call || call->state >= UPBX_CALL_ACTIVE) {
+    /* Call gone or already ringing/active/ended: drop */
+    if (!call || call->state >= UPBX_CALL_RINGING) {
         free(dc);
         return SCHED_DONE;
     }
@@ -310,8 +311,8 @@ static void handle_cancel(struct conn *c, char *line) {
     /* Unknown call: drop */
     if (!call) return;
 
-    /* Already active/ended: drop */
-    if (call->state >= UPBX_CALL_ACTIVE) return;
+    /* Already ringing/active/ended: drop */
+    if (call->state >= UPBX_CALL_RINGING) return;
 
     /* Schedule delayed cancel */
     struct timeval now;

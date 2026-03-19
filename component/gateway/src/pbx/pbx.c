@@ -809,6 +809,8 @@ void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id) {
 void pbx_on_backbone_cancel(struct pbx_state *s, const char *call_id) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
+    /* Once the call is ringing or beyond, cancel is ignored — use bye instead */
+    if (call->state >= CALL_RINGING) return;
     pbx_call_remove(s, call);
 }
 

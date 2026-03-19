@@ -102,11 +102,11 @@ int main(void) {
     ASSERT("charlie auth", testutil_auth(charlie, "charlie", charlie_pub, charlie_priv) == 0);
 
     /*
-     * Test 1: Answered call with cancel broadcast
+     * Test 1: Answered call with collapse on ringing
      *
      * Alice invites -> bob and charlie both get it
-     * Bob and charlie both send ringing -> alice gets exactly one
-     * Charlie answers -> alice gets answer, bob gets cancel
+     * Bob sends ringing first -> bob is selected as callee, charlie gets cancel
+     * Bob answers -> alice gets answer
      */
     printf("# Test 1: answered call\n");
 
@@ -120,43 +120,45 @@ int main(void) {
     line = testutil_client_recv_line(charlie, 3000);
     ASSERT("charlie got invite", line && strncmp(line, "invite call1", 12) == 0);
 
-    /* Both send ringing */
+    /* Bob sends ringing first — collapses the call, charlie gets cancel */
     testutil_client_send(bob, "ringing call1\n");
-    testutil_client_send(charlie, "ringing call1\n");
 
-    /* Alice should receive exactly one ringing */
+    /* Alice should receive ringing */
     line = testutil_client_recv_line(alice, 2000);
     ASSERT("alice got ringing", line && strncmp(line, "ringing call1", 13) == 0);
+
+    /* Charlie should receive cancel (from ringing collapse) */
+    line = testutil_client_recv_line(charlie, 2000);
+    ASSERT("charlie got cancel from ringing", line && strncmp(line, "cancel call1", 12) == 0);
+
+    /* Charlie's ringing is ignored (call already collapsed) */
+    testutil_client_send(charlie, "ringing call1\n");
 
     /* Alice should NOT receive a second ringing (wait briefly) */
     line = testutil_client_recv_line(alice, 500);
     ASSERT("alice no second ringing", line == NULL);
 
-    /* Charlie answers */
-    testutil_client_send(charlie, "answer call1\n");
+    /* Bob (the selected callee) answers */
+    testutil_client_send(bob, "answer call1\n");
 
     /* Alice should receive answer */
     line = testutil_client_recv_line(alice, 2000);
     ASSERT("alice got answer", line && strncmp(line, "answer call1", 12) == 0);
 
-    /* Bob should receive cancel */
-    line = testutil_client_recv_line(bob, 2000);
-    ASSERT("bob got cancel", line && strncmp(line, "cancel call1", 12) == 0);
-
-    /* Media: alice -> charlie */
+    /* Media: alice -> bob */
     testutil_client_send(alice, "media call1 data:;hex,deadbeef\n");
-    line = testutil_client_recv_line(charlie, 2000);
-    ASSERT("charlie got media", line && strstr(line, "deadbeef") != NULL);
+    line = testutil_client_recv_line(bob, 2000);
+    ASSERT("bob got media", line && strstr(line, "deadbeef") != NULL);
 
-    /* Media: charlie -> alice */
-    testutil_client_send(charlie, "media call1 data:;hex,cafebabe\n");
+    /* Media: bob -> alice */
+    testutil_client_send(bob, "media call1 data:;hex,cafebabe\n");
     line = testutil_client_recv_line(alice, 2000);
     ASSERT("alice got media", line && strstr(line, "cafebabe") != NULL);
 
     /* Bye */
     testutil_client_send(alice, "bye call1\n");
-    line = testutil_client_recv_line(charlie, 2000);
-    ASSERT("charlie got bye", line && strncmp(line, "bye call1", 9) == 0);
+    line = testutil_client_recv_line(bob, 2000);
+    ASSERT("bob got bye", line && strncmp(line, "bye call1", 9) == 0);
 
     /*
      * Test 2: Caller cancel

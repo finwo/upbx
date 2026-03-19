@@ -162,14 +162,19 @@ int main(void) {
         testutil_client_recv_line(bob, 2000);    /* bob gets invite */
         testutil_client_recv_line(charlie, 2000); /* charlie gets invite */
 
-        /* Bob answers first */
+        /* Bob sends ringing first — collapses the call, charlie gets cancel */
+        testutil_client_send(bob, "ringing dpick1\n");
+        line = testutil_client_recv_line(alice, 2000);
+        ASSERT("alice got ringing", line && strncmp(line, "ringing dpick1", 14) == 0);
+
+        /* Charlie gets cancel (from ringing collapse) */
+        line = testutil_client_recv_line(charlie, 2000);
+        ASSERT("charlie got cancel from ringing", line && strncmp(line, "cancel dpick1", 13) == 0);
+
+        /* Bob answers first (selected callee) */
         testutil_client_send(bob, "answer dpick1\n");
         line = testutil_client_recv_line(alice, 2000);
         ASSERT("alice got answer from bob", line && strncmp(line, "answer dpick1", 13) == 0);
-
-        /* Charlie gets cancel (from answer broadcast) */
-        line = testutil_client_recv_line(charlie, 2000);
-        ASSERT("charlie got cancel from answer", line && strncmp(line, "cancel dpick1", 13) == 0);
 
         /* Charlie tries to answer late -- should get bye back */
         testutil_client_send(charlie, "answer dpick1\n");
@@ -208,9 +213,9 @@ int main(void) {
     }
 
     /*
-     * Test 6: Cancel for active call is dropped
+     * Test 6: Cancel for ringing/active call is dropped
      */
-    printf("# Test: cancel for active call dropped\n");
+    printf("# Test: cancel for ringing/active call dropped\n");
     {
         test_client *alice = connect_and_auth("alice", alice_pub, alice_priv);
         test_client *bob = connect_and_auth("bob", bob_pub, bob_priv);
@@ -219,18 +224,23 @@ int main(void) {
         testutil_client_send(alice, "invite active1 did cid\n");
         testutil_client_recv_line(bob, 2000); /* bob gets invite */
 
+        /* Bob sends ringing — collapses the call */
+        testutil_client_send(bob, "ringing active1\n");
+        line = testutil_client_recv_line(alice, 2000);
+        ASSERT("alice got ringing active1", line && strncmp(line, "ringing active1", 15) == 0);
+
+        /* Cancel after ringing should be dropped */
+        testutil_client_send(alice, "cancel active1\n");
+
+        /* Bob should NOT receive cancel (call is ringing) */
+        line = testutil_client_recv_line(bob, 500);
+        ASSERT("bob no cancel for ringing call", line == NULL);
+
+        /* Media should still work after answer */
         testutil_client_send(bob, "answer active1\n");
         line = testutil_client_recv_line(alice, 2000);
         ASSERT("alice got answer active1", line && strncmp(line, "answer active1", 14) == 0);
 
-        /* Now try to cancel the active call -- should be dropped */
-        testutil_client_send(alice, "cancel active1\n");
-
-        /* Bob should NOT receive cancel (call is active) */
-        line = testutil_client_recv_line(bob, 500);
-        ASSERT("bob no cancel for active call", line == NULL);
-
-        /* Media should still work */
         testutil_client_send(alice, "media active1 data:;hex,aabb\n");
         line = testutil_client_recv_line(bob, 2000);
         ASSERT("bob still gets media after failed cancel", line && strstr(line, "aabb") != NULL);
@@ -275,21 +285,26 @@ int main(void) {
         testutil_client_recv_line(bob, 2000);    /* bob gets invite */
         testutil_client_recv_line(charlie, 2000); /* charlie gets invite */
 
-        /* Both send ringing */
+        /* Both send ringing — first one collapses the call */
         testutil_client_send(bob, "ringing ring1\n");
-        testutil_client_send(charlie, "ringing ring1\n");
 
-        /* Alice should get exactly one ringing */
+        /* Alice should get ringing from bob */
         line = testutil_client_recv_line(alice, 2000);
         ASSERT("alice got first ringing", line && strncmp(line, "ringing ring1", 13) == 0);
+
+        /* Charlie gets cancel (from ringing collapse) */
+        line = testutil_client_recv_line(charlie, 2000);
+        ASSERT("charlie got cancel from ringing", line && strncmp(line, "cancel ring1", 12) == 0);
+
+        /* Charlie's ringing is ignored (already collapsed) */
+        testutil_client_send(charlie, "ringing ring1\n");
 
         line = testutil_client_recv_line(alice, 500);
         ASSERT("alice no second ringing", line == NULL);
 
-        /* Clean up */
-        testutil_client_send(alice, "cancel ring1\n");
+        /* Clean up with bye (cancel is ignored after ringing) */
+        testutil_client_send(alice, "bye ring1\n");
         testutil_client_recv_line(bob, 1000);
-        testutil_client_recv_line(charlie, 1000);
 
         testutil_client_close(alice);
         testutil_client_close(bob);
