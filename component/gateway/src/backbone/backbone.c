@@ -14,6 +14,7 @@
 #include "finwo/scheduler.h"
 #include "orlp/ed25519.h"
 #include "backbone/backbone.h"
+#include "pbx/pbx.h"
 
 #define RECONNECT_INTERVAL 5
 #define AUTH_TIMEOUT        10
@@ -25,7 +26,6 @@ extern void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id);
 extern void pbx_on_backbone_cancel(struct pbx_state *s, const char *call_id);
 extern void pbx_on_backbone_media(struct pbx_state *s, const char *call_id, const uint8_t *data, size_t len);
 extern void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id);
-extern void pbx_handle_backbone_invite(struct pbx_state *s, const char *call_id, const char *did, const char *cid);
 
 // ── hex helpers ────────────────────────────────────────────────────────
 
@@ -119,11 +119,77 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
     sscanf(line, "%63s %511[^\n]", cmd, arg);
 
     if (strcmp(cmd, "invite") == 0) {
-        // Format: invite <call_id> <did> <cid>
+        // Format: invite <call_id> <did> <cid> [tags...]
         char call_id[256] = {0}, did[256] = {0}, cid[256] = {0};
-        if (sscanf(arg, "%255s %255s %255s", call_id, did, cid) >= 3) {
-            pbx_handle_backbone_invite(bs->pbx, call_id, did, cid);
+        char *p = arg;
+
+        /* Parse call_id */
+        char *space = strchr(p, ' ');
+        if (!space) return;
+        size_t id_len = (size_t)(space - p);
+        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+        memcpy(call_id, p, id_len);
+        call_id[id_len] = '\0';
+        p = space + 1;
+        while (*p == ' ') p++;
+
+        /* Parse did */
+        space = strchr(p, ' ');
+        if (!space) return;
+        id_len = (size_t)(space - p);
+        if (id_len >= sizeof(did)) id_len = sizeof(did) - 1;
+        memcpy(did, p, id_len);
+        did[id_len] = '\0';
+        p = space + 1;
+        while (*p == ' ') p++;
+
+        /* Parse cid */
+        space = strchr(p, ' ');
+        if (space) {
+            id_len = (size_t)(space - p);
+            if (id_len >= sizeof(cid)) id_len = sizeof(cid) - 1;
+            memcpy(cid, p, id_len);
+            cid[id_len] = '\0';
+            p = space + 1;
+            while (*p == ' ') p++;
+        } else {
+            strncpy(cid, p, sizeof(cid) - 1);
+            p = "";
         }
+
+        /* Parse remaining tokens as name=value tags */
+        struct gw_tag_entry *tags = NULL;
+        int tag_count = 0;
+        while (*p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            char *tag_end = strchr(p, ' ');
+            if (!tag_end) tag_end = p + strlen(p);
+            char *eq = memchr(p, '=', tag_end - p);
+            if (eq) {
+                tag_count++;
+                tags = realloc(tags, tag_count * sizeof(struct gw_tag_entry));
+                struct gw_tag_entry *t = &tags[tag_count - 1];
+                size_t name_len = eq - p;
+                size_t val_len = tag_end - eq - 1;
+                t->name = malloc(name_len + 1);
+                memcpy(t->name, p, name_len);
+                t->name[name_len] = '\0';
+                t->value = malloc(val_len + 1);
+                memcpy(t->value, eq + 1, val_len);
+                t->value[val_len] = '\0';
+            }
+            p = tag_end;
+        }
+
+        pbx_handle_backbone_invite(bs->pbx, call_id, did, cid, tags, tag_count);
+
+        /* Free parsed tags (deep-copied into call struct) */
+        for (int i = 0; i < tag_count; i++) {
+            free(tags[i].name);
+            free(tags[i].value);
+        }
+        free(tags);
     } else if (strcmp(cmd, "ringing") == 0) {
         pbx_on_backbone_ringing(bs->pbx, arg);
     } else if (strcmp(cmd, "answer") == 0) {
@@ -176,9 +242,16 @@ static void backbone_send_line(struct backbone_state *s, const char *line, int l
     send(s->fd, line, (size_t)len, 0);
 }
 
-void backbone_send_invite(struct backbone_state *s, const char *call_id, const char *did, const char *cid) {
+void backbone_send_invite(struct backbone_state *s, const char *call_id,
+                          const char *did, const char *cid,
+                          const char *tags) {
     char line[1024];
-    int len = snprintf(line, sizeof(line), "invite %s %s %s\n", call_id, did, cid);
+    int len;
+    if (tags && tags[0]) {
+        len = snprintf(line, sizeof(line), "invite %s %s %s %s\n", call_id, did, cid, tags);
+    } else {
+        len = snprintf(line, sizeof(line), "invite %s %s %s\n", call_id, did, cid);
+    }
     backbone_send_line(s, line, len);
 }
 

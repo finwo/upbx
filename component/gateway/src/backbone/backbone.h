@@ -31,7 +31,9 @@ struct backbone_state {
 struct backbone_state *backbone_create(struct gw_config *cfg, struct pbx_state *pbx);
 void backbone_free(struct backbone_state *bs);
 
-void backbone_send_invite(struct backbone_state *s, const char *call_id, const char *did, const char *cid);
+void backbone_send_invite(struct backbone_state *s, const char *call_id,
+                          const char *did, const char *cid,
+                          const char *tags);
 void backbone_send_ringing(struct backbone_state *s, const char *call_id);
 void backbone_send_answer(struct backbone_state *s, const char *call_id);
 void backbone_send_cancel(struct backbone_state *s, const char *call_id);

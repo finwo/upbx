@@ -11,6 +11,11 @@ enum upbx_call_state {
     UPBX_CALL_ENDED
 };
 
+struct upbx_tag {
+    char *name;
+    char *value;
+};
+
 struct upbx_call {
     char *call_id;
     size_t call_id_len;
@@ -18,6 +23,8 @@ struct upbx_call {
     char *cid;
     int caller_fd;
     int callee_fd;
+    struct upbx_tag *tags;
+    int tag_count;
     enum upbx_call_state state;
 };
 

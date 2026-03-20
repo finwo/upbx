@@ -139,6 +139,11 @@ static void pbx_call_free(struct pbx_call *call) {
     rtp_free(call->rtp_caller);
     rtp_free(call->rtp_callee);
     free_branches(call->branches);
+    for (int i = 0; i < call->tag_count; i++) {
+        free(call->tags[i].name);
+        free(call->tags[i].value);
+    }
+    free(call->tags);
     free(call);
 }
 
@@ -492,8 +497,27 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
         free(new_sdp);
     }
 
-    /* Send invite to backbone */
-    backbone_send_invite(ps->backbone, call->backbone_call_id, rewritten, ps->config->cid);
+    /* Send invite to backbone with tags */
+    {
+        char tags[1024];
+        tags[0] = '\0';
+        int pos = 0;
+        if (ps->backbone && ps->backbone->current && ps->backbone->current->username) {
+            pos += snprintf(tags + pos, sizeof(tags) - pos, "pbx=%s",
+                            ps->backbone->current->username);
+        }
+        if (caller_ext && caller_ext->extension) {
+            if (pos > 0 && pos < (int)sizeof(tags) - 1) tags[pos++] = ' ';
+            pos += snprintf(tags + pos, sizeof(tags) - pos, "src-ext=%s",
+                            caller_ext->extension);
+        }
+        if (dialed) {
+            if (pos > 0 && pos < (int)sizeof(tags) - 1) tags[pos++] = ' ';
+            pos += snprintf(tags + pos, sizeof(tags) - pos, "dialed-number=%s",
+                            dialed);
+        }
+        backbone_send_invite(ps->backbone, call->backbone_call_id, rewritten, ps->config->cid, tags);
+    }
 
     (void)0; /* call established log emitted when backbone answers */
 }
@@ -1078,9 +1102,10 @@ void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
 
 /* ── Backbone INVITE (incoming call from backbone) ───────────── */
 
-/* Called by the backbone module when it receives "invite <call_id> <did> <cid>" */
+/* Called by the backbone module when it receives "invite <call_id> <did> <cid> [tags...]" */
 static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
-                                   const char *did, const char *cid) {
+                                   const char *did, const char *cid,
+                                   struct gw_tag_entry *tags, int tag_count) {
     /* Check if DID matches any configured DID */
     int did_match = 0;
     for (struct gw_did *d = ps->config->dids; d; d = d->next) {
@@ -1114,6 +1139,17 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
     call->callee_did = strdup(did);
     call->caller_ext = strdup(cid);
     call->state = CALL_PENDING;
+
+    /* Store tags from backbone invite */
+    if (tag_count > 0 && tags) {
+        call->tag_count = tag_count;
+        call->tags = malloc(tag_count * sizeof(struct gw_tag_entry));
+        for (int i = 0; i < tag_count; i++) {
+            call->tags[i].name = strdup(tags[i].name);
+            call->tags[i].value = strdup(tags[i].value);
+        }
+    }
+
     call->next = ps->calls;
     ps->calls = call;
 
@@ -1193,8 +1229,9 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
 
 /* Expose backbone invite for the backbone module to call */
 void pbx_handle_backbone_invite(struct pbx_state *ps, const char *call_id,
-                                const char *did, const char *cid) {
-    handle_backbone_invite(ps, call_id, did, cid);
+                                const char *did, const char *cid,
+                                struct gw_tag_entry *tags, int tag_count) {
+    handle_backbone_invite(ps, call_id, did, cid, tags, tag_count);
 }
 
 /* ── Busy retry task ─────────────────────────────────────────── */

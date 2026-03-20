@@ -43,6 +43,11 @@ static void call_purge(void *item, void *udata) {
     free(c->call_id);
     free(c->did);
     free(c->cid);
+    for (int i = 0; i < c->tag_count; i++) {
+        free(c->tags[i].name);
+        free(c->tags[i].value);
+    }
+    free(c->tags);
     free(c);
 }
 
@@ -194,7 +199,49 @@ static void conn_authenticate(struct conn *c, char *args) {
 
 static void handle_invite(struct conn *c, char *line) {
     char call_id[256] = {0}, did[256] = {0}, cid[256] = {0};
-    if (sscanf(line, "invite %255s %255s %255s", call_id, did, cid) < 3) return;
+
+    /* Parse the line manually: invite <call_id> <did> <cid> [tags...] */
+    char *p = line + 6; /* skip "invite" */
+    while (*p == ' ') p++;
+
+    /* Parse call_id */
+    char *space = strchr(p, ' ');
+    if (!space) return;
+    size_t len = space - p;
+    if (len >= sizeof(call_id)) len = sizeof(call_id) - 1;
+    memcpy(call_id, p, len);
+    call_id[len] = '\0';
+    p = space + 1;
+    while (*p == ' ') p++;
+
+    /* Parse did */
+    space = strchr(p, ' ');
+    if (!space) {
+        /* Only call_id and did — treat remaining as cid */
+        strncpy(did, p, sizeof(did) - 1);
+        /* No cid, no tags */
+    } else {
+        len = space - p;
+        if (len >= sizeof(did)) len = sizeof(did) - 1;
+        memcpy(did, p, len);
+        did[len] = '\0';
+        p = space + 1;
+        while (*p == ' ') p++;
+
+        /* Parse cid */
+        space = strchr(p, ' ');
+        if (space) {
+            len = space - p;
+            if (len >= sizeof(cid)) len = sizeof(cid) - 1;
+            memcpy(cid, p, len);
+            cid[len] = '\0';
+            p = space + 1;
+            while (*p == ' ') p++;
+        } else {
+            strncpy(cid, p, sizeof(cid) - 1);
+            p = "";
+        }
+    }
 
     struct call_key key = {call_id, strlen(call_id)};
     struct upbx_call *call = mindex_get(c->proto->calls, &key);
@@ -209,6 +256,30 @@ static void handle_invite(struct conn *c, char *line) {
     call->cid = strdup(cid);
     call->caller_fd = c->fd;
     call->state = UPBX_CALL_PENDING;
+
+    /* Parse remaining tokens as name=value tags */
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        char *tag_end = strchr(p, ' ');
+        if (!tag_end) tag_end = p + strlen(p);
+        char *eq = memchr(p, '=', tag_end - p);
+        if (eq) {
+            call->tag_count++;
+            call->tags = realloc(call->tags, call->tag_count * sizeof(struct upbx_tag));
+            struct upbx_tag *t = &call->tags[call->tag_count - 1];
+            size_t name_len = eq - p;
+            size_t val_len = tag_end - eq - 1;
+            t->name = malloc(name_len + 1);
+            memcpy(t->name, p, name_len);
+            t->name[name_len] = '\0';
+            t->value = malloc(val_len + 1);
+            memcpy(t->value, eq + 1, val_len);
+            t->value[val_len] = '\0';
+        }
+        p = tag_end;
+    }
+
     mindex_set(c->proto->calls, call);
 
     /* Forward to all other authenticated connections (clients + peers) */

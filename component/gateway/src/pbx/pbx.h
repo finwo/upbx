@@ -20,6 +20,11 @@ enum call_state {
     CALL_ENDED,
 };
 
+struct gw_tag_entry {
+    char *name;
+    char *value;
+};
+
 struct fork_branch {
     struct gw_ext *ext;
     char *sip_call_id;
@@ -61,6 +66,10 @@ struct pbx_call {
     /* Fork (backbone→ext) */
     struct fork_branch *branches;
 
+    /* Tags received from backbone invite */
+    struct gw_tag_entry *tags;
+    int tag_count;
+
     enum call_state state;
     time_t started_at;      /* time call became ACTIVE, for duration logging */
     struct pbx_call *next;
@@ -87,7 +96,8 @@ int cleanup_task(int64_t ts, struct pt_task *pt);
 
 /* Called by backbone module when it receives an invite line */
 void pbx_handle_backbone_invite(struct pbx_state *ps, const char *call_id,
-                                const char *did, const char *cid);
+                                const char *did, const char *cid,
+                                struct gw_tag_entry *tags, int tag_count);
 
 /* Called by backbone module on incoming protocol lines */
 void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id);
