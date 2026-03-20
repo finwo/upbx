@@ -642,6 +642,33 @@ static void handle_cancel(int fd, struct pbx_state *ps, struct sockaddr_storage 
         }
     }
 
+    /* ext-to-ext: forward CANCEL to callee */
+    if (!call->is_backbone_call) {
+        struct gw_ext *callee_ext = gw_config_find_ext(ps->config, call->callee_did);
+        if (callee_ext && callee_ext->registered) {
+            char cancel[1024];
+            int clen = snprintf(cancel, sizeof(cancel),
+                "CANCEL sip:%s@%s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                "From: %s\r\n"
+                "To: <sip:%s@%s>\r\n"
+                "Call-ID: %s\r\n"
+                "CSeq: %d CANCEL\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n",
+                callee_ext->extension,
+                callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+                callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+                call->backbone_call_id,
+                call->caller_from ? call->caller_from : "",
+                callee_ext->extension,
+                callee_ext->pbx_addr ? callee_ext->pbx_addr : "0.0.0.0",
+                call->sip_call_id,
+                call->cseq_num + 1);
+            send_sip(callee_ext->sip_fd, &callee_ext->remote_addr, cancel, clen);
+        }
+    }
+
     if (call->is_backbone_call) {
         backbone_send_cancel(ps->backbone, call->backbone_call_id);
     }
