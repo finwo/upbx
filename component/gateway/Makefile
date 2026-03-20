@@ -1,4 +1,5 @@
 CC?=clang
+VERSION?=0.1.0
 
 FIND=$(shell which gfind find | head -1)
 
@@ -7,7 +8,7 @@ UNAME_M:=$(shell uname -m)
 
 SRC:=
 INCLUDES:=
-CFLAGS:=
+CFLAGS:=-DGW_VERSION=\"$(VERSION)\"
 LDFLAGS:=
 DESTDIR?=/usr/local
 
