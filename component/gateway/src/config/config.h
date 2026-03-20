@@ -15,6 +15,7 @@ struct gw_ext {
     char *contact;
     time_t expires;
     int registered;
+    int sip_fd;                             // fd that received the REGISTER
     struct gw_ext *next;
 };
 

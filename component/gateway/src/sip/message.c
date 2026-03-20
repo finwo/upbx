@@ -23,11 +23,11 @@ char *sip_build_response(int code, const char *reason,
 
     off += snprintf(buf + off, cap - off, "SIP/2.0 %d %s\r\n", code, reason);
     if (orig->via)
-        off += snprintf(buf + off, cap - off, "%s\r\n", orig->via);
+        off += snprintf(buf + off, cap - off, "Via: %s\r\n", orig->via);
     if (orig->from)
-        off += snprintf(buf + off, cap - off, "%s\r\n", orig->from);
+        off += snprintf(buf + off, cap - off, "From: %s\r\n", orig->from);
     if (orig->to)
-        off += snprintf(buf + off, cap - off, "%s\r\n", orig->to);
+        off += snprintf(buf + off, cap - off, "To: %s\r\n", orig->to);
     if (orig->call_id)
         off += snprintf(buf + off, cap - off, "Call-ID: %s\r\n", orig->call_id);
     if (orig->cseq_num > 0 && orig->cseq_method)

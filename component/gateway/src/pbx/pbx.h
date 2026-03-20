@@ -57,7 +57,7 @@ struct pbx_call {
 struct pbx_state {
     struct gw_config *config;
     struct backbone_state *backbone;
-    int sip_fd;
+    int *sip_fds;
     struct rtp_alloc_ctx rtp_ctx;
     struct pbx_call *calls;
     pt_task_t *busy_retry_task;

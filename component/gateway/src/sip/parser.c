@@ -11,21 +11,22 @@ static int match_header(const char *line, const char *name) {
     return line[nlen] == ':' || line[nlen] == ' ' || line[nlen] == '\t';
 }
 
-static char *hdr_val(const char *line, const char *name) {
+static char *hdr_val(const char *line, size_t line_len, const char *name) {
     size_t nlen = strlen(name);
     const char *p = line + nlen;
     while (*p == ' ' || *p == '\t' || *p == ':') p++;
-    const char *end = p + strlen(p);
-    while (end > p && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) end--;
-    size_t vlen = end - p;
+    const char *line_end = line + line_len;
+    while (line_end > p && (line_end[-1] == '\r' || line_end[-1] == '\n' || line_end[-1] == ' '))
+        line_end--;
+    size_t vlen = (size_t)(line_end - p);
     char *val = malloc(vlen + 1);
     memcpy(val, p, vlen);
     val[vlen] = '\0';
     return val;
 }
 
-static int hdr_int(const char *line, const char *name) {
-    char *val = hdr_val(line, name);
+static int hdr_int(const char *line, size_t line_len, const char *name) {
+    char *val = hdr_val(line, line_len, name);
     int n = atoi(val);
     free(val);
     return n;
@@ -117,18 +118,18 @@ struct sip_msg *sip_parse_request(const char *buf, int len) {
 
         if (match_header(p, "Via")) {
             free(msg->via);
-            msg->via = hdr_val(p, "Via");
+            msg->via = hdr_val(p, line_len, "Via");
         } else if (match_header(p, "From")) {
             free(msg->from);
-            msg->from = hdr_val(p, "From");
+            msg->from = hdr_val(p, line_len, "From");
         } else if (match_header(p, "To")) {
             free(msg->to);
-            msg->to = hdr_val(p, "To");
+            msg->to = hdr_val(p, line_len, "To");
         } else if (match_header(p, "Call-ID")) {
             free(msg->call_id);
-            msg->call_id = hdr_val(p, "Call-ID");
+            msg->call_id = hdr_val(p, line_len, "Call-ID");
         } else if (match_header(p, "CSeq")) {
-            char *val = hdr_val(p, "CSeq");
+            char *val = hdr_val(p, line_len, "CSeq");
             /* format: "number METHOD" */
             char *sp = strchr(val, ' ');
             if (sp) {
@@ -143,20 +144,20 @@ struct sip_msg *sip_parse_request(const char *buf, int len) {
             free(val);
         } else if (match_header(p, "Contact")) {
             free(msg->contact);
-            msg->contact = hdr_val(p, "Contact");
+            msg->contact = hdr_val(p, line_len, "Contact");
         } else if (match_header(p, "Authorization")) {
             free(msg->authorization);
-            msg->authorization = hdr_val(p, "Authorization");
+            msg->authorization = hdr_val(p, line_len, "Authorization");
         } else if (match_header(p, "WWW-Authenticate")) {
             free(msg->www_authenticate);
-            msg->www_authenticate = hdr_val(p, "WWW-Authenticate");
+            msg->www_authenticate = hdr_val(p, line_len, "WWW-Authenticate");
         } else if (match_header(p, "Expires")) {
-            msg->expires = hdr_int(p, "Expires");
+            msg->expires = hdr_int(p, line_len, "Expires");
         } else if (match_header(p, "Content-Length")) {
-            msg->content_length = hdr_int(p, "Content-Length");
+            msg->content_length = hdr_int(p, line_len, "Content-Length");
         } else if (match_header(p, "Content-Type")) {
             free(msg->content_type);
-            msg->content_type = hdr_val(p, "Content-Type");
+            msg->content_type = hdr_val(p, line_len, "Content-Type");
         }
 
         p = eol + 1;
@@ -185,7 +186,6 @@ void sip_msg_free(struct sip_msg *msg) {
     free(msg->www_authenticate);
     free(msg->content_type);
     free(msg->reason);
-    /* body points into original buffer, do NOT free */
     free(msg);
 }
 

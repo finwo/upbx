@@ -90,7 +90,7 @@ int cmd_daemon(int argc, const char **argv) {
         fprintf(stderr, "daemon: failed to bind SIP UDP socket on port %d\n", config->sip_port);
         return 1;
     }
-    pbx->sip_fd = sip_fds[1];
+    pbx->sip_fds = sip_fds;
 
     /* Start SIP receive task */
     pbx->sip_task = sched_create(sip_recv_task, pbx);

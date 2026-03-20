@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -41,12 +42,6 @@ static void generate_hex_id(char *out, size_t len) {
     out[need * 2] = '\0';
 }
 
-static void send_sip(struct pbx_state *ps, struct sockaddr_storage *dst,
-                     const char *data, int len) {
-    sendto(ps->sip_fd, data, (size_t)len, 0,
-           (struct sockaddr *)dst, sizeof(*dst));
-}
-
 static char *addr_to_str(struct sockaddr_storage *ss) {
     char ip[INET6_ADDRSTRLEN];
     int port;
@@ -59,9 +54,25 @@ static char *addr_to_str(struct sockaddr_storage *ss) {
         inet_ntop(AF_INET6, &s->sin6_addr, ip, sizeof(ip));
         port = ntohs(s->sin6_port);
     }
-    char *out = malloc(256);
-    snprintf(out, 256, "%s:%d", ip, port);
-    return out;
+    char *buf = malloc(INET6_ADDRSTRLEN + 8);
+    snprintf(buf, INET6_ADDRSTRLEN + 8, "%s:%d", ip, port);
+    return buf;
+}
+
+static void send_sip(int fd, struct sockaddr_storage *dst,
+                     const char *data, int len) {
+    sendto(fd, data, (size_t)len, 0,
+           (struct sockaddr *)dst, sizeof(*dst));
+}
+
+/* ── extension lookup by source ──────────────────────────────── */
+
+static struct gw_ext *find_ext_by_src(struct gw_config *cfg, struct sockaddr_storage *src) {
+    for (struct gw_ext *e = cfg->extensions; e; e = e->next) {
+        if (e->registered && memcmp(&e->remote_addr, src, sizeof(*src)) == 0)
+            return e;
+    }
+    return NULL;
 }
 
 /* ── call lookup ─────────────────────────────────────────────── */
@@ -120,12 +131,12 @@ void pbx_call_remove(struct pbx_state *s, struct pbx_call *call) {
 
 /* ── REGISTER handler ────────────────────────────────────────── */
 
-static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_register(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                             struct sip_msg *msg) {
     char *ext_num = sip_extract_uri_user(msg->to);
     if (!ext_num) {
         char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL, 0);
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         return;
     }
@@ -133,7 +144,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
     struct gw_ext *ext = gw_config_find_ext(ps->config, ext_num);
     if (!ext) {
         char *resp = sip_build_response(404, "Not Found", msg, NULL, NULL, 0);
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         free(ext_num);
         return;
@@ -156,7 +167,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
         ext->expires = 0;
         log_info("pbx: extension %s unregistered", ext_num);
         char *resp = sip_build_response(200, "OK", msg, NULL, NULL, 0);
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         free(ext_num);
         return;
@@ -167,7 +178,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
         char nonce[32];
         snprintf(nonce, sizeof(nonce), "%ld", (long)time(NULL));
         char *resp = sip_build_401(msg, nonce, "upbx");
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         free(ext_num);
         return;
@@ -179,7 +190,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
         char nonce[32];
         snprintf(nonce, sizeof(nonce), "%ld", (long)time(NULL));
         char *resp = sip_build_401(msg, nonce, "upbx");
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         sip_auth_free(auth);
         free(ext_num);
@@ -193,7 +204,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
         char nonce[32];
         snprintf(nonce, sizeof(nonce), "%ld", (long)now);
         char *resp = sip_build_401(msg, nonce, "upbx");
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         sip_auth_free(auth);
         free(ext_num);
@@ -231,7 +242,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
         char nonce[32];
         snprintf(nonce, sizeof(nonce), "%ld", (long)now);
         char *resp = sip_build_401(msg, nonce, "upbx");
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         sip_auth_free(auth);
         free(ext_num);
@@ -240,6 +251,7 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
 
     /* Auth succeeded */
     ext->remote_addr = *src;
+    ext->sip_fd = fd;
     if (msg->contact) {
         free(ext->contact);
         ext->contact = strdup(msg->contact);
@@ -252,13 +264,12 @@ static void handle_register(struct pbx_state *ps, struct sockaddr_storage *src,
     ext->expires = time(NULL) + expiry;
     ext->registered = 1;
 
-    log_info("pbx: extension %s registered from %s, pbx_addr=%s, expires=%ds",
-             ext_num, addr_to_str(src), ext->pbx_addr ? ext->pbx_addr : "?", expiry);
+    log_info("pbx: extension %s registered", ext_num);
 
     char extra[128];
     snprintf(extra, sizeof(extra), "Expires: %d\r\n", expiry);
     char *resp = sip_build_response(200, "OK", msg, extra, NULL, 0);
-    send_sip(ps, src, resp, (int)strlen(resp));
+    send_sip(fd, src, resp, (int)strlen(resp));
     free(resp);
     sip_auth_free(auth);
     free(ext_num);
@@ -300,18 +311,18 @@ static char *apply_rewrite(struct gw_config *cfg, const char *number) {
 
 /* ── SIP INVITE handler ──────────────────────────────────────── */
 
-static void send_trying(struct pbx_state *ps, struct sockaddr_storage *dst, struct sip_msg *msg) {
+static void send_trying(int fd, struct pbx_state *ps, struct sockaddr_storage *dst, struct sip_msg *msg) {
     char *resp = sip_build_response(100, "Trying", msg, NULL, NULL, 0);
-    send_sip(ps, dst, resp, (int)strlen(resp));
+    send_sip(fd, dst, resp, (int)strlen(resp));
     free(resp);
 }
 
-static void ext_to_ext(struct pbx_state *ps, struct sockaddr_storage *caller_addr,
+static void ext_to_ext(int fd, struct pbx_state *ps, struct sockaddr_storage *caller_addr,
                        struct gw_ext *caller_ext, struct gw_ext *callee_ext,
                        struct sip_msg *msg) {
     if (!callee_ext->registered) {
         char *resp = sip_build_response(480, "Temporarily Unavailable", msg, NULL, NULL, 0);
-        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        send_sip(fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
         return;
     }
@@ -321,7 +332,7 @@ static void ext_to_ext(struct pbx_state *ps, struct sockaddr_storage *caller_add
     struct rtp_pair *rtp_b = rtp_alloc(&ps->rtp_ctx);
     if (!rtp_a || !rtp_b) {
         char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
-        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        send_sip(fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
         rtp_free(rtp_a);
         rtp_free(rtp_b);
@@ -393,7 +404,7 @@ static void ext_to_ext(struct pbx_state *ps, struct sockaddr_storage *caller_add
         ilen += callee_sdp_len;
     }
 
-    send_sip(ps, &callee_ext->remote_addr, invite, ilen);
+    send_sip(callee_ext->sip_fd, &callee_ext->remote_addr, invite, ilen);
     free(new_sdp);
 }
 
@@ -402,7 +413,7 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
                             struct sip_msg *msg) {
     if (!ps->backbone || ps->backbone->phase != BACKBONE_CONNECTED) {
         char *resp = sip_build_response(503, "Service Unavailable", msg, NULL, NULL, 0);
-        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        send_sip(caller_ext->sip_fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
         return;
     }
@@ -414,7 +425,7 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
     struct rtp_pair *rtp = rtp_alloc(&ps->rtp_ctx);
     if (!rtp) {
         char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
-        send_sip(ps, caller_addr, resp, (int)strlen(resp));
+        send_sip(caller_ext->sip_fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
         free(rewritten);
         return;
@@ -452,25 +463,16 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
              caller_ext->extension, dialed, rewritten, call->backbone_call_id);
 }
 
-static void handle_invite(struct pbx_state *ps, struct sockaddr_storage *src,
-                          struct sip_msg *msg) {
-    send_trying(ps, src, msg);
+static void handle_invite(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
+                          struct sip_msg *msg, struct gw_ext *caller_ext) {
+    send_trying(fd, ps, src, msg);
 
     char *dialed = sip_extract_uri_user(msg->uri);
     if (!dialed) {
         char *resp = sip_build_response(400, "Bad Request", msg, NULL, NULL, 0);
-        send_sip(ps, src, resp, (int)strlen(resp));
+        send_sip(fd, src, resp, (int)strlen(resp));
         free(resp);
         return;
-    }
-
-    /* Find caller extension by source address */
-    struct gw_ext *caller_ext = NULL;
-    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
-        if (e->registered && memcmp(&e->remote_addr, src, sizeof(*src)) == 0) {
-            caller_ext = e;
-            break;
-        }
     }
 
     /* Check if dialed number matches a registered extension */
@@ -483,7 +485,7 @@ static void handle_invite(struct pbx_state *ps, struct sockaddr_storage *src,
     }
 
     if (callee_ext && callee_ext != caller_ext) {
-        ext_to_ext(ps, src, caller_ext, callee_ext, msg);
+        ext_to_ext(fd, ps, src, caller_ext, callee_ext, msg);
     } else {
         ext_to_backbone(ps, src, caller_ext, dialed, msg);
     }
@@ -493,7 +495,7 @@ static void handle_invite(struct pbx_state *ps, struct sockaddr_storage *src,
 
 /* ── SIP BYE handler ─────────────────────────────────────────── */
 
-static void handle_bye(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_bye(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                        struct sip_msg *msg) {
     struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
     if (!call) {
@@ -502,7 +504,7 @@ static void handle_bye(struct pbx_state *ps, struct sockaddr_storage *src,
     }
 
     char *ok = sip_build_response(200, "OK", msg, NULL, NULL, 0);
-    send_sip(ps, src, ok, (int)strlen(ok));
+    send_sip(fd, src, ok, (int)strlen(ok));
     free(ok);
 
     if (!call) return;
@@ -516,10 +518,10 @@ static void handle_bye(struct pbx_state *ps, struct sockaddr_storage *src,
 
 /* ── SIP CANCEL handler ──────────────────────────────────────── */
 
-static void handle_cancel(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_cancel(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                           struct sip_msg *msg) {
     char *ok = sip_build_response(200, "OK", msg, NULL, NULL, 0);
-    send_sip(ps, src, ok, (int)strlen(ok));
+    send_sip(fd, src, ok, (int)strlen(ok));
     free(ok);
 
     struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
@@ -543,7 +545,7 @@ static void handle_cancel(struct pbx_state *ps, struct sockaddr_storage *src,
                 b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0", b->sip_call_id,
                 b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
                 b->sip_call_id);
-            send_sip(ps, &b->ext->remote_addr, cancel, clen);
+            send_sip(fd, &b->ext->remote_addr, cancel, clen);
             b->finished = 1;
         }
     }
@@ -557,7 +559,7 @@ static void handle_cancel(struct pbx_state *ps, struct sockaddr_storage *src,
 
 /* ── SIP ACK handler ─────────────────────────────────────────── */
 
-static void handle_ack(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_ack(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                        struct sip_msg *msg) {
     (void)ps;
     (void)src;
@@ -567,16 +569,16 @@ static void handle_ack(struct pbx_state *ps, struct sockaddr_storage *src,
 
 /* ── SIP OPTIONS handler ─────────────────────────────────────── */
 
-static void handle_options(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_options(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                            struct sip_msg *msg) {
     char *resp = sip_build_response(200, "OK", msg, NULL, NULL, 0);
-    send_sip(ps, src, resp, (int)strlen(resp));
+    send_sip(fd, src, resp, (int)strlen(resp));
     free(resp);
 }
 
 /* ── SIP response handler (from extensions) ──────────────────── */
 
-static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *src,
+static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                                 struct sip_msg *msg) {
     (void)src;
 
@@ -607,7 +609,7 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
         if (code == 180) {
             /* Forward ringing to caller */
             char *resp = sip_build_response(180, "Ringing", msg, NULL, NULL, 0);
-            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            send_sip(fd, &call->caller_addr, resp, (int)strlen(resp));
             free(resp);
         } else if (code == 200) {
             /* Forward 200 OK to caller with rewritten SDP */
@@ -619,14 +621,14 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
                                    call->rtp_caller->port, &body_len);
             }
             char *resp = sip_build_response(200, "OK", msg, NULL, body, body_len);
-            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            send_sip(fd, &call->caller_addr, resp, (int)strlen(resp));
             free(resp);
             free(body);
             call->state = CALL_ACTIVE;
         } else if (code >= 400) {
             /* Forward error to caller */
             char *resp = sip_build_response(code, msg->reason ? msg->reason : "Error", msg, NULL, NULL, 0);
-            send_sip(ps, &call->caller_addr, resp, (int)strlen(resp));
+            send_sip(fd, &call->caller_addr, resp, (int)strlen(resp));
             free(resp);
             pbx_call_remove(ps, call);
         }
@@ -662,7 +664,7 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
                 branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0", branch->sip_call_id,
                 branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
                 branch->sip_call_id);
-            send_sip(ps, &branch->ext->remote_addr, bye, blen);
+            send_sip(fd, &branch->ext->remote_addr, bye, blen);
             return;
         }
 
@@ -695,7 +697,7 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
                 branch->sip_call_id,
                 msg->to ? msg->to : "",
                 branch->sip_call_id);
-            send_sip(ps, &branch->ext->remote_addr, ack, alen);
+            send_sip(fd, &branch->ext->remote_addr, ack, alen);
         }
 
         /* Cancel all other pending branches */
@@ -715,7 +717,7 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
                     b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0", b->sip_call_id,
                     b->ext->extension, b->ext->pbx_addr ? b->ext->pbx_addr : "0.0.0.0",
                     b->sip_call_id);
-                send_sip(ps, &b->ext->remote_addr, cancel, clen);
+                send_sip(fd, &b->ext->remote_addr, cancel, clen);
                 b->finished = 1;
             }
         }
@@ -726,7 +728,7 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
         /* Busy — queue for retry */
         branch->busy = 1;
         branch->retry_at = time(NULL) + BUSY_RETRY_SEC;
-        log_debug("pbx: ext %s busy, retry at T+%ds", branch->ext->extension, BUSY_RETRY_SEC);
+        log_info("pbx: ext %s busy, retry at T+%ds", branch->ext->extension, BUSY_RETRY_SEC);
     } else if (code >= 400) {
         /* Other failure — mark finished */
         branch->finished = 1;
@@ -738,6 +740,9 @@ static void handle_sip_response(struct pbx_state *ps, struct sockaddr_storage *s
 void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
+
+    struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
+    if (!caller_ext) return;
 
     /* Send 180 Ringing to the extension */
     char ringing[1024];
@@ -753,7 +758,7 @@ void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id) {
         "0.0.0.0",
         call->sip_call_id,
         call->cseq_num);
-    send_sip(s, &call->caller_addr, ringing, rlen);
+    send_sip(caller_ext->sip_fd, &call->caller_addr, ringing, rlen);
     call->state = CALL_RINGING;
 }
 
@@ -761,11 +766,13 @@ void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
 
+    struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
+    if (!caller_ext) return;
+
     /* Send 200 OK to extension with SDP pointing to our RTP port */
     char sdp_body[512];
     int sdp_len = 0;
-    struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
-    if (caller_ext && caller_ext->pbx_addr && call->rtp_caller) {
+    if (caller_ext->pbx_addr && call->rtp_caller) {
         sdp_len = snprintf(sdp_body, sizeof(sdp_body),
             "v=0\r\n"
             "o=- 0 0 IN IP4 %s\r\n"
@@ -802,7 +809,7 @@ void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id) {
         olen += sdp_len;
     }
 
-    send_sip(s, &call->caller_addr, ok, olen);
+    send_sip(caller_ext->sip_fd, &call->caller_addr, ok, olen);
     call->state = CALL_ACTIVE;
 }
 
@@ -828,8 +835,10 @@ void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
 
+    struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
+
     /* Send BYE to the connected extension */
-    if (call->rtp_caller) {
+    if (call->rtp_caller && caller_ext) {
         char bye[512];
         int blen = snprintf(bye, sizeof(bye),
             "BYE sip:%s@%s SIP/2.0\r\n"
@@ -846,7 +855,7 @@ void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
             call->caller_ext ? call->caller_ext : "?",
             "0.0.0.0",
             call->sip_call_id);
-        send_sip(s, &call->caller_addr, bye, blen);
+        send_sip(caller_ext->sip_fd, &call->caller_addr, bye, blen);
     }
 
     pbx_call_remove(s, call);
@@ -866,7 +875,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         }
     }
     if (!did_match) {
-        log_debug("pbx: backbone invite DID %s not in our list, ignoring", did);
+        log_info("pbx: backbone invite DID %s not in our list, ignoring", did);
         return;
     }
 
@@ -877,7 +886,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
     }
 
     if (n_ext == 0) {
-        log_debug("pbx: no registered extensions for backbone call %s", call_id);
+        log_info("pbx: no registered extensions for backbone call %s", call_id);
         backbone_send_cancel(ps->backbone, call_id);
         return;
     }
@@ -953,7 +962,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
             ilen += sdp_len;
         }
 
-        send_sip(ps, &e->remote_addr, invite, ilen);
+        send_sip(e->sip_fd, &e->remote_addr, invite, ilen);
         branch->invite_sent = 1;
         branch->next = call->branches;
         call->branches = branch;
@@ -1039,12 +1048,12 @@ int busy_retry_task(int64_t ts, struct pt_task *pt) {
                     ilen += sdp_len;
                 }
 
-                send_sip(ps, &b->ext->remote_addr, invite, ilen);
+                send_sip(b->ext->sip_fd, &b->ext->remote_addr, invite, ilen);
                 b->busy = 0;
                 b->invite_sent = 1;
                 b->retry_at = now + BUSY_RETRY_SEC;
 
-                log_debug("pbx: retrying ext %s for call %s", b->ext->extension, call->backbone_call_id);
+                log_info("pbx: retrying ext %s for call %s", b->ext->extension, call->backbone_call_id);
             }
         }
     }
@@ -1076,13 +1085,13 @@ int sip_recv_task(int64_t ts, struct pt_task *pt) {
     (void)ts;
     struct pbx_state *ps = pt->udata;
 
-    int fds[2] = {1, ps->sip_fd};
-    if (sched_has_data(fds) < 0) return SCHED_RUNNING;
+    int ready_fd = sched_has_data(ps->sip_fds);
+    if (ready_fd < 0) return SCHED_RUNNING;
 
     char buf[4096];
     struct sockaddr_storage src;
     socklen_t src_len = sizeof(src);
-    ssize_t n = recvfrom(ps->sip_fd, buf, sizeof(buf) - 1, 0,
+    ssize_t n = recvfrom(ready_fd, buf, sizeof(buf) - 1, 0,
                          (struct sockaddr *)&src, &src_len);
     if (n <= 0) return SCHED_RUNNING;
 
@@ -1092,29 +1101,54 @@ int sip_recv_task(int64_t ts, struct pt_task *pt) {
     if (!msg) return SCHED_RUNNING;
 
     if (msg->status_code > 0) {
-        handle_sip_response(ps, &src, msg);
+        handle_sip_response(ready_fd, ps, &src, msg);
     } else {
         switch (msg->method) {
         case SIP_METHOD_REGISTER:
-            handle_register(ps, &src, msg);
-            break;
-        case SIP_METHOD_INVITE:
-            handle_invite(ps, &src, msg);
-            break;
-        case SIP_METHOD_BYE:
-            handle_bye(ps, &src, msg);
-            break;
-        case SIP_METHOD_CANCEL:
-            handle_cancel(ps, &src, msg);
-            break;
-        case SIP_METHOD_ACK:
-            handle_ack(ps, &src, msg);
+            handle_register(ready_fd, ps, &src, msg);
             break;
         case SIP_METHOD_OPTIONS:
-            handle_options(ps, &src, msg);
+            handle_options(ready_fd, ps, &src, msg);
             break;
-        default:
+        default: {
+            /* All other methods require a registered sender */
+            struct gw_ext *caller_ext = find_ext_by_src(ps->config, &src);
+            if (!caller_ext) {
+                char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL, 0);
+                send_sip(ready_fd, &src, resp, (int)strlen(resp));
+                free(resp);
+                break;
+            }
+
+            /* Verify claimed extension matches registration */
+            char *claimed = sip_extract_uri_user(msg->from);
+            if (!claimed || strcmp(claimed, caller_ext->extension) != 0) {
+                char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL, 0);
+                send_sip(ready_fd, &src, resp, (int)strlen(resp));
+                free(resp);
+                free(claimed);
+                break;
+            }
+            free(claimed);
+
+            switch (msg->method) {
+            case SIP_METHOD_INVITE:
+                handle_invite(ready_fd, ps, &src, msg, caller_ext);
+                break;
+            case SIP_METHOD_BYE:
+                handle_bye(ready_fd, ps, &src, msg);
+                break;
+            case SIP_METHOD_CANCEL:
+                handle_cancel(ready_fd, ps, &src, msg);
+                break;
+            case SIP_METHOD_ACK:
+                handle_ack(ready_fd, ps, &src, msg);
+                break;
+            default:
+                break;
+            }
             break;
+        }
         }
     }
 
@@ -1128,7 +1162,7 @@ struct pbx_state *pbx_create(struct gw_config *cfg) {
     struct pbx_state *ps = calloc(1, sizeof(struct pbx_state));
     if (!ps) return NULL;
     ps->config = cfg;
-    ps->sip_fd = -1;
+    ps->sip_fds = NULL;
     rtp_ctx_init(&ps->rtp_ctx, cfg->rtp_min, cfg->rtp_max);
     return ps;
 }
