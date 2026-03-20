@@ -3,12 +3,16 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include "command/command.h"
 #include "config/config.h"
 #include "trunk/trunk.h"
 #include "backbone/backbone.h"
-#include "finwo/socket-util.h"
+#include "register/register.h"
 #include "finwo/scheduler.h"
 #include "rxi/log.h"
 
@@ -42,6 +46,30 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -c, --config <file>    Configuration file (default: /etc/upbx-trk.conf)\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
+}
+
+static int create_sip_socket(const char *target_host) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    /* Resolve the target to determine the address family */
+    if (target_host && getaddrinfo(target_host, NULL, &hints, &res) == 0 && res) {
+        int fd = socket(res->ai_family, SOCK_DGRAM, 0);
+        freeaddrinfo(res);
+        if (fd < 0) return -1;
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        return fd;
+    }
+
+    /* Fallback: IPv4 */
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fd;
 }
 
 int cmd_daemon(int argc, const char **argv) {
@@ -82,14 +110,18 @@ int cmd_daemon(int argc, const char **argv) {
     /* Create trunk state */
     struct trunk_state *trunk = trunk_create(config);
 
-    /* Bind SIP UDP socket */
-    char sip_addr[64];
-    snprintf(sip_addr, sizeof(sip_addr), ":%d", config->sip_port);
-    int *sip_fds = udp_recv(sip_addr, NULL, "5061");
-    if (!sip_fds || sip_fds[0] < 1) {
-        fprintf(stderr, "daemon: failed to bind SIP UDP socket on port %d\n", config->sip_port);
+    /* Create SIP UDP socket (OS-assigned ephemeral port) */
+    const char *target_host = config->target ? config->target->host : NULL;
+    int sip_fd = create_sip_socket(target_host);
+    if (sip_fd < 0) {
+        fprintf(stderr, "daemon: failed to create SIP UDP socket\n");
         return 1;
     }
+
+    /* Build fd array for sched_has_data: {count, fd} */
+    int *sip_fds = malloc(2 * sizeof(int));
+    sip_fds[0] = 1;
+    sip_fds[1] = sip_fd;
     trunk->sip_fds = sip_fds;
 
     /* Start SIP receive task */
@@ -102,19 +134,25 @@ int cmd_daemon(int argc, const char **argv) {
         trunk->backbone = backbone;
     }
 
+    /* Start SIP registration to upstream */
+    if (config->target && config->target->host && config->target->username) {
+        trunk->reg = register_create(config, trunk, sip_fd);
+    }
+
     /* Start delay timer task */
     trunk->delay_task = sched_create(trunk_delay_task, trunk);
 
     /* Shutdown watchdog */
     sched_create(shutdown_watchdog, NULL);
 
-    printf("UPBX trunk running on port %d. Press Ctrl+C to stop.\n", config->sip_port);
+    printf("UPBX trunk running. Press Ctrl+C to stop.\n");
     fflush(stdout);
 
     sched_main();
 
     if (backbone) backbone_free(backbone);
     trunk_free(trunk);
+    close(sip_fd);
     free(sip_fds);
     trk_config_free(config);
 

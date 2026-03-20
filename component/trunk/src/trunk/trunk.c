@@ -13,6 +13,7 @@
 #include "sdp/sdp.h"
 #include "backbone/backbone.h"
 #include "rtp/rtp.h"
+#include "register/register.h"
 #include "config/config.h"
 #include "finwo/scheduler.h"
 #include "rxi/log.h"
@@ -180,6 +181,7 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
         "Call-ID: %s\r\n"
         "CSeq: 1 INVITE\r\n"
         "Contact: <sip:trk@%s>\r\n"
+        "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "Content-Type: application/sdp\r\n"
         "Content-Length: %d\r\n"
         "\r\n",
@@ -424,12 +426,24 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
     if (n <= 0) return SCHED_RUNNING;
 
     buf[n] = '\0';
+    log_debug("sip: <<< %.*s", (int)n, buf);
 
     struct sip_msg *msg = sip_parse_request(buf, (int)n);
     if (!msg) return SCHED_RUNNING;
 
     if (msg->status_code > 0) {
-        handle_sip_response(ready_fd, state, &src, msg);
+        /* Route REGISTER responses to register module */
+        if (msg->cseq_method && strcasecmp(msg->cseq_method, "REGISTER") == 0) {
+            if (state->reg) {
+                if (msg->status_code == 401 && msg->www_authenticate) {
+                    register_on_401(state->reg, msg->www_authenticate);
+                } else if (msg->status_code == 200) {
+                    register_on_200(state->reg, msg->expires > 0 ? msg->expires : 300);
+                }
+            }
+        } else {
+            handle_sip_response(ready_fd, state, &src, msg);
+        }
     } else {
         switch (msg->method) {
         case SIP_METHOD_INVITE:
@@ -644,6 +658,7 @@ void trunk_free(struct trunk_state *ts) {
     if (!ts) return;
     if (ts->sip_task) sched_remove(ts->sip_task);
     if (ts->delay_task) sched_remove(ts->delay_task);
+    if (ts->reg) register_free(ts->reg);
     while (ts->calls) {
         struct trunk_call *next = ts->calls->next;
         trunk_call_free(ts->calls);

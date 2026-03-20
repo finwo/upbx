@@ -1,7 +1,5 @@
 orlp/ed25519 https://git.finwo.net/misc/dep-repository/archives/heads/pkg/orlp/ed25519.tar.gz
 
-finwo/socket-util https://git.finwo.net/lib/socket-util.c/archives/heads/main.tar.gz
-
 finwo/pbkdf2 https://git.finwo.net/lib/pbkdf2.c/archives/heads/main.tar.gz
 
 finwo/scheduler https://git.finwo.net/lib/scheduler.c/archives/heads/main.tar.gz

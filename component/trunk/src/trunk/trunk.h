@@ -9,6 +9,8 @@
 #include "rtp/rtp.h"
 #include "finwo/scheduler.h"
 
+struct register_state;
+
 enum call_state {
     CALL_WAITING,
     CALL_RINGING,
@@ -61,6 +63,7 @@ struct trunk_call {
 struct trunk_state {
     struct trk_config *config;
     struct backbone_state *backbone;
+    struct register_state *reg;
     int *sip_fds;
     struct rtp_alloc_ctx rtp_ctx;
     struct trunk_call *calls;
