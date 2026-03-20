@@ -59,9 +59,10 @@ struct sip_msg *sip_parse_request(const char *buf, int len) {
 
     /* check if response: starts with SIP/2.0 */
     if (line_len >= 8 && memcmp(p, "SIP/2.0 ", 8) == 0) {
+        /* Status line: "SIP/2.0 200 OK" — code starts at p+8 */
+        msg->status_code = atoi(p + 8);
         const char *sp = memchr(p + 8, ' ', eol - (p + 8));
         if (sp) {
-            msg->status_code = atoi(sp + 1);
             const char *reason_start = sp + 1;
             while (*reason_start == ' ') reason_start++;
             const char *reason_end = eol;

@@ -43,6 +43,17 @@ struct pbx_call {
     char *callee_did;                    // rewritten DID for backbone, or target ext
     int cseq_num;
 
+    /* Caller-side dialog headers (caller's INVITE + gateway's to-tag) */
+    char *caller_via;
+    char *caller_from;
+    char *caller_to;        /* includes gateway's to-tag after 200 OK */
+    char *caller_contact;
+    char gw_tag[16];        /* gateway-generated to-tag for caller dialog */
+
+    /* Callee-side dialog headers (from callee's 200 OK) */
+    char *callee_from;      /* From in callee's 200 OK */
+    char *callee_to;        /* To in callee's 200 OK (with callee's tag) */
+
     /* RTP */
     struct rtp_pair *rtp_caller;
     struct rtp_pair *rtp_callee;
@@ -51,6 +62,7 @@ struct pbx_call {
     struct fork_branch *branches;
 
     enum call_state state;
+    time_t started_at;      /* time call became ACTIVE, for duration logging */
     struct pbx_call *next;
 };
 
