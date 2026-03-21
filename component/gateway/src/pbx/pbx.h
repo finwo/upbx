@@ -100,10 +100,10 @@ void pbx_handle_backbone_invite(struct pbx_state *ps, const char *call_id,
                                 struct gw_tag_entry *tags, int tag_count);
 
 /* Called by backbone module on incoming protocol lines */
-void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id);
-void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id);
+void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id, const char *codec_tags);
+void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id, const char *codec_tags);
 void pbx_on_backbone_cancel(struct pbx_state *s, const char *call_id);
-void pbx_on_backbone_media(struct pbx_state *s, const char *call_id, const uint8_t *data, size_t len);
+void pbx_on_backbone_media(struct pbx_state *s, const char *call_id, int stream_id, const uint8_t *data, size_t len);
 void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id);
 
 /* Call management */

@@ -21,13 +21,27 @@ static int rtp_task(int64_t ts, struct pt_task *pt) {
     struct rtp_pair *rp = pt->udata;
 
     int fds[2] = {1, rp->fd};
-    if (sched_has_data(fds) < 0) return SCHED_RUNNING;
+    int ready_fd = sched_has_data(fds);
+    if (ready_fd < 0) return SCHED_RUNNING;
 
     uint8_t buf[1500];
     struct sockaddr_storage src;
     socklen_t src_len = sizeof(src);
-    ssize_t n = recvfrom(rp->fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &src_len);
-    if (n <= 0) return SCHED_RUNNING;
+    ssize_t n = recvfrom(ready_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &src_len);
+    if (n <= 0) {
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            log_warn("rtp: recvfrom error on port %d: %s (errno=%d)", rp->port, strerror(errno), errno);
+        return SCHED_RUNNING;
+    }
+
+    if (!rp->logged_incoming) {
+        struct sockaddr_in *a = (struct sockaddr_in *)&src;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+        log_info("rtp: first inbound RTP for %s from %s:%d (local port %d, %zd bytes)",
+                 rp->call_id, ip, ntohs(a->sin_port), rp->port, n);
+        rp->logged_incoming = 1;
+    }
 
     // Learn extension address from first packet
     if (!rp->learned_ext) {
@@ -37,7 +51,7 @@ static int rtp_task(int64_t ts, struct pt_task *pt) {
 
     if (rp->is_backbone_dir && rp->backbone) {
         // Forward to backbone as hex-encoded media
-        backbone_send_media(rp->backbone, rp->call_id, buf, (size_t)n);
+        backbone_send_media(rp->backbone, rp->call_id, rp->stream_id, buf, (size_t)n);
     } else if (rp->peer && rp->peer->learned_ext) {
         // Ext-to-ext: forward raw RTP to peer's learned address
         sendto(rp->peer->fd, buf, n, 0,
@@ -51,6 +65,7 @@ static int rtp_task(int64_t ts, struct pt_task *pt) {
 struct rtp_pair *rtp_alloc(struct rtp_alloc_ctx *ctx) {
     struct rtp_pair *rp = calloc(1, sizeof(*rp));
     if (!rp) return NULL;
+    rp->stream_id = -1;
 
     int attempts = 0;
     int port_count = (ctx->port_max - ctx->port_min) / 2 + 1;

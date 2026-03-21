@@ -44,10 +44,13 @@ struct gw_did {
     struct gw_did *next;
 };
 
+#define GW_DEFAULT_DATA_DIR "/var/lib/upbx/gateway"
+
 struct gw_config {
     int sip_port;                           // default 5060
     int rtp_min, rtp_max;                   // default 10000, 20000
     char *cid;
+    char *data_dir;
     struct gw_did *dids;
     struct gw_backbone *backbones;
     struct gw_ext *extensions;

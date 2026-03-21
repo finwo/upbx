@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -21,10 +23,10 @@
 #define PBKDF2_ITERATIONS   10000
 
 // Forward-declared callbacks from trunk (defined in trunk.c)
-extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id);
-extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id);
+extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id, const char *codec_tags);
+extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const char *codec_tags);
 extern void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id);
-extern void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, const uint8_t *data, size_t len);
+extern void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, int stream_id, const uint8_t *data, size_t len);
 extern void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id);
 
 // hex helpers
@@ -114,6 +116,8 @@ static void send_auth(struct backbone_state *bs) {
 // line dispatch
 
 static void dispatch_line(struct backbone_state *bs, const char *line) {
+    if (strncmp(line, "media ", 6) != 0)
+        log_info("backbone: dispatch_line: '%s'", line);
     char cmd[64] = {0};
     char arg[512] = {0};
     sscanf(line, "%63s %511[^\n]", cmd, arg);
@@ -155,33 +159,67 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
 
         trunk_handle_backbone_invite(bs->trunk, call_id, did, cid, p);
     } else if (strcmp(cmd, "ringing") == 0) {
-        trunk_on_backbone_ringing(bs->trunk, arg);
-    } else if (strcmp(cmd, "answer") == 0) {
-        trunk_on_backbone_answer(bs->trunk, arg);
-    } else if (strcmp(cmd, "cancel") == 0) {
-        trunk_on_backbone_cancel(bs->trunk, arg);
-    } else if (strcmp(cmd, "media") == 0) {
+        // Format: ringing <call_id> [<codec_tags>]
         char call_id[256] = {0};
         const char *p = arg;
         const char *space = strchr(p, ' ');
-        if (!space) return;
-        size_t id_len = (size_t)(space - p);
+        size_t id_len = space ? (size_t)(space - p) : strlen(p);
+        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+        memcpy(call_id, p, id_len);
+        call_id[id_len] = '\0';
+        const char *tags = space ? space + 1 : "";
+        trunk_on_backbone_ringing(bs->trunk, call_id, tags);
+    } else if (strcmp(cmd, "answer") == 0) {
+        // Format: answer <call_id> [<codec_tags>]
+        char call_id[256] = {0};
+        const char *p = arg;
+        const char *space = strchr(p, ' ');
+        size_t id_len = space ? (size_t)(space - p) : strlen(p);
+        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+        memcpy(call_id, p, id_len);
+        call_id[id_len] = '\0';
+        const char *tags = space ? space + 1 : "";
+        trunk_on_backbone_answer(bs->trunk, call_id, tags);
+    } else if (strcmp(cmd, "cancel") == 0) {
+        trunk_on_backbone_cancel(bs->trunk, arg);
+    } else if (strcmp(cmd, "media") == 0) {
+        // Format: media <call_id> [<stream_id>] data:;hex,<hex>
+        char call_id[256] = {0};
+        int stream_id = -1;
+
+        const char *p = arg;
+        const char *space1 = strchr(p, ' ');
+        if (!space1) return;
+        size_t id_len = (size_t)(space1 - p);
         if (id_len >= sizeof(call_id)) return;
         memcpy(call_id, p, id_len);
         call_id[id_len] = '\0';
 
-        p = space + 1;
-        const char *hex_tag = "data:;hex,";
+        /* after call_id: either "data:;hex,<hex>" or "<stream_id> data:;hex,<hex>" */
+        p = space1 + 1;
+        while (*p == ' ') p++;
+
+        if (isdigit((unsigned char)*p)) {
+            stream_id = atoi(p);
+            while (isdigit((unsigned char)*p)) p++;
+            while (*p == ' ') p++;
+        }
+
+        const char *hex_tag = "data:;";
         const char *found = strstr(p, hex_tag);
         if (!found) return;
-        char *hex_start = (char *)(found + strlen(hex_tag));
+        const char *hex_start = found + strlen(hex_tag);
+        /* skip datatype;hex, */
+        const char *hex_comma = strchr(hex_start, ',');
+        if (!hex_comma) return;
+        hex_start = hex_comma + 1;
 
         size_t hex_len = strlen(hex_start);
         uint8_t *raw = malloc(hex_len / 2 + 1);
         if (!raw) return;
         int raw_len = hex_decode(hex_start, raw, hex_len / 2 + 1);
         if (raw_len > 0) {
-            trunk_on_backbone_media(bs->trunk, call_id, raw, (size_t)raw_len);
+            trunk_on_backbone_media(bs->trunk, call_id, stream_id, raw, (size_t)raw_len);
         }
         free(raw);
     } else if (strcmp(cmd, "bye") == 0) {
@@ -212,15 +250,23 @@ void backbone_send_invite(struct backbone_state *s, const char *call_id,
     backbone_send_line(s, line, len);
 }
 
-void backbone_send_ringing(struct backbone_state *s, const char *call_id) {
-    char line[256];
-    int len = snprintf(line, sizeof(line), "ringing %s\n", call_id);
+void backbone_send_ringing(struct backbone_state *s, const char *call_id, const char *tags) {
+    char line[4096];
+    int len;
+    if (tags && tags[0])
+        len = snprintf(line, sizeof(line), "ringing %s %s\n", call_id, tags);
+    else
+        len = snprintf(line, sizeof(line), "ringing %s\n", call_id);
     backbone_send_line(s, line, len);
 }
 
-void backbone_send_answer(struct backbone_state *s, const char *call_id) {
-    char line[256];
-    int len = snprintf(line, sizeof(line), "answer %s\n", call_id);
+void backbone_send_answer(struct backbone_state *s, const char *call_id, const char *tags) {
+    char line[4096];
+    int len;
+    if (tags && tags[0])
+        len = snprintf(line, sizeof(line), "answer %s %s\n", call_id, tags);
+    else
+        len = snprintf(line, sizeof(line), "answer %s\n", call_id);
     backbone_send_line(s, line, len);
 }
 
@@ -230,16 +276,20 @@ void backbone_send_cancel(struct backbone_state *s, const char *call_id) {
     backbone_send_line(s, line, len);
 }
 
-void backbone_send_media(struct backbone_state *s, const char *call_id, const uint8_t *rtp, size_t len) {
+void backbone_send_media(struct backbone_state *s, const char *call_id, int stream_id, const uint8_t *rtp, size_t len) {
     size_t hex_len = len * 2 + 1;
     char *hex_buf = malloc(hex_len);
     if (!hex_buf) return;
     hex_encode(rtp, len, hex_buf, hex_len);
 
-    size_t line_cap = strlen(call_id) + hex_len + 32;
+    size_t line_cap = strlen(call_id) + hex_len + 48;
     char *line = malloc(line_cap);
     if (!line) { free(hex_buf); return; }
-    int line_len = snprintf(line, line_cap, "media %s data:;hex,%s\n", call_id, hex_buf);
+    int line_len;
+    if (stream_id >= 0)
+        line_len = snprintf(line, line_cap, "media %s %d data:;hex,%s\n", call_id, stream_id, hex_buf);
+    else
+        line_len = snprintf(line, line_cap, "media %s data:;hex,%s\n", call_id, hex_buf);
 
     backbone_send_line(s, line, line_len);
     free(line);
@@ -308,11 +358,12 @@ static int backbone_task(int64_t timestamp, pt_task_t *task) {
             return SCHED_RUNNING;
         }
 
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-
         bs->fd = fd;
         bs->fail_index = 0;
+
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
         log_info("backbone: connected to %s:%d, sending auth", host_buf, port_val);
 
         send_auth(bs);
@@ -330,7 +381,7 @@ static int backbone_task(int64_t timestamp, pt_task_t *task) {
         }
 
         char buf[1024];
-        ssize_t n = recv(bs->fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        ssize_t n = recv(bs->fd, buf, sizeof(buf) - 1, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return SCHED_RUNNING;
             log_debug("backbone: recv error during auth: %s", strerror(errno));
@@ -373,9 +424,10 @@ static int backbone_task(int64_t timestamp, pt_task_t *task) {
         ssize_t n = recv(bs->fd,
                          bs->recv_buf + bs->recv_len,
                          sizeof(bs->recv_buf) - bs->recv_len - 1,
-                         MSG_DONTWAIT);
+                         0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return SCHED_RUNNING;
+            log_warn("backbone: recv error in CONNECTED: %s (fd=%d)", strerror(errno), bs->fd);
             log_debug("backbone: recv error: %s", strerror(errno));
             close_fd(bs);
             advance_backbone(bs);

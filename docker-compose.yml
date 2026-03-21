@@ -15,6 +15,7 @@ services:
       - "10000-10099:10000-10099/udp"
     volumes:
       - ./docker/gateway.conf:/etc/upbx-gw.conf
+      - ./data:/var/lib/upbx/gateway
     depends_on:
       - backbone
     restart: unless-stopped

@@ -50,6 +50,9 @@ struct trunk_call {
     char *remote_sdp_host;
     int remote_sdp_port;
 
+    /* Diagnostics */
+    int media_logged;
+
     /* Delay timer for outgoing calls */
     int delay_active;
     int64_t delay_started;
@@ -84,10 +87,10 @@ void trunk_handle_backbone_invite(struct trunk_state *ts, const char *call_id,
                                   const char *tags_str);
 
 /* Backbone event callbacks */
-void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id);
-void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id);
+void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id, const char *codec_tags);
+void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const char *codec_tags);
 void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id);
-void trunk_on_backbone_media(struct trunk_state *s, const char *call_id,
+void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, int stream_id,
                              const uint8_t *data, size_t len);
 void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id);
 

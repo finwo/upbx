@@ -17,6 +17,7 @@
 #include "config/config.h"
 #include "finwo/scheduler.h"
 #include "rxi/log.h"
+#include "registration/registration.h"
 
 #define MAX_EXPIRY   300
 #define DEFAULT_EXPIRY 60
@@ -190,6 +191,7 @@ static void handle_register(int fd, struct pbx_state *ps, struct sockaddr_storag
         free(ext->contact);
         ext->contact = NULL;
         ext->expires = 0;
+        registration_delete(ps->config->data_dir, ext->extension);
         log_info("pbx: extension %s unregistered", ext_num);
         char *resp = sip_build_response(200, "OK", msg, NULL, NULL, 0);
         send_sip(fd, src, resp, (int)strlen(resp));
@@ -288,6 +290,13 @@ static void handle_register(int fd, struct pbx_state *ps, struct sockaddr_storag
     }
     ext->expires = time(NULL) + expiry;
     ext->registered = 1;
+
+    /* Save registration to disk */
+    registration_save(ps->config->data_dir, ext->extension,
+                      &ext->remote_addr,
+                      msg->contact ? msg->contact : "",
+                      ext->pbx_addr ? ext->pbx_addr : "",
+                      ext->expires);
 
     log_info("pbx: extension %s registered", ext_num);
 
@@ -453,6 +462,7 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
                             struct gw_ext *caller_ext, const char *dialed,
                             struct sip_msg *msg) {
     if (!ps->backbone || ps->backbone->phase != BACKBONE_CONNECTED) {
+        log_warn("pbx: ext_to_backbone: backbone not connected, sending 503");
         char *resp = sip_build_response(503, "Service Unavailable", msg, NULL, NULL, 0);
         send_sip(caller_ext->sip_fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
@@ -465,6 +475,7 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
     /* Allocate one RTP pair */
     struct rtp_pair *rtp = rtp_alloc(&ps->rtp_ctx);
     if (!rtp) {
+        log_error("pbx: ext_to_backbone: RTP allocation failed, sending 500");
         char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
         send_sip(caller_ext->sip_fd, caller_addr, resp, (int)strlen(resp));
         free(resp);
@@ -473,6 +484,8 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
     }
     rtp->is_backbone_dir = 1;
     rtp->backbone = ps->backbone;
+
+    log_info("pbx: allocated RTP port %d fd %d for ext %s -> backbone", rtp->port, rtp->fd, caller_ext->extension);
 
     /* Generate backbone call_id */
     struct pbx_call *call = calloc(1, sizeof(struct pbx_call));
@@ -487,14 +500,37 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
     call->rtp_caller = rtp;
     call->is_backbone_call = 1;
     call->state = CALL_PENDING;
+
+    /* Store caller's original headers for building responses back */
+    if (msg->via)     call->caller_via     = strdup(msg->via);
+    if (msg->from)    call->caller_from    = strdup(msg->from);
+    if (msg->contact) call->caller_contact = strdup(msg->contact);
+
+    /* Generate gateway to-tag and build caller_to with it */
+    generate_hex_id(call->gw_tag, sizeof(call->gw_tag));
+    {
+        const char *orig_to = msg->to ? msg->to : "";
+        size_t tlen = strlen(orig_to) + 6 + strlen(call->gw_tag) + 1;
+        call->caller_to = malloc(tlen);
+        snprintf(call->caller_to, tlen, "%s;tag=%s", orig_to, call->gw_tag);
+    }
     call->next = ps->calls;
     ps->calls = call;
 
-    /* Rewrite caller's SDP to point to RTP port */
+    /* Parse phone's SDP for codec tags */
+    char *codec_tags = NULL;
     if (msg->body && msg->body_len > 0 && caller_ext->pbx_addr) {
-        char *new_sdp = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr, rtp->port, NULL);
-        /* We don't send SDP to backbone, just need the port for RTP */
-        free(new_sdp);
+        struct sdp_info *sdp = sdp_parse(msg->body, msg->body_len);
+        if (sdp && sdp->codec_count > 0) {
+            codec_tags = codec_tags_to_string(sdp->codecs, sdp->codec_count);
+            /* Rewrite SDP to point to our RTP port */
+            char *new_sdp = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr, rtp->port, NULL);
+            free(new_sdp);
+        } else {
+            char *new_sdp = sdp_rewrite(msg->body, msg->body_len, caller_ext->pbx_addr, rtp->port, NULL);
+            free(new_sdp);
+        }
+        sdp_free(sdp);
     }
 
     /* Send invite to backbone with tags */
@@ -516,10 +552,17 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
             pos += snprintf(tags + pos, sizeof(tags) - pos, "dialed-number=%s",
                             dialed);
         }
+        if (codec_tags && codec_tags[0]) {
+            if (pos > 0 && pos < (int)sizeof(tags) - 1) tags[pos++] = ' ';
+            pos += snprintf(tags + pos, sizeof(tags) - pos, "%s", codec_tags);
+        }
         backbone_send_invite(ps->backbone, call->backbone_call_id, rewritten, ps->config->cid, tags);
     }
 
-    (void)0; /* call established log emitted when backbone answers */
+    log_info("pbx: ext %s -> backbone: did=%s (rewritten from %s), call_id=%s, cid=%s",
+             caller_ext->extension, rewritten, dialed, call->backbone_call_id, ps->config->cid);
+
+    free(codec_tags);
 }
 
 static void handle_invite(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
@@ -534,6 +577,8 @@ static void handle_invite(int fd, struct pbx_state *ps, struct sockaddr_storage 
         return;
     }
 
+    log_info("pbx: INVITE from ext %s dialing %s", caller_ext->extension, dialed);
+
     /* Check if dialed number matches a registered extension */
     struct gw_ext *callee_ext = NULL;
     for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
@@ -544,8 +589,10 @@ static void handle_invite(int fd, struct pbx_state *ps, struct sockaddr_storage 
     }
 
     if (callee_ext && callee_ext != caller_ext) {
+        log_info("pbx: routing ext %s -> ext %s (ext-to-ext)", caller_ext->extension, dialed);
         ext_to_ext(fd, ps, src, caller_ext, callee_ext, msg);
     } else {
+        log_info("pbx: routing ext %s -> backbone for %s", caller_ext->extension, dialed);
         ext_to_backbone(ps, src, caller_ext, dialed, msg);
     }
 
@@ -556,6 +603,8 @@ static void handle_invite(int fd, struct pbx_state *ps, struct sockaddr_storage 
 
 static void handle_bye(int fd, struct pbx_state *ps, struct sockaddr_storage *src,
                        struct sip_msg *msg) {
+    log_info("pbx: handle_bye call_id=%s", msg->call_id ? msg->call_id : "?");
+
     struct pbx_call *call = pbx_find_by_sip_id(ps, msg->call_id);
     if (!call) {
         /* Could be a branch SIP call-id */
@@ -566,7 +615,10 @@ static void handle_bye(int fd, struct pbx_state *ps, struct sockaddr_storage *sr
     send_sip(fd, src, ok, (int)strlen(ok));
     free(ok);
 
-    if (!call) return;
+    if (!call) {
+        log_warn("pbx: BYE for unknown call %s", msg->call_id ? msg->call_id : "?");
+        return;
+    }
 
     /* Log call ended with duration */
     if (call->started_at > 0) {
@@ -577,6 +629,7 @@ static void handle_bye(int fd, struct pbx_state *ps, struct sockaddr_storage *sr
     }
 
     if (call->is_backbone_call) {
+        log_info("pbx: forwarding BYE to backbone for %s", call->backbone_call_id);
         backbone_send_bye(ps->backbone, call->backbone_call_id);
     } else {
         /* ext-to-ext: forward BYE to the other party */
@@ -883,7 +936,7 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
     if (code == 180) {
         /* First ringing → send ringing to backbone */
         if (call->state < CALL_RINGING && ps->backbone) {
-            backbone_send_ringing(ps->backbone, call->backbone_call_id);
+            backbone_send_ringing(ps->backbone, call->backbone_call_id, "");
             call->state = CALL_RINGING;
         }
     } else if (code == 200) {
@@ -911,7 +964,7 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
         call->state = CALL_ACTIVE;
 
         /* Send answer to backbone */
-        backbone_send_answer(ps->backbone, call->backbone_call_id);
+        backbone_send_answer(ps->backbone, call->backbone_call_id, "");
 
         /* Set up RTP for this branch */
         if (branch->rtp) {
@@ -961,7 +1014,7 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
             }
         }
 
-        log_info("pbx: call backbone -> %s established",
+        log_info("pbx: call backbone -> %s to ext %s established",
                  call->backbone_call_id, branch->ext->extension);
     } else if (code == 486) {
         /* Busy — queue for retry */
@@ -976,79 +1029,98 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
 
 /* ── Backbone INVITE handler ─────────────────────────────────── */
 
-void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id) {
+void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id, const char *codec_tags) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
 
     struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
     if (!caller_ext) return;
 
+    /* Build SDP body from codec tags (or empty) */
+    char *sdp_body = NULL;
+    int sdp_len = 0;
+    if (codec_tags && codec_tags[0]) {
+        struct codec_tag tags[MAX_CODEC_TAGS];
+        int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
+        if (tag_count > 0 && call->rtp_caller) {
+            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, tags, tag_count);
+            if (sdp_body) sdp_len = (int)strlen(sdp_body);
+        }
+    }
+
     /* Send 180 Ringing to the extension */
-    char ringing[1024];
+    char ringing[4096];
     int rlen = snprintf(ringing, sizeof(ringing),
         "SIP/2.0 180 Ringing\r\n"
-        "From: <sip:gw@pbx>\r\n"
-        "To: <sip:%s@%s>\r\n"
+        "Via: %s\r\n"
+        "From: %s\r\n"
+        "To: %s\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Content-Length: 0\r\n"
-        "\r\n",
-        call->callee_did ? call->callee_did : "?",
-        "0.0.0.0",
+        "%s"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
+        call->caller_via ? call->caller_via : "SIP/2.0/UDP 0.0.0.0",
+        call->caller_from ? call->caller_from : "<sip:unknown>",
+        call->caller_to ? call->caller_to : "<sip:unknown>",
         call->sip_call_id,
-        call->cseq_num);
+        call->cseq_num,
+        sdp_body ? "Content-Type: application/sdp\r\n" : "",
+        sdp_len,
+        sdp_body ? sdp_body : "");
     send_sip(caller_ext->sip_fd, &call->caller_addr, ringing, rlen);
+    free(sdp_body);
+    log_info("pbx: sent 180 Ringing to ext %s for call %s", call->caller_ext, call->backbone_call_id);
     call->state = CALL_RINGING;
 }
 
-void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id) {
+void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id, const char *codec_tags) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call) return;
 
     struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
     if (!caller_ext) return;
 
-    /* Send 200 OK to extension with SDP pointing to our RTP port */
-    char sdp_body[512];
+    /* Build SDP body from codec tags (or empty) */
+    char *sdp_body = NULL;
     int sdp_len = 0;
-    if (caller_ext->pbx_addr && call->rtp_caller) {
-        sdp_len = snprintf(sdp_body, sizeof(sdp_body),
-            "v=0\r\n"
-            "o=- 0 0 IN IP4 %s\r\n"
-            "s=session\r\n"
-            "c=IN IP4 %s\r\n"
-            "t=0 0\r\n"
-            "m=audio %d RTP/AVP 0 8 101\r\n"
-            "a=rtpmap:0 PCMU/8000\r\n"
-            "a=rtpmap:8 PCMA/8000\r\n"
-            "a=rtpmap:101 telephone-event/8000\r\n",
-            caller_ext->pbx_addr, caller_ext->pbx_addr, call->rtp_caller->port);
+    if (codec_tags && codec_tags[0]) {
+        struct codec_tag tags[MAX_CODEC_TAGS];
+        int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
+        if (tag_count > 0 && call->rtp_caller) {
+            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, tags, tag_count);
+            if (sdp_body) sdp_len = (int)strlen(sdp_body);
+        }
     }
 
-    char ok[2048];
+    char ok[4096];
     int olen = snprintf(ok, sizeof(ok),
         "SIP/2.0 200 OK\r\n"
-        "From: <sip:gw@pbx>\r\n"
-        "To: <sip:%s@%s>\r\n"
+        "Via: %s\r\n"
+        "From: %s\r\n"
+        "To: %s\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
         "Contact: <sip:gw@%s>\r\n"
-        "Content-Type: application/sdp\r\n"
+        "%s"
         "Content-Length: %d\r\n"
-        "\r\n",
-        call->callee_did ? call->callee_did : "?",
-        "0.0.0.0",
+        "\r\n"
+        "%s",
+        call->caller_via ? call->caller_via : "SIP/2.0/UDP 0.0.0.0",
+        call->caller_from ? call->caller_from : "<sip:unknown>",
+        call->caller_to ? call->caller_to : "<sip:unknown>",
         call->sip_call_id,
         call->cseq_num,
         caller_ext && caller_ext->pbx_addr ? caller_ext->pbx_addr : "0.0.0.0",
-        sdp_len);
+        sdp_body ? "Content-Type: application/sdp\r\n" : "",
+        sdp_len,
+        sdp_body ? sdp_body : "");
 
-    if (olen > 0 && sdp_len > 0 && olen + sdp_len < (int)sizeof(ok)) {
-        memcpy(ok + olen, sdp_body, sdp_len);
-        olen += sdp_len;
-    }
+    free(sdp_body);
 
     send_sip(caller_ext->sip_fd, &call->caller_addr, ok, olen);
+    log_info("pbx: sent 200 OK to ext %s for call %s", call->caller_ext, call->backbone_call_id);
     call->state = CALL_ACTIVE;
 }
 
@@ -1061,7 +1133,7 @@ void pbx_on_backbone_cancel(struct pbx_state *s, const char *call_id) {
 }
 
 void pbx_on_backbone_media(struct pbx_state *s, const char *call_id,
-                           const uint8_t *data, size_t len) {
+                           int stream_id, const uint8_t *data, size_t len) {
     struct pbx_call *call = pbx_find_by_backbone_id(s, call_id);
     if (!call || call->state != CALL_ACTIVE) return;
     if (!call->rtp_caller) return;
@@ -1219,7 +1291,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         call->branches = branch;
 
         if (!ringing_sent) {
-            backbone_send_ringing(ps->backbone, call_id);
+            backbone_send_ringing(ps->backbone, call_id, "");
             ringing_sent = 1;
         }
     }
@@ -1317,15 +1389,10 @@ int busy_retry_task(int64_t ts, struct pt_task *pt) {
 int cleanup_task(int64_t ts, struct pt_task *pt) {
     (void)ts;
     struct pbx_state *ps = pt->udata;
-    time_t now = time(NULL);
 
-    for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
-        if (e->registered && e->expires > 0 && e->expires < now) {
-            e->registered = 0;
-            memset(&e->remote_addr, 0, sizeof(e->remote_addr));
-            log_info("pbx: extension %s registration expired", e->extension);
-        }
-    }
+    /* Check one random registration on disk for expiry */
+    if (ps->config->data_dir)
+        registration_cleanup_once(ps->config->data_dir);
 
     return SCHED_RUNNING;
 }
@@ -1351,6 +1418,12 @@ int sip_recv_task(int64_t ts, struct pt_task *pt) {
     struct sip_msg *msg = sip_parse_request(buf, (int)n);
     if (!msg) return SCHED_RUNNING;
 
+    if (msg->status_code == 0 && msg->method_str) {
+        char *src_str = addr_to_str(&src);
+        log_info("pbx: received %s from %s", msg->method_str, src_str);
+        free(src_str);
+    }
+
     if (msg->status_code > 0) {
         handle_sip_response(ready_fd, ps, &src, msg);
     } else {
@@ -1363,26 +1436,40 @@ int sip_recv_task(int64_t ts, struct pt_task *pt) {
             break;
         default: {
             /* All other methods require a registered sender.
-             * Look up by claimed From user, then verify source IP matches
-             * registration. If IP matches, update remote_addr to track
-             * port changes (phones may use different ephemeral ports). */
-            char *claimed = sip_extract_uri_user(msg->from);
-            struct gw_ext *caller_ext = claimed ? gw_config_find_ext(ps->config, claimed) : NULL;
-            if (!caller_ext || !caller_ext->registered) {
+             * Look up registration by source address on disk. */
+            char *found_ext = registration_find_by_addr(ps->config->data_dir, &src);
+            if (!found_ext) {
+                log_warn("pbx: SIP %s from unregistered source, sending 403", msg->method_str ? msg->method_str : "?");
                 char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL, 0);
                 send_sip(ready_fd, &src, resp, (int)strlen(resp));
                 free(resp);
-                free(claimed);
                 break;
             }
-            if (!addrs_same_ip(&caller_ext->remote_addr, &src)) {
+            /* Verify the claimed From user matches the registered extension */
+            char *claimed = sip_extract_uri_user(msg->from);
+            if (!claimed || strcmp(claimed, found_ext) != 0) {
+                log_warn("pbx: SIP %s from %s but claims %s, sending 403",
+                         msg->method_str ? msg->method_str : "?", found_ext, claimed ? claimed : "?");
                 char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL, 0);
                 send_sip(ready_fd, &src, resp, (int)strlen(resp));
                 free(resp);
                 free(claimed);
+                free(found_ext);
                 break;
             }
             free(claimed);
+
+            struct gw_ext *caller_ext = gw_config_find_ext(ps->config, found_ext);
+            free(found_ext);
+            if (!caller_ext) {
+                char *resp = sip_build_response(403, "Forbidden", msg, NULL, NULL, 0);
+                send_sip(ready_fd, &src, resp, (int)strlen(resp));
+                free(resp);
+                break;
+            }
+            /* Update in-memory remote_addr for port tracking */
+            caller_ext->remote_addr = src;
+            caller_ext->sip_fd = ready_fd;
 
             switch (msg->method) {
             case SIP_METHOD_INVITE:

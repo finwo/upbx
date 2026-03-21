@@ -39,6 +39,9 @@ static int config_handler(void *user, const char *section, const char *name, con
             }
         } else if (strcmp(name, "cid") == 0) {
             cfg->cid = strdup(value);
+        } else if (strcmp(name, "data_dir") == 0) {
+            free(cfg->data_dir);
+            cfg->data_dir = strdup(value);
         } else if (is_numbered(name, "did")) {
             struct gw_did *d = calloc(1, sizeof(struct gw_did));
             d->did = strdup(value);
@@ -115,6 +118,7 @@ struct gw_config *gw_config_load(const char *path) {
     cfg->sip_port = 5060;
     cfg->rtp_min = 10000;
     cfg->rtp_max = 20000;
+    cfg->data_dir = strdup(GW_DEFAULT_DATA_DIR);
 
     /* Reset static rewrite arrays */
     memset(rewrite_desc, 0, sizeof(rewrite_desc));
@@ -205,6 +209,7 @@ void gw_config_free(struct gw_config *cfg) {
     }
 
     free(cfg->cid);
+    free(cfg->data_dir);
     free(cfg);
 }
 

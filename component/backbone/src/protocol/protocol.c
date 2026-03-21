@@ -2,8 +2,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include "finwo/socket-util.h"
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <errno.h>
 #include <time.h>
@@ -122,7 +124,15 @@ static int conn_recv_line(struct conn *c, char *out, size_t out_size) {
     if (c->fd < 0) return -1;
     char buf[1024];
     ssize_t n = recv(c->fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return -1;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        /* No data available right now — check if we have a buffered line */
+        if (c->recv_len > 0) {
+            char *newline = strchr(c->recv_buf, '\n');
+            if (newline) goto drain_line;
+        }
+        return 1; /* no data, no complete line */
+    }
+    if (n <= 0) return -1; /* real error or connection closed */
 
     if (c->recv_len + (size_t)n + 1 > c->recv_cap) {
         c->recv_cap = (c->recv_len + (size_t)n + 4096) * 2;
@@ -132,6 +142,7 @@ static int conn_recv_line(struct conn *c, char *out, size_t out_size) {
     c->recv_len += (size_t)n;
     c->recv_buf[c->recv_len] = '\0';
 
+drain_line:;
     char *newline = strchr(c->recv_buf, '\n');
     if (!newline) return 1;
 
@@ -187,6 +198,20 @@ static void conn_authenticate(struct conn *c, char *args) {
     if (verified == 0) {
         c->authenticated = 1;
         c->username = username[0] ? strdup(username) : NULL;
+
+        /* Close any existing connections with the same username */
+        if (c->username) {
+            struct conn *cur = c->proto->conns;
+            while (cur) {
+                struct conn *next = cur->next;
+                if (cur != c && cur->username && strcmp(cur->username, c->username) == 0) {
+                    log_info("protocol: replacing stale connection fd=%d for %s", cur->fd, cur->username);
+                    conn_free(cur);
+                }
+                cur = next;
+            }
+        }
+
         conn_send(c->fd, "ok\n", 3);
         log_info("protocol: authenticated %s", c->username ? c->username : "(peer)");
     } else {
@@ -282,21 +307,30 @@ static void handle_invite(struct conn *c, char *line) {
 
     mindex_set(c->proto->calls, call);
 
-    /* Forward to all other authenticated connections (clients + peers) */
+    /* Count and forward to all other authenticated connections (clients + peers) */
+    int peers_forwarded = 0;
     for (struct conn *pc = c->proto->conns; pc; pc = pc->next) {
         if (pc != c && pc->authenticated) {
             conn_sendf(pc->fd, "%s\n", line);
+            peers_forwarded++;
         }
     }
+    log_info("protocol: invite call_id=%s did=%s cid=%s (forwarded to %d peer%s)",
+             call_id, did, cid, peers_forwarded, peers_forwarded == 1 ? "" : "s");
 }
 
 static void handle_ringing(struct conn *c, char *line) {
     char call_id[256] = {0};
     if (sscanf(line, "ringing %255s", call_id) < 1) return;
 
+    log_info("protocol: ringing call_id=%s from fd=%d", call_id, c->fd);
+
     struct call_key key = {call_id, strlen(call_id)};
     struct upbx_call *call = mindex_get(c->proto->calls, &key);
-    if (!call) return;
+    if (!call) {
+        log_warn("protocol: ringing for unknown call %s", call_id);
+        return;
+    }
 
     /* Collapse on first ringing: select callee, cancel all others */
     if (call->state < UPBX_CALL_RINGING && call->caller_fd >= 0 && call->caller_fd != c->fd) {
@@ -317,14 +351,20 @@ static void handle_answer(struct conn *c, char *line) {
     char call_id[256] = {0};
     if (sscanf(line, "answer %255s", call_id) < 1) return;
 
+    log_info("protocol: answer call_id=%s from fd=%d", call_id, c->fd);
+
     struct call_key key = {call_id, strlen(call_id)};
     struct upbx_call *call = mindex_get(c->proto->calls, &key);
 
     /* Unknown call: drop */
-    if (!call) return;
+    if (!call) {
+        log_warn("protocol: answer for unknown call %s", call_id);
+        return;
+    }
 
     /* Already active: double-pickup race -- send bye back to late answerer */
     if (call->state == UPBX_CALL_ACTIVE) {
+        log_info("protocol: answer for already-active call %s, sending bye", call_id);
         conn_sendf(c->fd, "bye %s\n", call_id);
         return;
     }
@@ -336,6 +376,9 @@ static void handle_answer(struct conn *c, char *line) {
     /* Send answer to caller */
     if (call->caller_fd >= 0) {
         conn_sendf(call->caller_fd, "answer %s\n", call_id);
+        log_info("protocol: answer forwarded to caller fd=%d for call %s", call->caller_fd, call_id);
+    } else {
+        log_warn("protocol: answer for call %s but caller_fd is invalid", call_id);
     }
 }
 
@@ -418,18 +461,32 @@ static void handle_bye(struct conn *c, char *line) {
     char call_id[256] = {0};
     if (sscanf(line, "bye %255s", call_id) < 1) return;
 
+    log_info("protocol: bye call_id=%s from fd=%d", call_id, c->fd);
+
     struct call_key key = {call_id, strlen(call_id)};
     struct upbx_call *call = mindex_get(c->proto->calls, &key);
 
     /* Unknown call: drop */
-    if (!call) return;
+    if (!call) {
+        log_warn("protocol: bye for unknown call %s", call_id);
+        return;
+    }
 
     int other_fd = -1;
     if (call->caller_fd == c->fd) other_fd = call->callee_fd;
     else if (call->callee_fd == c->fd) other_fd = call->caller_fd;
-    else return;
+    else {
+        log_warn("protocol: bye from fd=%d but caller_fd=%d callee_fd=%d for %s",
+                 c->fd, call->caller_fd, call->callee_fd, call_id);
+        return;
+    }
 
-    if (other_fd >= 0) conn_sendf(other_fd, "bye %s\n", call_id);
+    if (other_fd >= 0) {
+        conn_sendf(other_fd, "bye %s\n", call_id);
+        log_info("protocol: bye forwarded to fd=%d for call %s", other_fd, call_id);
+    } else {
+        log_warn("protocol: bye for %s but other_fd is -1", call_id);
+    }
     call->state = UPBX_CALL_ENDED;
     mindex_delete(c->proto->calls, &key);
 }
@@ -440,11 +497,15 @@ static int conn_task(int64_t ts, struct pt_task *pt) {
     (void)ts;
     struct conn *c = pt->udata;
 
-    if (c->fd < 0) return SCHED_DONE;
+    if (c->fd < 0) {
+        conn_free(c);
+        return SCHED_DONE;
+    }
 
     time_t age = time(NULL) - c->connected_at;
     if (!c->authenticated && age > AUTH_TIMEOUT_SEC) {
-        conn_close(c);
+        log_debug("protocol: auth timeout fd=%d, closing", c->fd);
+        conn_free(c);
         return SCHED_DONE;
     }
 
@@ -453,7 +514,11 @@ static int conn_task(int64_t ts, struct pt_task *pt) {
 
     char line[MAX_LINE];
     int ret = conn_recv_line(c, line, sizeof(line));
-    if (ret < 0) return SCHED_DONE;
+    if (ret < 0) {
+        log_info("protocol: connection closed fd=%d user=%s", c->fd, c->username ? c->username : "?");
+        conn_free(c);
+        return SCHED_DONE;
+    }
     if (ret > 0) return SCHED_RUNNING;
 
     char *p = line;
@@ -506,6 +571,9 @@ static int listener_task(int64_t ts, struct pt_task *pt) {
     socklen_t sslen = sizeof(ss);
     int fd = accept(ready, (struct sockaddr *)&ss, &sslen);
     if (fd < 0) return SCHED_RUNNING;
+    set_socket_nonblocking(fd, 1);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     struct conn *c = calloc(1, sizeof(struct conn));
     c->fd = fd;
@@ -548,7 +616,11 @@ static int peer_connect_tcp(const char *host, const char *port) {
     for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            break;
+        }
         close(fd);
         fd = -1;
     }
