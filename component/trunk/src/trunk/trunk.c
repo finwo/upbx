@@ -80,14 +80,13 @@ static void send_sip(int fd, struct sockaddr_storage *dst,
                      const char *data, int len) {
     char ip[INET6_ADDRSTRLEN];
     sockaddr_to_str(dst, ip, sizeof(ip));
-    log_info("trunk: >>> SIP to %s:%d fd=%d (%d bytes)\n%.*s",
-             ip, sockaddr_port(dst), fd, len, len, data);
     ssize_t sent = sendto(fd, data, (size_t)len, 0,
                           (struct sockaddr *)dst, get_addrlen(dst));
     if (sent < 0) {
         log_error("trunk: sendto failed: %s (errno=%d)", strerror(errno), errno);
     } else {
-        log_debug("trunk: sendto sent %zd bytes", sent);
+        log_info("trunk: >>> SIP to %s:%d fd=%d (%zd/%d bytes)\n%.*s",
+                 ip, sockaddr_port(dst), fd, sent, len, len, data);
     }
 }
 
@@ -275,9 +274,9 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
         sdp_body = malloc(512);
         sdp_len = snprintf(sdp_body, 512,
             "v=0\r\n"
-            "o=- 0 0 %s %s\r\n"
+            "o=- 0 0 IN %s %s\r\n"
             "s=session\r\n"
-            "c=%s %s\r\n"
+            "c=IN %s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
@@ -294,6 +293,7 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE %s SIP/2.0\r\n"
         "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+        "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
@@ -306,7 +306,7 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
         "\r\n",
         uri,
         ts->listen_addr, call->branch,
-        call->trunk_cid ? call->trunk_cid : user, host, call->from_tag,
+        call->trunk_cid ? call->trunk_cid : user, ts->listen_addr, call->from_tag,
         call->trunk_did ? call->trunk_did : "?", host,
         call->sip_call_id,
         call->cseq_num,
@@ -352,9 +352,9 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
         sdp_body = malloc(512);
         sdp_len = snprintf(sdp_body, 512,
             "v=0\r\n"
-            "o=- 0 0 %s %s\r\n"
+            "o=- 0 0 IN %s %s\r\n"
             "s=session\r\n"
-            "c=%s %s\r\n"
+            "c=IN %s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
@@ -368,6 +368,7 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE sip:%s@%s SIP/2.0\r\n"
         "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+        "Max-Forwards: 70\r\n"
         "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
@@ -381,7 +382,7 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
         target->host,
         ts->listen_addr, call->branch,
         call->trunk_cid ? call->trunk_cid : (target->username ? target->username : "trunk"),
-        target->host, call->from_tag,
+        ts->listen_addr, call->from_tag,
         call->trunk_did ? call->trunk_did : "?",
         target->host,
         call->sip_call_id,
@@ -629,6 +630,7 @@ static void handle_sip_response(int fd, struct trunk_state *ts, struct sockaddr_
             int alen = snprintf(ack, sizeof(ack),
                 "ACK sip:%s@%s SIP/2.0\r\n"
                 "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+                "Max-Forwards: 70\r\n"
                 "From: <sip:%s@%s>;tag=%s\r\n"
                 "To: %s\r\n"
                 "Call-ID: %s\r\n"
@@ -636,9 +638,11 @@ static void handle_sip_response(int fd, struct trunk_state *ts, struct sockaddr_
                 "Contact: <sip:%s@%s>\r\n"
                 "Content-Length: 0\r\n"
                 "\r\n",
-                call->trunk_did ? call->trunk_did : "?", host,
+                call->trunk_did ? call->trunk_did : "?",
+                host,
                 ts->listen_addr, call->branch,
-                call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"), host, call->from_tag,
+                call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"),
+                ts->listen_addr, call->from_tag,
                 msg->to ? msg->to : "",
                 call->sip_call_id,
                 call->cseq_num,
@@ -699,7 +703,7 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
     if (n <= 0) return SCHED_RUNNING;
 
     buf[n] = '\0';
-    log_debug("sip: <<< %.*s", (int)n, buf);
+    log_info("sip: <<< %.*s", (int)n, buf);
 
     struct sip_msg *msg = sip_parse_request(buf, (int)n);
     if (!msg) return SCHED_RUNNING;
@@ -810,9 +814,9 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
         const char *af = sdp_addr_family(s->listen_addr);
         sdp_len = snprintf(sdp_body, sizeof(sdp_body),
             "v=0\r\n"
-            "o=- 0 0 %s %s\r\n"
+            "o=- 0 0 IN %s %s\r\n"
             "s=session\r\n"
-            "c=%s %s\r\n"
+            "c=IN %s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
@@ -867,12 +871,12 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
     if (call->direction == CALL_OUTGOING) {
         /* Send CANCEL to trunk */
         if (call->trunk_fd >= 0) {
-            struct trk_backbone *target = s->config->target;
-            const char *host = target ? target->host : "0.0.0.0";
+            const char *host = s->config->target ? s->config->target->host : "0.0.0.0";
             char cancel[512];
             int clen = snprintf(cancel, sizeof(cancel),
                 "CANCEL sip:%s@%s SIP/2.0\r\n"
                 "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+                "Max-Forwards: 70\r\n"
                 "From: <sip:%s@%s>;tag=%s\r\n"
                 "To: <sip:%s@%s>\r\n"
                 "Call-ID: %s\r\n"
@@ -882,8 +886,9 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
                 call->trunk_did ? call->trunk_did : "?",
                 host,
                 s->listen_addr, call->branch,
-                call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"),
-                host, call->from_tag,
+                call->trunk_cid ? call->trunk_cid : (s->config->target && s->config->target->username ? s->config->target->username : "trunk"),
+                s->listen_addr,
+                call->from_tag,
                 call->trunk_did ? call->trunk_did : "?",
                 host,
                 call->sip_call_id);
@@ -938,26 +943,27 @@ void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id) {
     struct trunk_call *call = trunk_find_by_backbone_id(s, call_id);
     if (!call) return;
 
-    /* Send BYE to trunk */
-    if (call->trunk_fd >= 0) {
-        struct trk_backbone *target = s->config->target;
-        const char *host = target ? target->host : "0.0.0.0";
-        char bye[1024];
-        int blen = snprintf(bye, sizeof(bye),
-            "BYE sip:%s@%s SIP/2.0\r\n"
-            "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
-            "From: <sip:%s@%s>;tag=%s\r\n"
-            "To: %s\r\n"
-            "Call-ID: %s\r\n"
-            "CSeq: %d BYE\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n",
-            call->trunk_did ? call->trunk_did : "?", host,
-            s->listen_addr, call->branch,
-            call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"), host, call->from_tag,
-            call->trunk_to ? call->trunk_to : "",
-            call->sip_call_id,
-            call->cseq_num + 1);
+     /* Send BYE to trunk */
+     if (call->trunk_fd >= 0) {
+         const char *host = s->config->target ? s->config->target->host : "0.0.0.0";
+         char bye[1024];
+         int blen = snprintf(bye, sizeof(bye),
+             "BYE sip:%s@%s SIP/2.0\r\n"
+             "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
+             "Max-Forwards: 70\r\n"
+             "From: <sip:%s@%s>;tag=%s\r\n"
+             "To: %s\r\n"
+             "Call-ID: %s\r\n"
+             "CSeq: %d BYE\r\n"
+             "Content-Length: 0\r\n"
+             "\r\n",
+             call->trunk_did ? call->trunk_did : "?",
+             host,
+             s->listen_addr, call->branch,
+             call->trunk_cid ? call->trunk_cid : (s->config->target && s->config->target->username ? s->config->target->username : "trunk"), s->listen_addr, call->from_tag,
+             call->trunk_to ? call->trunk_to : "",
+             call->sip_call_id,
+             call->cseq_num + 1);
         send_sip(call->trunk_fd, &call->trunk_addr, bye, blen);
         log_info("trunk: sent BYE to upstream for %s", call->backbone_call_id);
     }

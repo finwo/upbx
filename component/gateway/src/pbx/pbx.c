@@ -1280,9 +1280,9 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
             const char *af = sdp_addr_family(e->pbx_addr);
             sdp_len = snprintf(sdp_body, sizeof(sdp_body),
                 "v=0\r\n"
-                "o=- 0 0 %s %s\r\n"
+                "o=- 0 0 IN %s %s\r\n"
                 "s=session\r\n"
-                "c=%s %s\r\n"
+                "c=IN %s %s\r\n"
                 "t=0 0\r\n"
                 "m=audio %d RTP/AVP 0 8 101\r\n"
                 "a=rtpmap:0 PCMU/8000\r\n"
@@ -1368,9 +1368,9 @@ int busy_retry_task(int64_t ts, struct pt_task *pt) {
                     const char *af = sdp_addr_family(b->ext->pbx_addr);
                     sdp_len = snprintf(sdp_body, sizeof(sdp_body),
                         "v=0\r\n"
-                        "o=- 0 0 %s %s\r\n"
+                        "o=- 0 0 IN %s %s\r\n"
                         "s=session\r\n"
-                        "c=%s %s\r\n"
+                        "c=IN %s %s\r\n"
                         "t=0 0\r\n"
                         "m=audio %d RTP/AVP 0 8 101\r\n"
                         "a=rtpmap:0 PCMU/8000\r\n"

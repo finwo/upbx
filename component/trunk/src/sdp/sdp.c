@@ -224,9 +224,9 @@ char *sdp_build_from_codecs(int rtp_port, const char *listen_ip,
     const char *type = tag_count > 0 ? tags[0].media_type : "audio";
     snprintf(sdp, 1024 + sizeof(rtpmaps),
         "v=0\r\n"
-        "o=- 0 0 %s %s\r\n"
+        "o=- 0 0 IN %s %s\r\n"
         "s=session\r\n"
-        "c=%s %s\r\n"
+        "c=IN %s %s\r\n"
         "t=0 0\r\n"
         "m=%s %d RTP/AVP %s\r\n"
         "%s",
