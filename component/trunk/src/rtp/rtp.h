@@ -31,7 +31,7 @@ struct rtp_alloc_ctx {
 };
 
 void rtp_ctx_init(struct rtp_alloc_ctx *ctx, int min, int max);
-struct rtp_pair *rtp_alloc(struct rtp_alloc_ctx *ctx);
+struct rtp_pair *rtp_alloc(struct rtp_alloc_ctx *ctx, int af);
 void rtp_free(struct rtp_pair *rp);
 
 void rtp_send_to_ext(struct rtp_pair *rp, const uint8_t *data, size_t len);

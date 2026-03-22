@@ -60,10 +60,21 @@ static char *addr_to_str(struct sockaddr_storage *ss) {
     return buf;
 }
 
+static socklen_t get_addrlen(const struct sockaddr_storage *addr) {
+    if (addr->ss_family == AF_INET) return sizeof(struct sockaddr_in);
+    return sizeof(struct sockaddr_in6);
+}
+
+static const char *sdp_addr_family(const char *ip) {
+    if (!ip) return "IP4";
+    if (strchr(ip, ':')) return "IP6";
+    return "IP4";
+}
+
 static void send_sip(int fd, struct sockaddr_storage *dst,
                      const char *data, int len) {
     sendto(fd, data, (size_t)len, 0,
-           (struct sockaddr *)dst, sizeof(*dst));
+           (struct sockaddr *)dst, get_addrlen(dst));
 }
 
 /* ── extension lookup by source ──────────────────────────────── */
@@ -1043,8 +1054,18 @@ void pbx_on_backbone_ringing(struct pbx_state *s, const char *call_id, const cha
         struct codec_tag tags[MAX_CODEC_TAGS];
         int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
         if (tag_count > 0 && call->rtp_caller) {
-            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, tags, tag_count);
-            if (sdp_body) sdp_len = (int)strlen(sdp_body);
+            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, "IP4", tags, tag_count);
+            if (sdp_body) {
+                /* Replace 0.0.0.0 with the address the extension registered to */
+                if (caller_ext->pbx_addr) {
+                    char *rewritten = sdp_rewrite(sdp_body, (int)strlen(sdp_body),
+                                                  caller_ext->pbx_addr, call->rtp_caller->port, &sdp_len);
+                    free(sdp_body);
+                    sdp_body = rewritten;
+                } else {
+                    sdp_len = (int)strlen(sdp_body);
+                }
+            }
         }
     }
 
@@ -1089,8 +1110,18 @@ void pbx_on_backbone_answer(struct pbx_state *s, const char *call_id, const char
         struct codec_tag tags[MAX_CODEC_TAGS];
         int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
         if (tag_count > 0 && call->rtp_caller) {
-            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, tags, tag_count);
-            if (sdp_body) sdp_len = (int)strlen(sdp_body);
+            sdp_body = sdp_build_from_codecs(call->rtp_caller->port, "IP4", tags, tag_count);
+            if (sdp_body) {
+                /* Replace 0.0.0.0 with the address the extension registered to */
+                if (caller_ext->pbx_addr) {
+                    char *rewritten = sdp_rewrite(sdp_body, (int)strlen(sdp_body),
+                                                  caller_ext->pbx_addr, call->rtp_caller->port, &sdp_len);
+                    free(sdp_body);
+                    sdp_body = rewritten;
+                } else {
+                    sdp_len = (int)strlen(sdp_body);
+                }
+            }
         }
     }
 
@@ -1246,17 +1277,18 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         char sdp_body[512];
         int sdp_len = 0;
         if (e->pbx_addr) {
+            const char *af = sdp_addr_family(e->pbx_addr);
             sdp_len = snprintf(sdp_body, sizeof(sdp_body),
                 "v=0\r\n"
-                "o=- 0 0 IN IP4 %s\r\n"
+                "o=- 0 0 %s %s\r\n"
                 "s=session\r\n"
-                "c=IN IP4 %s\r\n"
+                "c=%s %s\r\n"
                 "t=0 0\r\n"
                 "m=audio %d RTP/AVP 0 8 101\r\n"
                 "a=rtpmap:0 PCMU/8000\r\n"
                 "a=rtpmap:8 PCMA/8000\r\n"
                 "a=rtpmap:101 telephone-event/8000\r\n",
-                e->pbx_addr, e->pbx_addr, branch->rtp->port);
+                af, e->pbx_addr, af, e->pbx_addr, branch->rtp->port);
         }
 
         /* Send INVITE to extension */
@@ -1333,17 +1365,18 @@ int busy_retry_task(int64_t ts, struct pt_task *pt) {
                 char sdp_body[512];
                 int sdp_len = 0;
                 if (b->ext->pbx_addr && b->rtp) {
+                    const char *af = sdp_addr_family(b->ext->pbx_addr);
                     sdp_len = snprintf(sdp_body, sizeof(sdp_body),
                         "v=0\r\n"
-                        "o=- 0 0 IN IP4 %s\r\n"
+                        "o=- 0 0 %s %s\r\n"
                         "s=session\r\n"
-                        "c=IN IP4 %s\r\n"
+                        "c=%s %s\r\n"
                         "t=0 0\r\n"
                         "m=audio %d RTP/AVP 0 8 101\r\n"
                         "a=rtpmap:0 PCMU/8000\r\n"
                         "a=rtpmap:8 PCMA/8000\r\n"
                         "a=rtpmap:101 telephone-event/8000\r\n",
-                        b->ext->pbx_addr, b->ext->pbx_addr, b->rtp->port);
+                        af, b->ext->pbx_addr, af, b->ext->pbx_addr, b->rtp->port);
                 }
 
                 char invite[2048];

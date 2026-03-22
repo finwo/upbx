@@ -9,7 +9,9 @@
 struct backbone_state; // forward
 
 struct rtp_pair {
-    int fd;
+    int fd;                            /* primary (IPv4 if available) */
+    int fd6;                           /* IPv6 socket, -1 if not bound */
+    int fds[3];                        /* {count, fd1, fd2} for sched_has_data */
     int port;
     struct sockaddr_storage ext_addr;
     int learned_ext;

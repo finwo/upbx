@@ -162,6 +162,9 @@ static int config_handler(void *user, const char *section, const char *name, con
             }
         } else if (strcmp(name, "delay") == 0) {
             cfg->delay_ms = atoi(value);
+        } else if (strcmp(name, "listen_address") == 0) {
+            free(cfg->listen_address);
+            cfg->listen_address = strdup(value);
         } else if (strcmp(name, "target") == 0) {
             if (cfg->target) {
                 free(cfg->target->url); free(cfg->target->scheme); free(cfg->target->host);
@@ -232,5 +235,6 @@ void trk_config_free(struct trk_config *cfg) {
         f = next;
     }
 
+    free(cfg->listen_address);
     free(cfg);
 }

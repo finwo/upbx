@@ -44,15 +44,46 @@ static void generate_hex_id(char *out, size_t len) {
     out[need * 2] = '\0';
 }
 
+static socklen_t get_addrlen(const struct sockaddr_storage *addr) {
+    if (addr->ss_family == AF_INET) return sizeof(struct sockaddr_in);
+    return sizeof(struct sockaddr_in6);
+}
+
+static const char *sdp_addr_family(const char *ip) {
+    if (!ip) return "IP4";
+    if (strchr(ip, ':')) return "IP6";
+    return "IP4";
+}
+
+static void sockaddr_to_str(const struct sockaddr_storage *addr,
+                            char *buf, size_t buflen) {
+    if (addr->ss_family == AF_INET) {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)addr)->sin_addr,
+                  buf, (socklen_t)buflen);
+    } else if (addr->ss_family == AF_INET6) {
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)addr)->sin6_addr,
+                  buf, (socklen_t)buflen);
+    } else {
+        snprintf(buf, buflen, "?");
+    }
+}
+
+static int sockaddr_port(const struct sockaddr_storage *addr) {
+    if (addr->ss_family == AF_INET)
+        return ntohs(((struct sockaddr_in *)addr)->sin_port);
+    if (addr->ss_family == AF_INET6)
+        return ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+    return 0;
+}
+
 static void send_sip(int fd, struct sockaddr_storage *dst,
                      const char *data, int len) {
-    struct sockaddr_in *a = (struct sockaddr_in *)dst;
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+    char ip[INET6_ADDRSTRLEN];
+    sockaddr_to_str(dst, ip, sizeof(ip));
     log_info("trunk: >>> SIP to %s:%d fd=%d (%d bytes)\n%.*s",
-             ip, ntohs(a->sin_port), fd, len, len, data);
+             ip, sockaddr_port(dst), fd, len, len, data);
     ssize_t sent = sendto(fd, data, (size_t)len, 0,
-                          (struct sockaddr *)dst, sizeof(struct sockaddr_in));
+                          (struct sockaddr *)dst, get_addrlen(dst));
     if (sent < 0) {
         log_error("trunk: sendto failed: %s (errno=%d)", strerror(errno), errno);
     }
@@ -229,7 +260,7 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
     memset(&dst, 0, sizeof(dst));
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     if (getaddrinfo(host, target->port, &hints, &res) != 0 || !res) {
         log_error("trunk: DNS resolution failed for %s:%s", host, target->port);
@@ -245,22 +276,26 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
         struct codec_tag tags[MAX_CODEC_TAGS];
         int tag_count = codec_tags_from_string(call->backbone_tags, tags, MAX_CODEC_TAGS);
         if (tag_count > 0) {
-            sdp_body = sdp_build_from_codecs(call->rtp->port, tags, tag_count);
+            sdp_body = sdp_build_from_codecs(call->rtp->port, ts->listen_addr,
+                                              sdp_addr_family(ts->listen_addr),
+                                              tags, tag_count);
             if (sdp_body) sdp_len = (int)strlen(sdp_body);
         }
     }
     if (!sdp_body && call->rtp) {
+        const char *af = sdp_addr_family(ts->listen_addr);
         sdp_body = malloc(512);
         sdp_len = snprintf(sdp_body, 512,
             "v=0\r\n"
-            "o=- 0 0 IN IP4 0.0.0.0\r\n"
+            "o=- 0 0 %s %s\r\n"
             "s=session\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
+            "c=%s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n",
+            af, ts->listen_addr, af, ts->listen_addr,
             call->rtp->port);
     }
 
@@ -270,23 +305,24 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
     char invite[4096];
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE %s SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP 0.0.0.0;branch=z9hG4bKtrk%s\r\n"
+        "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrk%s\r\n"
         "From: <sip:%s@%s>;tag=trk%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Contact: <sip:trk@0.0.0.0>\r\n"
+        "Contact: <sip:trk@%s>\r\n"
         "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "%s"
         "%s"
         "Content-Length: %d\r\n"
         "\r\n",
         uri,
-        call->sip_call_id,
+        ts->listen_addr, call->sip_call_id,
         call->trunk_cid ? call->trunk_cid : user, host, call->sip_call_id,
         call->trunk_did ? call->trunk_did : "?", host,
         call->sip_call_id,
         call->cseq_num,
+        ts->listen_addr,
         auth_hdr,
         sdp_body ? "Content-Type: application/sdp\r\n" : "",
         sdp_len);
@@ -313,7 +349,7 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
     memset(&dst, 0, sizeof(dst));
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     if (getaddrinfo(target->host, target->port, &hints, &res) != 0 || !res) {
         log_error("trunk: DNS resolution failed for %s:%s", target->host, target->port);
@@ -332,47 +368,52 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
         struct codec_tag tags[MAX_CODEC_TAGS];
         int tag_count = codec_tags_from_string(call->backbone_tags, tags, MAX_CODEC_TAGS);
         if (tag_count > 0) {
-            sdp_body = sdp_build_from_codecs(call->rtp->port, tags, tag_count);
+            sdp_body = sdp_build_from_codecs(call->rtp->port, ts->listen_addr,
+                                              sdp_addr_family(ts->listen_addr),
+                                              tags, tag_count);
             if (sdp_body) sdp_len = (int)strlen(sdp_body);
         }
     }
     /* Fallback if no codec tags from backbone */
     if (!sdp_body && call->rtp) {
+        const char *af = sdp_addr_family(ts->listen_addr);
         sdp_body = malloc(512);
         sdp_len = snprintf(sdp_body, 512,
             "v=0\r\n"
-            "o=- 0 0 IN IP4 0.0.0.0\r\n"
+            "o=- 0 0 %s %s\r\n"
             "s=session\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
+            "c=%s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n",
+            af, ts->listen_addr, af, ts->listen_addr,
             call->rtp->port);
     }
 
     char invite[4096];
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE sip:%s@%s SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP 0.0.0.0;branch=z9hG4bKtrk%s\r\n"
+        "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrk%s\r\n"
         "From: <sip:%s@%s>;tag=trk%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
         "CSeq: 1 INVITE\r\n"
-        "Contact: <sip:trk@0.0.0.0>\r\n"
+        "Contact: <sip:trk@%s>\r\n"
         "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "%s"
         "Content-Length: %d\r\n"
         "\r\n",
         call->trunk_did ? call->trunk_did : "?",
         target->host,
-        call->sip_call_id,
+        ts->listen_addr, call->sip_call_id,
         call->trunk_cid ? call->trunk_cid : (target->username ? target->username : "trunk"),
         target->host, call->sip_call_id,
         call->trunk_did ? call->trunk_did : "?",
         target->host,
         call->sip_call_id,
+        ts->listen_addr,
         sdp_body ? "Content-Type: application/sdp\r\n" : "",
         sdp_len);
 
@@ -441,7 +482,7 @@ static void handle_sip_invite(int fd, struct trunk_state *ts, struct sockaddr_st
     free(trying);
 
     /* Allocate RTP pair */
-    struct rtp_pair *rtp = rtp_alloc(&ts->rtp_ctx);
+    struct rtp_pair *rtp = rtp_alloc(&ts->rtp_ctx, ts->target_af);
     if (!rtp) {
         char *resp = sip_build_response(500, "Server Internal Error", msg, NULL, NULL, 0);
         send_sip(fd, src, resp, (int)strlen(resp));
@@ -611,7 +652,7 @@ static void handle_sip_response(int fd, struct trunk_state *ts, struct sockaddr_
             char ack[2048];
             int alen = snprintf(ack, sizeof(ack),
                 "ACK sip:%s@%s SIP/2.0\r\n"
-                "Via: SIP/2.0/UDP 0.0.0.0;branch=z9hG4bKack%s\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKack%s\r\n"
                 "From: <sip:%s@%s>;tag=trk%s\r\n"
                 "To: %s\r\n"
                 "Call-ID: %s\r\n"
@@ -619,7 +660,7 @@ static void handle_sip_response(int fd, struct trunk_state *ts, struct sockaddr_
                 "Content-Length: 0\r\n"
                 "\r\n",
                 call->trunk_did ? call->trunk_did : "?", host,
-                call->sip_call_id,
+                ts->listen_addr, call->sip_call_id,
                 call->trunk_cid ? call->trunk_cid : "trunk", host, call->sip_call_id,
                 msg->to ? msg->to : "",
                 call->sip_call_id,
@@ -650,6 +691,24 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
     (void)ts;
     struct trunk_state *state = pt->udata;
 
+    /* Registration lifecycle — single action per call */
+    int64_t now_ms = (int64_t)time(NULL) * 1000;
+    if (!state->reg_registered && state->reg_last_send == 0) {
+        /* First boot: send initial REGISTER */
+        trunk_send_register(state);
+    } else if (state->reg_registered) {
+        /* Re-register 15s before expiry */
+        int re_reg_ms = (state->reg_expires - 15) * 1000;
+        if (re_reg_ms < 5000) re_reg_ms = state->reg_expires * 500;
+        if (now_ms - state->reg_last_send >= (int64_t)re_reg_ms) {
+            state->reg_registered = 0;
+            trunk_send_register(state);
+        }
+    } else if (!state->reg_registered && now_ms - state->reg_last_send > 30000) {
+        /* No response in 30s, retry */
+        trunk_send_register(state);
+    }
+
     int ready_fd = sched_has_data(state->sip_fds);
     if (ready_fd < 0) return SCHED_RUNNING;
 
@@ -675,14 +734,15 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
     }
 
     if (msg->status_code > 0) {
-        /* Route REGISTER responses to register module */
         if (msg->cseq_method && strcasecmp(msg->cseq_method, "REGISTER") == 0) {
-            if (state->reg) {
-                if (msg->status_code == 401 && msg->www_authenticate) {
-                    register_on_401(state->reg, msg->www_authenticate);
-                } else if (msg->status_code == 200) {
-                    register_on_200(state->reg, msg->expires > 0 ? msg->expires : 300);
-                }
+            /* REGISTER response — handle inline */
+            if (msg->status_code == 401 && msg->www_authenticate) {
+                log_info("trunk: REGISTER got 401, authenticating");
+                trunk_send_register_auth(state, msg->www_authenticate);
+            } else if (msg->status_code == 200) {
+                state->reg_expires = msg->expires > 0 ? msg->expires : 300;
+                state->reg_registered = 1;
+                log_info("trunk: REGISTER OK, expires=%d", state->reg_expires);
             }
         } else {
             handle_sip_response(ready_fd, state, &src, msg);
@@ -733,7 +793,7 @@ int trunk_delay_task(int64_t ts, struct pt_task *pt) {
             if (call->state == CALL_ENDED) continue;
 
             /* Allocate RTP pair for the outgoing call */
-            call->rtp = rtp_alloc(&state->rtp_ctx);
+            call->rtp = rtp_alloc(&state->rtp_ctx, state->target_af);
             if (!call->rtp) {
                 log_warn("trunk: failed to allocate RTP for outgoing call %s", call->backbone_call_id);
                 trunk_call_remove(state, call);
@@ -768,16 +828,18 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
     char sdp_body[512];
     int sdp_len = 0;
     if (call->rtp) {
+        const char *af = sdp_addr_family(s->listen_addr);
         sdp_len = snprintf(sdp_body, sizeof(sdp_body),
             "v=0\r\n"
-            "o=- 0 0 IN IP4 0.0.0.0\r\n"
+            "o=- 0 0 %s %s\r\n"
             "s=session\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
+            "c=%s %s\r\n"
             "t=0 0\r\n"
             "m=audio %d RTP/AVP 0 8 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n",
+            af, s->listen_addr, af, s->listen_addr,
             call->rtp->port);
     }
 
@@ -789,7 +851,7 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
         "To: %s\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Contact: <sip:trk@0.0.0.0>\r\n"
+        "Contact: <sip:trk@%s>\r\n"
         "Content-Type: application/sdp\r\n"
         "Content-Length: %d\r\n"
         "\r\n",
@@ -798,6 +860,7 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
         call->trunk_to ? call->trunk_to : "",
         call->sip_call_id,
         call->cseq_num,
+        s->listen_addr,
         sdp_len);
 
     if (rlen > 0 && sdp_len > 0 && rlen + sdp_len < (int)sizeof(resp)) {
@@ -824,21 +887,24 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
     if (call->state >= CALL_RINGING && call->direction == CALL_OUTGOING) {
         /* Send CANCEL to trunk */
         if (call->trunk_fd >= 0) {
+            struct trk_backbone *target = s->config->target;
+            const char *host = target ? target->host : "0.0.0.0";
             char cancel[512];
             int clen = snprintf(cancel, sizeof(cancel),
                 "CANCEL sip:%s@%s SIP/2.0\r\n"
                 "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrkcancel\r\n"
-                "From: <sip:trk@0.0.0.0>\r\n"
+                "From: <sip:trk@%s>\r\n"
                 "To: <sip:%s@%s>\r\n"
                 "Call-ID: %s\r\n"
                 "CSeq: 1 CANCEL\r\n"
                 "Content-Length: 0\r\n"
                 "\r\n",
                 call->trunk_did ? call->trunk_did : "?",
-                "0.0.0.0",
-                "0.0.0.0",
+                host,
+                s->listen_addr,
+                s->listen_addr,
                 call->trunk_did ? call->trunk_did : "?",
-                "0.0.0.0",
+                host,
                 call->sip_call_id);
             send_sip(call->trunk_fd, &call->trunk_addr, cancel, clen);
         }
@@ -863,17 +929,16 @@ void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, int str
 
     /* Log first outbound RTP packet for diagnostics */
     if (!call->media_logged) {
-        struct sockaddr_in *a = (struct sockaddr_in *)&call->rtp->ext_addr;
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+        char ip[INET6_ADDRSTRLEN];
+        sockaddr_to_str(&call->rtp->ext_addr, ip, sizeof(ip));
         log_info("trunk: first RTP out for %s -> %s:%d (local port %d, fd %d, %zu bytes)",
-                 call->backbone_call_id, ip, ntohs(a->sin_port),
+                 call->backbone_call_id, ip, sockaddr_port(&call->rtp->ext_addr),
                  call->rtp->port, call->rtp->fd, len);
 
         /* Test sendto with correct addrlen and log any error */
         ssize_t sent = sendto(call->rtp->fd, data, len, 0,
                               (struct sockaddr *)&call->rtp->ext_addr,
-                              sizeof(struct sockaddr_in));
+                              get_addrlen(&call->rtp->ext_addr));
         if (sent < 0) {
             log_error("trunk: first RTP sendto failed: %s (errno=%d)", strerror(errno), errno);
         } else {
@@ -898,7 +963,7 @@ void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id) {
         char bye[1024];
         int blen = snprintf(bye, sizeof(bye),
             "BYE sip:%s@%s SIP/2.0\r\n"
-            "Via: SIP/2.0/UDP 0.0.0.0;branch=z9hG4bKbye%s\r\n"
+            "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
             "From: <sip:%s@%s>;tag=trk%s\r\n"
             "To: %s\r\n"
             "Call-ID: %s\r\n"
@@ -906,7 +971,7 @@ void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id) {
             "Content-Length: 0\r\n"
             "\r\n",
             call->trunk_did ? call->trunk_did : "?", host,
-            call->sip_call_id,
+            s->listen_addr, call->sip_call_id,
             call->trunk_cid ? call->trunk_cid : "trunk", host, call->sip_call_id,
             call->trunk_to ? call->trunk_to : "",
             call->sip_call_id,
@@ -925,6 +990,7 @@ struct trunk_state *trunk_create(struct trk_config *cfg) {
     if (!ts) return NULL;
     ts->config = cfg;
     ts->sip_fds = NULL;
+    strncpy(ts->listen_addr, "0.0.0.0", sizeof(ts->listen_addr) - 1);
     rtp_ctx_init(&ts->rtp_ctx, cfg->rtp_min, cfg->rtp_max);
     return ts;
 }
@@ -933,7 +999,6 @@ void trunk_free(struct trunk_state *ts) {
     if (!ts) return;
     if (ts->sip_task) sched_remove(ts->sip_task);
     if (ts->delay_task) sched_remove(ts->delay_task);
-    if (ts->reg) register_free(ts->reg);
     while (ts->calls) {
         struct trunk_call *next = ts->calls->next;
         trunk_call_free(ts->calls);

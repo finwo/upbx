@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,7 +13,6 @@
 #include "config/config.h"
 #include "trunk/trunk.h"
 #include "backbone/backbone.h"
-#include "register/register.h"
 #include "finwo/scheduler.h"
 #include "rxi/log.h"
 
@@ -48,28 +48,39 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -h, --help             Show this help\n");
 }
 
-static int create_sip_socket(const char *target_host) {
+/* Detect local IP that would be used to reach target_host.
+ * Uses a temporary UDP connect+getsockname trick. */
+static void detect_listen_address(struct trunk_state *ts, const char *target_host) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
 
-    /* Resolve the target to determine the address family */
-    if (target_host && getaddrinfo(target_host, NULL, &hints, &res) == 0 && res) {
-        int fd = socket(res->ai_family, SOCK_DGRAM, 0);
-        freeaddrinfo(res);
-        if (fd < 0) return -1;
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        return fd;
+    if (!target_host || getaddrinfo(target_host, "5060", &hints, &res) != 0 || !res) {
+        log_warn("trunk: failed to resolve %s for listen address detection", target_host ? target_host : "(null)");
+        return;
     }
 
-    /* Fallback: IPv4 */
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    return fd;
+    int fd = socket(res->ai_family, SOCK_DGRAM, 0);
+    if (fd < 0) { freeaddrinfo(res); return; }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+        struct sockaddr_storage local;
+        socklen_t local_len = sizeof(local);
+        if (getsockname(fd, (struct sockaddr *)&local, &local_len) == 0) {
+            if (local.ss_family == AF_INET) {
+                struct sockaddr_in *la = (struct sockaddr_in *)&local;
+                inet_ntop(AF_INET, &la->sin_addr, ts->listen_addr, sizeof(ts->listen_addr));
+            } else if (local.ss_family == AF_INET6) {
+                struct sockaddr_in6 *la = (struct sockaddr_in6 *)&local;
+                inet_ntop(AF_INET6, &la->sin6_addr, ts->listen_addr, sizeof(ts->listen_addr));
+            }
+            log_info("trunk: listen address auto-detected: %s (from route to %s)",
+                     ts->listen_addr, target_host);
+        }
+    }
+    close(fd);
+    freeaddrinfo(res);
 }
 
 int cmd_daemon(int argc, const char **argv) {
@@ -110,21 +121,54 @@ int cmd_daemon(int argc, const char **argv) {
     /* Create trunk state */
     struct trunk_state *trunk = trunk_create(config);
 
-    /* Create SIP UDP socket (OS-assigned ephemeral port) */
+    /* Set listen address for SDP/SIP headers */
     const char *target_host = config->target ? config->target->host : NULL;
-    int sip_fd = create_sip_socket(target_host);
+    if (config->listen_address) {
+        strncpy(trunk->listen_addr, config->listen_address, sizeof(trunk->listen_addr) - 1);
+        log_info("trunk: listen address from config: %s", trunk->listen_addr);
+    } else if (target_host) {
+        detect_listen_address(trunk, target_host);
+    }
+
+    /* Resolve target once, store in trunk_state */
+    int target_af = AF_INET;
+    if (target_host) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(target_host, "5060", &hints, &res) == 0 && res) {
+            target_af = res->ai_family;
+            trunk->target_addrlen = res->ai_addrlen;
+            memcpy(&trunk->target_addr, res->ai_addr, res->ai_addrlen);
+            /* Override port to target's configured port */
+            int port = config->target->port ? atoi(config->target->port) : 5060;
+            if (target_af == AF_INET) {
+                ((struct sockaddr_in *)&trunk->target_addr)->sin_port = htons(port);
+            } else {
+                ((struct sockaddr_in6 *)&trunk->target_addr)->sin6_port = htons(port);
+            }
+            freeaddrinfo(res);
+        }
+    }
+    trunk->target_af = target_af;
+
+    /* Create SIP socket matching target's address family — no bind */
+    int sip_fd = socket(target_af, SOCK_DGRAM, 0);
     if (sip_fd < 0) {
         fprintf(stderr, "daemon: failed to create SIP UDP socket\n");
         return 1;
     }
+    int flags = fcntl(sip_fd, F_GETFL, 0);
+    fcntl(sip_fd, F_SETFL, flags | O_NONBLOCK);
 
-    /* Build fd array for sched_has_data: {count, fd} */
+    /* Store as {1, fd} fd array for sched_has_data */
     int *sip_fds = malloc(2 * sizeof(int));
     sip_fds[0] = 1;
     sip_fds[1] = sip_fd;
     trunk->sip_fds = sip_fds;
 
-    /* Start SIP receive task */
+    /* Start SIP receive task (handles registration + signalling) */
     trunk->sip_task = sched_create(trunk_sip_recv_task, trunk);
 
     /* Start backbone connection (if configured) */
@@ -132,11 +176,6 @@ int cmd_daemon(int argc, const char **argv) {
     if (config->backbones) {
         backbone = backbone_create(config, trunk);
         trunk->backbone = backbone;
-    }
-
-    /* Start SIP registration to upstream */
-    if (config->target && config->target->host && config->target->username) {
-        trunk->reg = register_create(config, trunk, sip_fd);
     }
 
     /* Start delay timer task */

@@ -36,6 +36,7 @@ struct trk_config {
     int sip_port;
     int rtp_min, rtp_max;
     int delay_ms;
+    char *listen_address;        // optional: override auto-detected local IP
     struct trk_backbone *backbones;
     struct trk_backbone *target;
     struct trk_filter *filters;

@@ -28,7 +28,9 @@ void sdp_free(struct sdp_info *info);
 char *sdp_rewrite(const char *body, int len, const char *new_ip, int new_port, int *out_len);
 
 // Build SDP body from codec tags. Returns malloc'd string.
-char *sdp_build_from_codecs(int rtp_port, struct codec_tag *tags, int tag_count);
+// addr_family: "IP4" or "IP6"
+char *sdp_build_from_codecs(int rtp_port, const char *addr_family,
+                            struct codec_tag *tags, int tag_count);
 
 // Build codec tags string from codec array. Returns malloc'd string.
 char *codec_tags_to_string(struct codec_tag *tags, int tag_count);

@@ -4,12 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include "config/config.h"
 #include "rtp/rtp.h"
 #include "finwo/scheduler.h"
-
-struct register_state;
 
 enum call_state {
     CALL_WAITING,
@@ -66,8 +65,19 @@ struct trunk_call {
 struct trunk_state {
     struct trk_config *config;
     struct backbone_state *backbone;
-    struct register_state *reg;
     int *sip_fds;
+    char listen_addr[INET6_ADDRSTRLEN]; // auto-detected local IP for SDP/SIP
+
+    /* Resolved target address — set once at startup */
+    struct sockaddr_storage target_addr; // upstream address (resolved)
+    socklen_t target_addrlen;            // sizeof(sockaddr_in) or sockaddr_in6
+    int target_af;                       // AF_INET or AF_INET6
+
+    /* Registration state (owned by sip recv task) */
+    int reg_registered;
+    int64_t reg_last_send;
+    int reg_expires;
+
     struct rtp_alloc_ctx rtp_ctx;
     struct trunk_call *calls;
     pt_task_t *sip_task;

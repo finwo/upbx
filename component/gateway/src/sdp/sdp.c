@@ -181,8 +181,10 @@ char *sdp_rewrite(const char *body, int len, const char *new_ip, int new_port, i
 
 /* ── codec tag helpers ────────────────────────────────────────── */
 
-char *sdp_build_from_codecs(int rtp_port, struct codec_tag *tags, int tag_count) {
+char *sdp_build_from_codecs(int rtp_port, const char *addr_family,
+                            struct codec_tag *tags, int tag_count) {
     if (!tags || tag_count <= 0) return NULL;
+    if (!addr_family) addr_family = "IP4";
 
     /* build m= line payload type list */
     char pt_list[256] = {0};
@@ -220,13 +222,13 @@ char *sdp_build_from_codecs(int rtp_port, struct codec_tag *tags, int tag_count)
     const char *type = tag_count > 0 ? tags[0].media_type : "audio";
     snprintf(sdp, 1024 + sizeof(rtpmaps),
         "v=0\r\n"
-        "o=- 0 0 IN IP4 0.0.0.0\r\n"
+        "o=- 0 0 %s 0.0.0.0\r\n"
         "s=session\r\n"
-        "c=IN IP4 0.0.0.0\r\n"
+        "c=%s 0.0.0.0\r\n"
         "t=0 0\r\n"
         "m=%s %d RTP/AVP %s\r\n"
         "%s",
-        type, rtp_port, pt_list, rtpmaps);
+        addr_family, addr_family, type, rtp_port, pt_list, rtpmaps);
 
     return sdp;
 }
