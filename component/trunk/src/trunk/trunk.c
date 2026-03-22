@@ -86,6 +86,8 @@ static void send_sip(int fd, struct sockaddr_storage *dst,
                           (struct sockaddr *)dst, get_addrlen(dst));
     if (sent < 0) {
         log_error("trunk: sendto failed: %s (errno=%d)", strerror(errno), errno);
+    } else {
+        log_debug("trunk: sendto sent %zd bytes", sent);
     }
 }
 
@@ -255,20 +257,6 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
     free(realm);
     free(nonce);
 
-    /* Resolve destination */
-    struct sockaddr_storage dst;
-    memset(&dst, 0, sizeof(dst));
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, target->port, &hints, &res) != 0 || !res) {
-        log_error("trunk: DNS resolution failed for %s:%s", host, target->port);
-        return;
-    }
-    memcpy(&dst, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
     /* Build SDP from codec tags (or fallback) */
     char *sdp_body = NULL;
     int sdp_len = 0;
@@ -305,23 +293,24 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
     char invite[4096];
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE %s SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrk%s\r\n"
-        "From: <sip:%s@%s>;tag=trk%s\r\n"
+        "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+        "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Contact: <sip:trk@%s>\r\n"
+        "Contact: <sip:%s@%s>\r\n"
         "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "%s"
         "%s"
         "Content-Length: %d\r\n"
         "\r\n",
         uri,
-        ts->listen_addr, call->sip_call_id,
-        call->trunk_cid ? call->trunk_cid : user, host, call->sip_call_id,
+        ts->listen_addr, call->branch,
+        call->trunk_cid ? call->trunk_cid : user, host, call->from_tag,
         call->trunk_did ? call->trunk_did : "?", host,
         call->sip_call_id,
         call->cseq_num,
+        user,
         ts->listen_addr,
         auth_hdr,
         sdp_body ? "Content-Type: application/sdp\r\n" : "",
@@ -332,7 +321,7 @@ static void resend_invite_with_auth(struct trunk_state *ts, struct trunk_call *c
         ilen += sdp_len;
     }
 
-    send_sip(call->trunk_fd, &dst, invite, ilen);
+    send_sip(call->trunk_fd, &ts->target_addr, invite, ilen);
     free(sdp_body);
     log_info("trunk: resent INVITE with auth for %s", call->trunk_did ? call->trunk_did : "?");
 }
@@ -343,23 +332,6 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
         log_warn("trunk: no target configured for outgoing call");
         return;
     }
-
-    /* Resolve destination address */
-    struct sockaddr_storage dst;
-    memset(&dst, 0, sizeof(dst));
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(target->host, target->port, &hints, &res) != 0 || !res) {
-        log_error("trunk: DNS resolution failed for %s:%s", target->host, target->port);
-        return;
-    }
-    memcpy(&dst, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
-    /* Generate gateway to-tag */
-    generate_hex_id(call->gw_tag, sizeof(call->gw_tag));
 
     /* Build SDP from codec tags in backbone invite (or fallback to hardcoded) */
     char *sdp_body = NULL;
@@ -395,24 +367,25 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
     char invite[4096];
     int ilen = snprintf(invite, sizeof(invite),
         "INVITE sip:%s@%s SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrk%s\r\n"
-        "From: <sip:%s@%s>;tag=trk%s\r\n"
+        "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+        "From: <sip:%s@%s>;tag=%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: %s\r\n"
         "CSeq: 1 INVITE\r\n"
-        "Contact: <sip:trk@%s>\r\n"
+        "Contact: <sip:%s@%s>\r\n"
         "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "%s"
         "Content-Length: %d\r\n"
         "\r\n",
         call->trunk_did ? call->trunk_did : "?",
         target->host,
-        ts->listen_addr, call->sip_call_id,
+        ts->listen_addr, call->branch,
         call->trunk_cid ? call->trunk_cid : (target->username ? target->username : "trunk"),
-        target->host, call->sip_call_id,
+        target->host, call->from_tag,
         call->trunk_did ? call->trunk_did : "?",
         target->host,
         call->sip_call_id,
+        target->username ? target->username : "",
         ts->listen_addr,
         sdp_body ? "Content-Type: application/sdp\r\n" : "",
         sdp_len);
@@ -424,7 +397,7 @@ static void send_invite_to_trunk(struct trunk_state *ts, struct trunk_call *call
 
     call->trunk_fd = ts->sip_fds[1];
     call->cseq_num = 1;
-    send_sip(call->trunk_fd, &dst, invite, ilen);
+    send_sip(call->trunk_fd, &ts->target_addr, invite, ilen);
     free(sdp_body);
     log_info("trunk: sent INVITE to %s:%s for %s", target->host, target->port,
              call->trunk_did ? call->trunk_did : "?");
@@ -448,16 +421,19 @@ void trunk_handle_backbone_invite(struct trunk_state *ts, const char *call_id,
     /* Check for duplicate call_id */
     if (trunk_find_by_backbone_id(ts, call_id)) return;
 
-    /* Create call */
+    /* Create call - re-use backbone call_id as sip_call_id */
     struct trunk_call *call = calloc(1, sizeof(struct trunk_call));
-    call->sip_call_id = malloc(65);
-    generate_hex_id(call->sip_call_id, 65);
+    call->sip_call_id = strdup(call_id);
     strncpy(call->backbone_call_id, call_id, sizeof(call->backbone_call_id) - 1);
     call->direction = CALL_OUTGOING;
     call->state = CALL_WAITING;
     call->trunk_did = strdup(did);
     call->trunk_cid = strdup(cid);
     if (tags_str) call->backbone_tags = strdup(tags_str);
+
+    /* Generate short branch and tag for SIP dialog */
+    generate_hex_id(call->branch, sizeof(call->branch));
+    generate_hex_id(call->from_tag, sizeof(call->from_tag));
 
     /* Start delay timer */
     call->delay_active = 1;
@@ -652,19 +628,22 @@ static void handle_sip_response(int fd, struct trunk_state *ts, struct sockaddr_
             char ack[2048];
             int alen = snprintf(ack, sizeof(ack),
                 "ACK sip:%s@%s SIP/2.0\r\n"
-                "Via: SIP/2.0/UDP %s;branch=z9hG4bKack%s\r\n"
-                "From: <sip:%s@%s>;tag=trk%s\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+                "From: <sip:%s@%s>;tag=%s\r\n"
                 "To: %s\r\n"
                 "Call-ID: %s\r\n"
                 "CSeq: %d ACK\r\n"
+                "Contact: <sip:%s@%s>\r\n"
                 "Content-Length: 0\r\n"
                 "\r\n",
                 call->trunk_did ? call->trunk_did : "?", host,
-                ts->listen_addr, call->sip_call_id,
-                call->trunk_cid ? call->trunk_cid : "trunk", host, call->sip_call_id,
+                ts->listen_addr, call->branch,
+                call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"), host, call->from_tag,
                 msg->to ? msg->to : "",
                 call->sip_call_id,
-                call->cseq_num);
+                call->cseq_num,
+                target && target->username ? target->username : "",
+                ts->listen_addr);
             call->trunk_addr = *src;
             call->trunk_fd = fd;
             send_sip(fd, src, ack, alen);
@@ -851,7 +830,7 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
         "To: %s\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Contact: <sip:trk@%s>\r\n"
+        "Contact: <sip:%s@%s>\r\n"
         "Content-Type: application/sdp\r\n"
         "Content-Length: %d\r\n"
         "\r\n",
@@ -860,6 +839,7 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const 
         call->trunk_to ? call->trunk_to : "",
         call->sip_call_id,
         call->cseq_num,
+        s->config->target && s->config->target->username ? s->config->target->username : "",
         s->listen_addr,
         sdp_len);
 
@@ -884,7 +864,7 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
         return;
     }
 
-    if (call->state >= CALL_RINGING && call->direction == CALL_OUTGOING) {
+    if (call->direction == CALL_OUTGOING) {
         /* Send CANCEL to trunk */
         if (call->trunk_fd >= 0) {
             struct trk_backbone *target = s->config->target;
@@ -892,8 +872,8 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
             char cancel[512];
             int clen = snprintf(cancel, sizeof(cancel),
                 "CANCEL sip:%s@%s SIP/2.0\r\n"
-                "Via: SIP/2.0/UDP %s;branch=z9hG4bKtrkcancel\r\n"
-                "From: <sip:trk@%s>\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bK%s\r\n"
+                "From: <sip:%s@%s>;tag=%s\r\n"
                 "To: <sip:%s@%s>\r\n"
                 "Call-ID: %s\r\n"
                 "CSeq: 1 CANCEL\r\n"
@@ -901,12 +881,14 @@ void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id) {
                 "\r\n",
                 call->trunk_did ? call->trunk_did : "?",
                 host,
-                s->listen_addr,
-                s->listen_addr,
+                s->listen_addr, call->branch,
+                call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"),
+                host, call->from_tag,
                 call->trunk_did ? call->trunk_did : "?",
                 host,
                 call->sip_call_id);
-            send_sip(call->trunk_fd, &call->trunk_addr, cancel, clen);
+            send_sip(call->trunk_fd, &s->target_addr, cancel, clen);
+            log_info("trunk: sent CANCEL to upstream for %s", call->backbone_call_id);
         }
     }
 
@@ -964,15 +946,15 @@ void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id) {
         int blen = snprintf(bye, sizeof(bye),
             "BYE sip:%s@%s SIP/2.0\r\n"
             "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
-            "From: <sip:%s@%s>;tag=trk%s\r\n"
+            "From: <sip:%s@%s>;tag=%s\r\n"
             "To: %s\r\n"
             "Call-ID: %s\r\n"
             "CSeq: %d BYE\r\n"
             "Content-Length: 0\r\n"
             "\r\n",
             call->trunk_did ? call->trunk_did : "?", host,
-            s->listen_addr, call->sip_call_id,
-            call->trunk_cid ? call->trunk_cid : "trunk", host, call->sip_call_id,
+            s->listen_addr, call->branch,
+            call->trunk_cid ? call->trunk_cid : (target && target->username ? target->username : "trunk"), host, call->from_tag,
             call->trunk_to ? call->trunk_to : "",
             call->sip_call_id,
             call->cseq_num + 1);

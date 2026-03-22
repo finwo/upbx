@@ -498,10 +498,10 @@ static void ext_to_backbone(struct pbx_state *ps, struct sockaddr_storage *calle
 
     log_info("pbx: allocated RTP port %d fd %d for ext %s -> backbone", rtp->port, rtp->fd, caller_ext->extension);
 
-    /* Generate backbone call_id */
+    /* Use extension's Call-ID for backbone */
     struct pbx_call *call = calloc(1, sizeof(struct pbx_call));
     call->sip_call_id = strdup(msg->call_id);
-    generate_hex_id(call->backbone_call_id, 33);
+    strncpy(call->backbone_call_id, msg->call_id, sizeof(call->backbone_call_id) - 1);
     strncpy(rtp->call_id, call->backbone_call_id, sizeof(rtp->call_id) - 1);
 
     call->caller_addr = *caller_addr;

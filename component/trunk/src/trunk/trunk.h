@@ -34,6 +34,8 @@ struct trunk_call {
     char *trunk_did;
     char *trunk_cid;
     int cseq_num;
+    char branch[32];           /* Via branch parameter for this call */
+    char from_tag[32];         /* From tag for this call */
 
     /* Dialog headers for response building */
     char *trunk_via;
