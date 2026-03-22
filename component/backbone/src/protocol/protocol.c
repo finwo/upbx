@@ -120,44 +120,6 @@ static void conn_sendf(int fd, const char *fmt, ...) {
     if (len > 0) conn_send(fd, buf, (size_t)len);
 }
 
-static int conn_recv_line(struct conn *c, char *out, size_t out_size) {
-    if (c->fd < 0) return -1;
-    char buf[1024];
-    ssize_t n = recv(c->fd, buf, sizeof(buf) - 1, 0);
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        /* No data available right now — check if we have a buffered line */
-        if (c->recv_len > 0) {
-            char *newline = strchr(c->recv_buf, '\n');
-            if (newline) goto drain_line;
-        }
-        return 1; /* no data, no complete line */
-    }
-    if (n <= 0) return -1; /* real error or connection closed */
-
-    if (c->recv_len + (size_t)n + 1 > c->recv_cap) {
-        c->recv_cap = (c->recv_len + (size_t)n + 4096) * 2;
-        c->recv_buf = realloc(c->recv_buf, c->recv_cap);
-    }
-    memcpy(c->recv_buf + c->recv_len, buf, (size_t)n);
-    c->recv_len += (size_t)n;
-    c->recv_buf[c->recv_len] = '\0';
-
-drain_line:;
-    char *newline = strchr(c->recv_buf, '\n');
-    if (!newline) return 1;
-
-    size_t line_len = newline - c->recv_buf;
-    if (line_len >= out_size) line_len = out_size - 1;
-    memcpy(out, c->recv_buf, line_len);
-    out[line_len] = '\0';
-
-    size_t remaining = c->recv_len - line_len - 1;
-    memmove(c->recv_buf, newline + 1, remaining + 1);
-    c->recv_len = remaining;
-
-    return 0;
-}
-
 static void conn_authenticate(struct conn *c, char *args) {
     char username[256] = {0};
     char nonce[64] = {0};
@@ -336,7 +298,7 @@ static void handle_ringing(struct conn *c, char *line) {
     if (call->state < UPBX_CALL_RINGING && call->caller_fd >= 0 && call->caller_fd != c->fd) {
         call->callee_fd = c->fd;
         call->state = UPBX_CALL_RINGING;
-        conn_sendf(call->caller_fd, "ringing %s\n", call_id);
+        conn_sendf(call->caller_fd, "%s\n", line);
 
         /* Cancel all other connections (except caller and ringing sender) */
         for (struct conn *pc = c->proto->conns; pc; pc = pc->next) {
@@ -375,7 +337,7 @@ static void handle_answer(struct conn *c, char *line) {
 
     /* Send answer to caller */
     if (call->caller_fd >= 0) {
-        conn_sendf(call->caller_fd, "answer %s\n", call_id);
+        conn_sendf(call->caller_fd, "%s\n", line);
         log_info("protocol: answer forwarded to caller fd=%d for call %s", call->caller_fd, call_id);
     } else {
         log_warn("protocol: answer for call %s but caller_fd is invalid", call_id);
@@ -482,7 +444,7 @@ static void handle_bye(struct conn *c, char *line) {
     }
 
     if (other_fd >= 0) {
-        conn_sendf(other_fd, "bye %s\n", call_id);
+        conn_sendf(other_fd, "%s\n", line);
         log_info("protocol: bye forwarded to fd=%d for call %s", other_fd, call_id);
     } else {
         log_warn("protocol: bye for %s but other_fd is -1", call_id);
@@ -510,48 +472,79 @@ static int conn_task(int64_t ts, struct pt_task *pt) {
     }
 
     int fds[2] = {1, c->fd};
-    if (sched_has_data(fds) < 0) return SCHED_RUNNING;
+    int ready_fd = sched_has_data(fds);
+    if (ready_fd < 0) return SCHED_RUNNING;
 
-    char line[MAX_LINE];
-    int ret = conn_recv_line(c, line, sizeof(line));
-    if (ret < 0) {
+    /* Read new data from socket into recv_buf */
+    char buf[4096];
+    ssize_t n = recv(ready_fd, buf, sizeof(buf) - 1, 0);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SCHED_RUNNING;
+    if (n <= 0) {
         log_info("protocol: connection closed fd=%d user=%s", c->fd, c->username ? c->username : "?");
         conn_free(c);
         return SCHED_DONE;
     }
-    if (ret > 0) return SCHED_RUNNING;
 
-    char *p = line;
-    while (*p == ' ') p++;
-    char *space = strchr(p, ' ');
-    char cmd[64] = {0};
-    if (space) {
-        size_t len = space - p;
-        if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
-        memcpy(cmd, p, len);
-    } else {
-        strncpy(cmd, p, sizeof(cmd) - 1);
+    if (c->recv_len + (size_t)n + 1 > c->recv_cap) {
+        c->recv_cap = (c->recv_len + (size_t)n + 4096) * 2;
+        c->recv_buf = realloc(c->recv_buf, c->recv_cap);
+    }
+    memcpy(c->recv_buf + c->recv_len, buf, (size_t)n);
+    c->recv_len += (size_t)n;
+    c->recv_buf[c->recv_len] = '\0';
+
+    /* Process all complete lines */
+    char *start = c->recv_buf;
+    char *nl;
+    while ((nl = strchr(start, '\n')) != NULL) {
+        *nl = '\0';
+        /* Strip trailing \r */
+        char *cr = strchr(start, '\r');
+        if (cr) *cr = '\0';
+
+        if (strlen(start) > 0) {
+            char *p = start;
+            while (*p == ' ') p++;
+            char *space = strchr(p, ' ');
+            char cmd[64] = {0};
+            if (space) {
+                size_t len = space - p;
+                if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
+                memcpy(cmd, p, len);
+            } else {
+                strncpy(cmd, p, sizeof(cmd) - 1);
+            }
+
+            if (strcmp(cmd, "auth") == 0) {
+                conn_authenticate(c, p + 4);
+            } else if (strcmp(cmd, "ping") == 0) {
+                conn_send(c->fd, "pong\n", 5);
+            } else if (!c->authenticated) {
+                /* Drop non-auth commands from unauthenticated connections */
+            } else if (strcmp(cmd, "invite") == 0) {
+                handle_invite(c, p);
+            } else if (strcmp(cmd, "ringing") == 0) {
+                handle_ringing(c, p);
+            } else if (strcmp(cmd, "answer") == 0) {
+                handle_answer(c, p);
+            } else if (strcmp(cmd, "cancel") == 0) {
+                handle_cancel(c, p);
+            } else if (strcmp(cmd, "media") == 0) {
+                handle_media(c, p);
+            } else if (strcmp(cmd, "bye") == 0) {
+                handle_bye(c, p);
+            }
+        }
+        start = nl + 1;
     }
 
-    if (strcmp(cmd, "auth") == 0) {
-        conn_authenticate(c, line + 4);
-    } else if (strcmp(cmd, "ping") == 0) {
-        conn_send(c->fd, "pong\n", 5);
-    } else if (!c->authenticated) {
-        /* Drop non-auth commands from unauthenticated connections */
-    } else if (strcmp(cmd, "invite") == 0) {
-        handle_invite(c, line);
-    } else if (strcmp(cmd, "ringing") == 0) {
-        handle_ringing(c, line);
-    } else if (strcmp(cmd, "answer") == 0) {
-        handle_answer(c, line);
-    } else if (strcmp(cmd, "cancel") == 0) {
-        handle_cancel(c, line);
-    } else if (strcmp(cmd, "media") == 0) {
-        handle_media(c, line);
-    } else if (strcmp(cmd, "bye") == 0) {
-        handle_bye(c, line);
+    /* Move remaining partial line to front of buffer */
+    size_t consumed = (size_t)(start - c->recv_buf);
+    size_t remaining = c->recv_len - consumed;
+    if (remaining > 0) {
+        memmove(c->recv_buf, start, remaining);
     }
+    c->recv_len = remaining;
 
     return SCHED_RUNNING;
 }

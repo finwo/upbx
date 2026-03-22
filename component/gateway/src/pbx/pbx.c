@@ -1179,25 +1179,34 @@ void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
 
     struct gw_ext *caller_ext = gw_config_find_ext(s->config, call->caller_ext);
 
-    /* Send BYE to the connected extension */
-    if (call->rtp_caller && caller_ext) {
-        char bye[512];
+    /* Send BYE to the connected extension using proper in-dialog headers.
+     * Gateway is UAS in the caller dialog, so From = caller_to (our side),
+     * To = caller_from (phone's side). */
+    if (caller_ext) {
+        const char *bye_from = call->caller_to   ? call->caller_to   : "";
+        const char *bye_to   = call->caller_from ? call->caller_from : "";
+        const char *addr     = caller_ext->pbx_addr ? caller_ext->pbx_addr : "0.0.0.0";
+
+        char bye[1024];
         int blen = snprintf(bye, sizeof(bye),
             "BYE sip:%s@%s SIP/2.0\r\n"
-            "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwbye\r\n"
-            "From: <sip:gw@pbx>\r\n"
-            "To: <sip:%s@%s>\r\n"
+            "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwbye%s\r\n"
+            "From: %s\r\n"
+            "To: %s\r\n"
             "Call-ID: %s\r\n"
-            "CSeq: 2 BYE\r\n"
+            "CSeq: %d BYE\r\n"
             "Content-Length: 0\r\n"
             "\r\n",
             call->caller_ext ? call->caller_ext : "?",
-            "0.0.0.0",
-            "0.0.0.0",
-            call->caller_ext ? call->caller_ext : "?",
-            "0.0.0.0",
-            call->sip_call_id);
+            addr,
+            addr,
+            call->sip_call_id,
+            bye_from,
+            bye_to,
+            call->sip_call_id,
+            call->cseq_num + 2);
         send_sip(caller_ext->sip_fd, &call->caller_addr, bye, blen);
+        log_info("pbx: sent BYE to ext %s for call %s (backbone bye)", call->caller_ext, call_id);
     }
 
     pbx_call_remove(s, call);
