@@ -680,9 +680,8 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
         /* First boot: send initial REGISTER */
         trunk_send_register(state);
     } else if (state->reg_registered) {
-        /* Re-register 15s before expiry */
-        int re_reg_ms = (state->reg_expires - 15) * 1000;
-        if (re_reg_ms < 5000) re_reg_ms = state->reg_expires * 500;
+        /* Re-register at 80% of returned expiry */
+        int re_reg_ms = (int)((int64_t)state->reg_expires * 800);
         if (now_ms - state->reg_last_send >= (int64_t)re_reg_ms) {
             state->reg_registered = 0;
             trunk_send_register(state);
@@ -690,6 +689,15 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
     } else if (!state->reg_registered && now_ms - state->reg_last_send > 30000) {
         /* No response in 30s, retry */
         trunk_send_register(state);
+    }
+
+    /* NAT keepalive — send CRLF ping every 25s to keep conntrack entries alive */
+    if (state->reg_registered && now_ms - state->keepalive_last_send >= 25000) {
+        const char *ping = "\r\n";
+        sendto(state->sip_fds[1], ping, 2, 0,
+               (struct sockaddr *)&state->target_addr, state->target_addrlen);
+        state->keepalive_last_send = now_ms;
+        log_debug("trunk: sent NAT keepalive ping");
     }
 
     int ready_fd = sched_has_data(state->sip_fds);
@@ -718,12 +726,43 @@ int trunk_sip_recv_task(int64_t ts, struct pt_task *pt) {
 
     if (msg->status_code > 0) {
         if (msg->cseq_method && strcasecmp(msg->cseq_method, "REGISTER") == 0) {
+            /* Extract NAT-detected public address from Via received/rport */
+            if (msg->via) {
+                const char *rcv = strstr(msg->via, "received=");
+                const char *rpt = strstr(msg->via, "rport=");
+                if (rcv) {
+                    rcv += 9;
+                    const char *end = rcv;
+                    while (*end && *end != ';' && *end != ',' && *end != ' ') end++;
+                    size_t len = (size_t)(end - rcv);
+                    if (len > 0 && len < sizeof(state->public_addr)) {
+                        memcpy(state->public_addr, rcv, len);
+                        state->public_addr[len] = '\0';
+                    }
+                }
+                if (rpt) {
+                    rpt += 6;
+                    state->public_port = atoi(rpt);
+                }
+                if (state->public_addr[0] && state->public_port > 0) {
+                    log_info("trunk: NAT detected public address %s:%d",
+                             state->public_addr, state->public_port);
+                }
+            }
+
             /* REGISTER response — handle inline */
             if (msg->status_code == 401 && msg->www_authenticate) {
                 log_info("trunk: REGISTER got 401, authenticating");
                 trunk_send_register_auth(state, msg->www_authenticate);
             } else if (msg->status_code == 200) {
-                state->reg_expires = msg->expires > 0 ? msg->expires : 300;
+                /* Parse expires from Contact header (provider stores it there) */
+                int expires = 300;
+                if (msg->contact) {
+                    const char *exp_str = strstr(msg->contact, "expires=");
+                    if (exp_str) expires = atoi(exp_str + 8);
+                }
+                if (expires <= 0) expires = 300;
+                state->reg_expires = expires;
                 state->reg_registered = 1;
                 log_info("trunk: REGISTER OK, expires=%d", state->reg_expires);
             }

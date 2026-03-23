@@ -80,6 +80,13 @@ struct trunk_state {
     int64_t reg_last_send;
     int reg_expires;
 
+    /* NAT keepalive state */
+    int64_t keepalive_last_send;
+
+    /* NAT-detected public address (from Via received/rport in REGISTER response) */
+    char public_addr[INET6_ADDRSTRLEN];
+    int  public_port;
+
     struct rtp_alloc_ctx rtp_ctx;
     struct trunk_call *calls;
     pt_task_t *sip_task;

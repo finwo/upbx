@@ -28,28 +28,54 @@ static void send_raw_register(struct trunk_state *ts, const char *authorization)
     const char *host = target->host ? target->host : "localhost";
     const char *auth_hdr = authorization ? authorization : "";
 
+    /* Use NAT-detected public address if available, otherwise listen_addr */
+    const char *contact_addr;
+    if (ts->public_addr[0] && ts->public_port > 0) {
+        contact_addr = ts->public_addr;
+    } else {
+        contact_addr = ts->listen_addr;
+    }
+    int contact_port = ts->public_port > 0 ? ts->public_port : 0;
+
+    /* Build Via */
+    char via[256];
+    if (contact_port) {
+        snprintf(via, sizeof(via), "SIP/2.0/UDP %s:%d;rport;branch=z9hG4bKreg",
+                 contact_addr, contact_port);
+    } else {
+        snprintf(via, sizeof(via), "SIP/2.0/UDP %s;rport;branch=z9hG4bKreg",
+                 contact_addr);
+    }
+
+    /* Build Contact */
+    char contact[256];
+    if (contact_port) {
+        snprintf(contact, sizeof(contact), "<sip:%s@%s:%d>", user, contact_addr, contact_port);
+    } else {
+        snprintf(contact, sizeof(contact), "<sip:%s@%s>", user, contact_addr);
+    }
+
     char buf[2048];
-    snprintf(buf, sizeof(buf),
+    int off = snprintf(buf, sizeof(buf),
         "REGISTER sip:%s SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP %s;branch=z9hG4bKreg\r\n"
-        "From: <sip:%s@%s>\r\n"
+        "Via: %s\r\n"
+        "From: <sip:%s@%s>;tag=trunk-%s\r\n"
         "To: <sip:%s@%s>\r\n"
         "Call-ID: trunk-register@%s\r\n"
         "CSeq: %d REGISTER\r\n"
-        "Contact: <sip:%s@%s>\r\n"
+        "Contact: %s\r\n"
         "User-Agent: upbx-trunk/" TRK_VERSION "\r\n"
         "Expires: 300\r\n"
-        "Content-Length: 0\r\n"
-        "%s"
-        "\r\n",
+        "Content-Length: 0\r\n",
         host,
-        ts->listen_addr,
-        user, host,
+        via,
+        user, host, user,
         user, host,
         host,
         reg_cseq,
-        user, ts->listen_addr,
-        auth_hdr);
+        contact);
+    if (*auth_hdr) off += snprintf(buf + off, sizeof(buf) - off, "%s", auth_hdr);
+    snprintf(buf + off, sizeof(buf) - off, "\r\n");
 
     ssize_t sent = sendto(ts->sip_fds[1], buf, strlen(buf), 0,
                           (struct sockaddr *)&ts->target_addr,

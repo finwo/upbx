@@ -22,9 +22,6 @@ services:
 
   trunk:
     build: component/trunk
-    ports:
-      - "5062:5062/udp"
-      - "20000-20099:20000-20099/udp"
     volumes:
       - ./docker/trunk.conf:/etc/upbx-trk.conf
     depends_on:
