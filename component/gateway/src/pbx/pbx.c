@@ -947,7 +947,17 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
     if (code == 180) {
         /* First ringing → send ringing to backbone */
         if (call->state < CALL_RINGING && ps->backbone) {
-            backbone_send_ringing(ps->backbone, call->backbone_call_id, "");
+            char *ring_codec_tags = NULL;
+            if (msg->body && msg->body_len > 0) {
+                struct sdp_info *sdp = sdp_parse(msg->body, msg->body_len);
+                if (sdp && sdp->codec_count > 0) {
+                    ring_codec_tags = codec_tags_to_string(sdp->codecs, sdp->codec_count);
+                }
+                if (sdp) sdp_free(sdp);
+            }
+            backbone_send_ringing(ps->backbone, call->backbone_call_id,
+                                  ring_codec_tags ? ring_codec_tags : "");
+            free(ring_codec_tags);
             call->state = CALL_RINGING;
         }
     } else if (code == 200) {
@@ -974,8 +984,18 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
         branch->answered = 1;
         call->state = CALL_ACTIVE;
 
-        /* Send answer to backbone */
-        backbone_send_answer(ps->backbone, call->backbone_call_id, "");
+        /* Parse phone's SDP codecs and send answer to backbone */
+        char *answer_codec_tags = NULL;
+        if (msg->body && msg->body_len > 0) {
+            struct sdp_info *sdp = sdp_parse(msg->body, msg->body_len);
+            if (sdp && sdp->codec_count > 0) {
+                answer_codec_tags = codec_tags_to_string(sdp->codecs, sdp->codec_count);
+            }
+            if (sdp) sdp_free(sdp);
+        }
+        backbone_send_answer(ps->backbone, call->backbone_call_id,
+                             answer_codec_tags ? answer_codec_tags : "");
+        free(answer_codec_tags);
 
         /* Set up RTP for this branch */
         if (branch->rtp) {
@@ -1218,6 +1238,8 @@ void pbx_on_backbone_bye(struct pbx_state *s, const char *call_id) {
 static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
                                    const char *did, const char *cid,
                                    struct gw_tag_entry *tags, int tag_count) {
+    log_info("pbx: backbone invite for did=%s cid=%s (call_id=%s)", did, cid, call_id);
+
     /* Check if DID matches any configured DID */
     int did_match = 0;
     for (struct gw_did *d = ps->config->dids; d; d = d->next) {
@@ -1227,7 +1249,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         }
     }
     if (!did_match) {
-        (void)0; /* DID not in our list */
+        log_warn("pbx: backbone invite did=%s not in our DID list", did);
         return;
     }
 
@@ -1331,10 +1353,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         branch->next = call->branches;
         call->branches = branch;
 
-        if (!ringing_sent) {
-            backbone_send_ringing(ps->backbone, call_id, "");
-            ringing_sent = 1;
-        }
+        (void)ringing_sent;
     }
 
     (void)call_id; (void)did; (void)cid; (void)n_ext;

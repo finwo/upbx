@@ -471,11 +471,15 @@ static void handle_sip_invite(int fd, struct trunk_state *ts, struct sockaddr_st
     rtp->backbone = ts->backbone;
 
     /* Parse remote SDP to learn trunk provider's media address */
+    char *codec_tags = NULL;
     if (msg->body && msg->body_len > 0) {
         struct sdp_info *sdp = sdp_parse(msg->body, msg->body_len);
         if (sdp && sdp->c_addr && sdp->m_port > 0) {
             rtp_set_remote(rtp, sdp->c_addr, sdp->m_port);
             log_info("trunk: learned remote media %s:%d from SDP", sdp->c_addr, sdp->m_port);
+        }
+        if (sdp && sdp->codec_count > 0) {
+            codec_tags = codec_tags_to_string(sdp->codecs, sdp->codec_count);
         }
         if (sdp) sdp_free(sdp);
     }
@@ -512,15 +516,20 @@ static void handle_sip_invite(int fd, struct trunk_state *ts, struct sockaddr_st
     call->next = ts->calls;
     ts->calls = call;
 
-    /* Send invite to backbone with trunk=<username> tag */
+    /* Send invite to backbone with trunk=<username> tag and codec tags */
     {
-        char tags[256];
-        snprintf(tags, sizeof(tags), "trunk=%s",
-                 ts->config->backbones && ts->config->backbones->username
-                 ? ts->config->backbones->username : "trunk");
+        char tags[4096];
+        int tlen = snprintf(tags, sizeof(tags), "trunk=%s",
+                            ts->config->backbones && ts->config->backbones->username
+                            ? ts->config->backbones->username : "trunk");
+        if (codec_tags && codec_tags[0]) {
+            tlen += snprintf(tags + tlen, sizeof(tags) - (size_t)tlen,
+                             " %s", codec_tags);
+        }
         backbone_send_invite(ts->backbone, call->backbone_call_id, dialed,
                             call->trunk_cid, tags);
     }
+    free(codec_tags);
 
     log_info("trunk: incoming call from trunk for %s, backbone id %s", dialed, call->backbone_call_id);
 }
@@ -836,8 +845,27 @@ int trunk_delay_task(int64_t ts, struct pt_task *pt) {
 /* ── Backbone event callbacks ────────────────────────────────── */
 
 void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id, const char *codec_tags) {
-    /* For incoming calls: ignore (trunk doesn't send ringing back to SIP trunk) */
-    (void)s; (void)call_id;
+    struct trunk_call *call = trunk_find_by_backbone_id(s, call_id);
+    if (!call || call->direction != CALL_INCOMING) return;
+
+    /* Send 180 Ringing to the trunk provider */
+    char ringing[1024];
+    int rlen = snprintf(ringing, sizeof(ringing),
+        "SIP/2.0 180 Ringing\r\n"
+        "Via: %s\r\n"
+        "From: %s\r\n"
+        "To: %s\r\n"
+        "Call-ID: %s\r\n"
+        "CSeq: %d INVITE\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n",
+        call->trunk_via  ? call->trunk_via  : "",
+        call->trunk_from ? call->trunk_from : "",
+        call->trunk_to   ? call->trunk_to   : "",
+        call->sip_call_id,
+        call->cseq_num);
+    send_sip(call->trunk_fd, &call->trunk_addr, ringing, rlen);
+    log_info("trunk: sent 180 Ringing to upstream for %s", call_id);
 }
 
 void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const char *codec_tags) {
