@@ -35,6 +35,9 @@ struct fork_branch {
     time_t retry_at;
     int invite_sent;
     int finished;
+    /* Dialog tags from extension's 200 OK */
+    char *callee_from;
+    char *callee_to;
     struct fork_branch *next;
 };
 

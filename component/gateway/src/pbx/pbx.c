@@ -132,6 +132,8 @@ static void free_branches(struct fork_branch *b) {
     while (b) {
         struct fork_branch *next = b->next;
         free(b->sip_call_id);
+        free(b->callee_from);
+        free(b->callee_to);
         rtp_free(b->rtp);
         free(b);
         b = next;
@@ -963,26 +965,54 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
     } else if (code == 200) {
         if (call->state >= CALL_ACTIVE) {
             /* Double pickup race — send BYE to late answerer */
-            char bye[512];
-            int blen = snprintf(bye, sizeof(bye),
-                "BYE sip:%s@%s SIP/2.0\r\n"
-                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
-                "From: <sip:gw@pbx>\r\n"
-                "To: <sip:%s@%s>\r\n"
+            if (!branch->answered) {
+                char bye[512];
+                int blen = snprintf(bye, sizeof(bye),
+                    "BYE sip:%s@%s SIP/2.0\r\n"
+                    "Via: SIP/2.0/UDP %s;branch=z9hG4bKgw%s\r\n"
+                    "From: <sip:gw@pbx>\r\n"
+                    "To: <sip:%s@%s>\r\n"
+                    "Call-ID: %s\r\n"
+                    "CSeq: 2 BYE\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n",
+                    branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                    branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0", branch->sip_call_id,
+                    branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                    branch->sip_call_id);
+                send_sip(fd, &branch->ext->remote_addr, bye, blen);
+                return;
+            }
+            /* Retransmitted 200 OK from answered branch — re-send ACK */
+            const char *addr = branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0";
+            char ack[512];
+            int alen = snprintf(ack, sizeof(ack),
+                "ACK sip:%s@%s SIP/2.0\r\n"
+                "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwack%s\r\n"
+                "From: %s\r\n"
+                "To: %s\r\n"
                 "Call-ID: %s\r\n"
-                "CSeq: 2 BYE\r\n"
+                "CSeq: 1 ACK\r\n"
                 "Content-Length: 0\r\n"
                 "\r\n",
-                branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
-                branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0", branch->sip_call_id,
-                branch->ext->extension, branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                branch->ext->extension, addr,
+                addr,
+                branch->sip_call_id,
+                branch->callee_from ? branch->callee_from : "<sip:gw@pbx>",
+                branch->callee_to ? branch->callee_to : "<sip:unknown>",
                 branch->sip_call_id);
-            send_sip(fd, &branch->ext->remote_addr, bye, blen);
+            send_sip(fd, &branch->ext->remote_addr, ack, alen);
             return;
         }
 
         branch->answered = 1;
         call->state = CALL_ACTIVE;
+
+        /* Store callee's dialog From/To (includes callee's tag) */
+        free(branch->callee_from);
+        branch->callee_from = msg->from ? strdup(msg->from) : NULL;
+        free(branch->callee_to);
+        branch->callee_to = msg->to ? strdup(msg->to) : NULL;
 
         /* Parse phone's SDP codecs and send answer to backbone */
         char *answer_codec_tags = NULL;
@@ -1004,23 +1034,27 @@ static void handle_sip_response(int fd, struct pbx_state *ps, struct sockaddr_st
         }
 
         /* Send ACK to answering extension */
-        if (msg->contact) {
+        {
+            const char *addr = branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0";
             char ack[512];
             int alen = snprintf(ack, sizeof(ack),
-                "ACK %s SIP/2.0\r\n"
+                "ACK sip:%s@%s SIP/2.0\r\n"
                 "Via: SIP/2.0/UDP %s;branch=z9hG4bKgwack%s\r\n"
-                "From: <sip:gw@pbx>\r\n"
+                "From: %s\r\n"
                 "To: %s\r\n"
                 "Call-ID: %s\r\n"
                 "CSeq: 1 ACK\r\n"
                 "Content-Length: 0\r\n"
                 "\r\n",
-                msg->contact,
-                branch->ext->pbx_addr ? branch->ext->pbx_addr : "0.0.0.0",
+                branch->ext->extension, addr,
+                addr,
                 branch->sip_call_id,
-                msg->to ? msg->to : "",
+                branch->callee_from ? branch->callee_from : "<sip:gw@pbx>",
+                branch->callee_to ? branch->callee_to : "<sip:unknown>",
                 branch->sip_call_id);
             send_sip(fd, &branch->ext->remote_addr, ack, alen);
+            log_info("pbx: sent ACK to ext %s for backbone call %s",
+                     branch->ext->extension, call->backbone_call_id);
         }
 
         /* Cancel all other pending branches */
@@ -1258,9 +1292,10 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
     for (struct gw_ext *e = ps->config->extensions; e; e = e->next) {
         if (e->registered) n_ext++;
     }
+    log_info("pbx: backbone invite: %d registered extension(s) for did=%s", n_ext, did);
 
     if (n_ext == 0) {
-        (void)0; /* no registered extensions */
+        log_warn("pbx: no registered extensions, cancelling call %s", call_id);
         backbone_send_cancel(ps->backbone, call_id);
         return;
     }
@@ -1299,6 +1334,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         branch->rtp = rtp_alloc(&ps->rtp_ctx);
 
         if (!branch->rtp) {
+            log_warn("pbx: failed to allocate RTP for ext %s, skipping", e->extension);
             free(branch->sip_call_id);
             free(branch);
             continue;
@@ -1337,7 +1373,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
             "\r\n",
             e->extension, e->pbx_addr ? e->pbx_addr : "0.0.0.0",
             e->pbx_addr ? e->pbx_addr : "0.0.0.0", branch->sip_call_id,
-            cid, call_id,
+            did, branch->sip_call_id,
             e->extension, e->pbx_addr ? e->pbx_addr : "0.0.0.0",
             branch->sip_call_id,
             e->pbx_addr ? e->pbx_addr : "0.0.0.0",
@@ -1349,6 +1385,7 @@ static void handle_backbone_invite(struct pbx_state *ps, const char *call_id,
         }
 
         send_sip(e->sip_fd, &e->remote_addr, invite, ilen);
+        log_info("pbx: sent INVITE to ext %s (sip_fd=%d, ilen=%d)", e->extension, e->sip_fd, ilen);
         branch->invite_sent = 1;
         branch->next = call->branches;
         call->branches = branch;
