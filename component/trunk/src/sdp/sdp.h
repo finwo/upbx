@@ -15,10 +15,14 @@ struct sdp_info {
     char *c_addr;     // connection address from c= line
     int   m_port;     // port from first m= line
 
+    /* payload types parsed from m= line */
+    int   m_pts[MAX_CODEC_TAGS];
+    int   m_pt_count;
+
     /* codec tags from a=rtpmap lines */
     struct codec_tag codecs[MAX_CODEC_TAGS];
     int codec_count;
-    char media_type[16]; // from m= line ("audio", "video")
+    char media_type[16]; // from m= line (any RFC 4566 token)
 };
 
 struct sdp_info *sdp_parse(const char *body, int len);

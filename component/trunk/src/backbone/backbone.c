@@ -23,8 +23,10 @@
 #define PBKDF2_ITERATIONS   10000
 
 // Forward-declared callbacks from trunk (defined in trunk.c)
-extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id);
-extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id);
+extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id,
+                                    const char *codec_tags);
+extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id,
+                                    const char *codec_tags);
 extern void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id);
 extern void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, const uint8_t *data, size_t len);
 extern void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id);
@@ -160,12 +162,24 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
         trunk_on_backbone_invite(bs->trunk, call_id, did, cid, p);
     } else if (strcmp(cmd, "ringing") == 0) {
         char call_id[256] = {0};
-        if (sscanf(arg, "%255s", call_id) < 1) return;
-        trunk_on_backbone_ringing(bs->trunk, call_id);
+        const char *p = arg;
+        const char *space = strchr(p, ' ');
+        size_t id_len = space ? (size_t)(space - p) : strlen(p);
+        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+        memcpy(call_id, p, id_len);
+        call_id[id_len] = '\0';
+        const char *tags = space ? space + 1 : "";
+        trunk_on_backbone_ringing(bs->trunk, call_id, tags);
     } else if (strcmp(cmd, "answer") == 0) {
         char call_id[256] = {0};
-        if (sscanf(arg, "%255s", call_id) < 1) return;
-        trunk_on_backbone_answer(bs->trunk, call_id);
+        const char *p = arg;
+        const char *space = strchr(p, ' ');
+        size_t id_len = space ? (size_t)(space - p) : strlen(p);
+        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+        memcpy(call_id, p, id_len);
+        call_id[id_len] = '\0';
+        const char *tags = space ? space + 1 : "";
+        trunk_on_backbone_answer(bs->trunk, call_id, tags);
     } else if (strcmp(cmd, "cancel") == 0) {
         trunk_on_backbone_cancel(bs->trunk, arg);
     } else if (strcmp(cmd, "media") == 0) {

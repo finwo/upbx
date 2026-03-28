@@ -44,8 +44,10 @@ void trunk_on_backbone_invite(struct trunk_state *ts, const char *call_id,
                               const char *did, const char *cid,
                               const char *tags_str);
 
-void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id);
-void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id);
+void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id,
+                               const char *codec_tags);
+void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id,
+                              const char *codec_tags);
 void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id);
 void trunk_on_backbone_media(struct trunk_state *s, const char *call_id,
                              const uint8_t *data, size_t len);

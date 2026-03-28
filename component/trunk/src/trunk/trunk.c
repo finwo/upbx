@@ -701,9 +701,21 @@ int trunk_delay_task(int64_t ts, struct pt_task *pt) {
     return SCHED_RUNNING;
 }
 
-void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id) {
+void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id,
+                              const char *codec_tags) {
     struct trunk_call *call = call_lookup(s->calls, call_id);
     if (!call) return;
+
+    char sdp_body[2048] = {0};
+    int sdp_len = 0;
+    if (codec_tags && codec_tags[0] && call->rtp) {
+        struct codec_tag tags[MAX_CODEC_TAGS];
+        int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
+        if (tag_count > 0) {
+            build_sdp_body(sdp_body, sizeof(sdp_body), call->rtp, s->listen_addr, tags, tag_count);
+            sdp_len = (int)strlen(sdp_body);
+        }
+    }
 
     char ringing[1024];
     int rlen = snprintf(ringing, sizeof(ringing),
@@ -713,22 +725,40 @@ void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id) {
         "To: %s\r\n"
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
-        "Content-Length: 0\r\n"
-        "\r\n",
+        "%s"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
         call->trunk_via  ? call->trunk_via  : "",
         call->trunk_from ? call->trunk_from : "",
         call->trunk_to   ? call->trunk_to   : "",
         call->sip_call_id,
-        call->cseq_num);
+        call->cseq_num,
+        sdp_len > 0 ? "Content-Type: application/sdp\r\n" : "",
+        sdp_len,
+        sdp_len > 0 ? sdp_body : "");
+
     send_sip(call->trunk_fd, &call->trunk_addr, ringing, rlen);
     log_info("trunk: sent 180 Ringing to provider for %s", call_id);
 }
 
-void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id) {
+void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id,
+                             const char *codec_tags) {
     struct trunk_call *call = call_lookup(s->calls, call_id);
     if (!call) return;
 
     call->state = CALL_ACTIVE;
+
+    char sdp_body[2048] = {0};
+    int sdp_len = 0;
+    if (codec_tags && codec_tags[0] && call->rtp) {
+        struct codec_tag tags[MAX_CODEC_TAGS];
+        int tag_count = codec_tags_from_string(codec_tags, tags, MAX_CODEC_TAGS);
+        if (tag_count > 0) {
+            build_sdp_body(sdp_body, sizeof(sdp_body), call->rtp, s->listen_addr, tags, tag_count);
+            sdp_len = (int)strlen(sdp_body);
+        }
+    }
 
     char resp[4096];
     int rlen = snprintf(resp, sizeof(resp),
@@ -739,15 +769,20 @@ void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id) {
         "Call-ID: %s\r\n"
         "CSeq: %d INVITE\r\n"
         "Contact: <sip:%s@%s>\r\n"
-        "Content-Length: 0\r\n"
-        "\r\n",
+        "%s"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
         call->trunk_via ? call->trunk_via : "",
         call->trunk_from ? call->trunk_from : "",
         call->trunk_to ? call->trunk_to : "",
         call->sip_call_id,
         call->cseq_num,
         s->config->target && s->config->target->username ? s->config->target->username : "",
-        s->listen_addr);
+        s->listen_addr,
+        sdp_len > 0 ? "Content-Type: application/sdp\r\n" : "",
+        sdp_len,
+        sdp_len > 0 ? sdp_body : "");
 
     send_sip(call->trunk_fd, &call->trunk_addr, resp, rlen);
     log_info("trunk: answered call %s to provider", call_id);

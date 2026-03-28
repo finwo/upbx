@@ -4,6 +4,35 @@
 #include <ctype.h>
 #include "sdp/sdp.h"
 
+static const struct { int pt; const char *codec; } static_codecs[] = {
+    { 0,  "PCMU/8000" },
+    { 3,  "GSM/8000" },
+    { 4,  "G723/8000" },
+    { 5,  "DVI4/8000" },
+    { 6,  "DVI4/16000" },
+    { 7,  "LPC/8000" },
+    { 8,  "PCMA/8000" },
+    { 9,  "G722/8000" },
+    { 10, "L16/44100" },
+    { 11, "L16/44100" },
+    { 12, "QCELP/8000" },
+    { 13, "CN/8000" },
+    { 14, "MPA/90000" },
+    { 15, "G728/8000" },
+    { 16, "DVI4/11025" },
+    { 17, "DVI4/22050" },
+    { 18, "G729/8000" },
+    { 25, "CELLB/90000" },
+    { 26, "JPEG/90000" },
+    { 28, "nv/90000" },
+    { 31, "H261/90000" },
+    { 32, "MPV/90000" },
+    { 33, "MP2T/90000" },
+    { 34, "H263/90000" },
+};
+
+static const int static_codec_count = sizeof(static_codecs) / sizeof(static_codecs[0]);
+
 struct sdp_info *sdp_parse(const char *body, int len) {
     struct sdp_info *info = calloc(1, sizeof(struct sdp_info));
     if (!info) return NULL;
@@ -37,16 +66,39 @@ struct sdp_info *sdp_parse(const char *body, int len) {
             }
         }
 
-        /* m=<type> <port> ... */
-        if (!info->m_port && line_len > 8 && line[0] == 'm' && line[1] == '=') {
-            if (memcmp(line + 2, "audio ", 6) == 0) {
-                const char *cp = line + 8;
-                info->m_port = atoi(cp);
-                memcpy(info->media_type, "audio", 6);
-            } else if (memcmp(line + 2, "video ", 6) == 0) {
-                const char *cp = line + 8;
-                info->m_port = atoi(cp);
-                memcpy(info->media_type, "video", 6);
+        /* m=<type> <port> <protocol> <pt> [<pt>]... */
+        if (!info->m_port && line_len > 2 && line[0] == 'm' && line[1] == '=') {
+            const char *cp = line + 2;
+            const char *cend = line + line_len;
+
+            /* extract media type token */
+            const char *space = memchr(cp, ' ', cend - cp);
+            size_t tok_len = space ? (size_t)(space - cp) : (size_t)(cend - cp);
+            if (tok_len > 0 && tok_len < sizeof(info->media_type)) {
+                memcpy(info->media_type, cp, tok_len);
+                info->media_type[tok_len] = '\0';
+            }
+
+            /* skip to port */
+            cp = space ? space + 1 : cp + tok_len;
+            info->m_port = atoi(cp);
+
+            /* skip port and find protocol */
+            while (cp < cend && !isspace((unsigned char)*cp)) cp++;
+            while (cp < cend && isspace((unsigned char)*cp)) cp++;
+
+            /* skip protocol (e.g. "RTP/AVP") */
+            while (cp < cend && !isspace((unsigned char)*cp)) cp++;
+            while (cp < cend && isspace((unsigned char)*cp)) cp++;
+
+            /* extract all payload types */
+            while (cp < cend && info->m_pt_count < MAX_CODEC_TAGS) {
+                int pt = atoi(cp);
+                if (pt >= 0 && pt <= 127) {
+                    info->m_pts[info->m_pt_count++] = pt;
+                }
+                while (cp < cend && !isspace((unsigned char)*cp)) cp++;
+                while (cp < cend && isspace((unsigned char)*cp)) cp++;
             }
         }
 
@@ -75,6 +127,35 @@ struct sdp_info *sdp_parse(const char *body, int len) {
         }
 
         p = nl + 1;
+    }
+
+    /* resolve static payload types that have no rtpmap entry */
+    for (int i = 0; i < info->m_pt_count && info->codec_count < MAX_CODEC_TAGS; i++) {
+        int pt = info->m_pts[i];
+
+        /* check if already in codecs via rtpmap */
+        int found = 0;
+        for (int j = 0; j < info->codec_count; j++) {
+            if (info->codecs[j].stream_id == pt) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) continue;
+
+        /* look up static codec */
+        for (int k = 0; k < static_codec_count; k++) {
+            if (static_codecs[k].pt == pt) {
+                struct codec_tag *tag = &info->codecs[info->codec_count];
+                tag->stream_id = pt;
+                strncpy(tag->media_type, info->media_type[0] ? info->media_type : "audio", 15);
+                tag->media_type[15] = '\0';
+                strncpy(tag->codec, static_codecs[k].codec, sizeof(tag->codec) - 1);
+                tag->codec[sizeof(tag->codec) - 1] = '\0';
+                info->codec_count++;
+                break;
+            }
+        }
     }
 
     return info;
