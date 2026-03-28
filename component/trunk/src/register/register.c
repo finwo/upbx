@@ -28,32 +28,16 @@ static void send_raw_register(struct trunk_state *ts, const char *authorization)
     const char *host = target->host ? target->host : "localhost";
     const char *auth_hdr = authorization ? authorization : "";
 
-    /* Use NAT-detected public address if available, otherwise listen_addr */
-    const char *contact_addr;
-    if (ts->public_addr[0] && ts->public_port > 0) {
-        contact_addr = ts->public_addr;
-    } else {
-        contact_addr = ts->listen_addr;
-    }
-    int contact_port = ts->public_port > 0 ? ts->public_port : 0;
+    /* Use listen_addr for Contact and Via */
+    const char *contact_addr = ts->listen_addr;
 
     /* Build Via */
     char via[256];
-    if (contact_port) {
-        snprintf(via, sizeof(via), "SIP/2.0/UDP %s:%d;rport;branch=z9hG4bKreg",
-                 contact_addr, contact_port);
-    } else {
-        snprintf(via, sizeof(via), "SIP/2.0/UDP %s;rport;branch=z9hG4bKreg",
-                 contact_addr);
-    }
+    snprintf(via, sizeof(via), "SIP/2.0/UDP %s;rport;branch=z9hG4bKreg", contact_addr);
 
     /* Build Contact */
     char contact[256];
-    if (contact_port) {
-        snprintf(contact, sizeof(contact), "<sip:%s@%s:%d>", user, contact_addr, contact_port);
-    } else {
-        snprintf(contact, sizeof(contact), "<sip:%s@%s>", user, contact_addr);
-    }
+    snprintf(contact, sizeof(contact), "<sip:%s@%s>", user, contact_addr);
 
     char buf[2048];
     int off = snprintf(buf, sizeof(buf),
@@ -86,8 +70,6 @@ static void send_raw_register(struct trunk_state *ts, const char *authorization)
     log_info("register: sent REGISTER%s to %s (%zd bytes)",
              authorization ? " with auth" : "", host, sent);
     log_debug("sip: >>> %s", buf);
-
-    ts->reg_last_send = (int64_t)time(NULL) * 1000;
 }
 
 void trunk_send_register(struct trunk_state *ts) {

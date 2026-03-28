@@ -11,3 +11,5 @@ cofyc/argparse https://git.finwo.net/misc/dep-repository/archives/heads/pkg/cofy
 finwo/url-parser https://git.finwo.net/lib/url-parser.c/archives/heads/main.tar.gz
 
 rxi/log https://git.finwo.net/misc/dep-repository/archives/heads/pkg/rxi/log.tar.gz
+
+finwo/mindex https://git.finwo.net/lib/mindex.c/archives/heads/main.tar.gz

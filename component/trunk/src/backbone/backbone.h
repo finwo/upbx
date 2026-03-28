@@ -37,7 +37,7 @@ void backbone_send_invite(struct backbone_state *s, const char *call_id,
 void backbone_send_ringing(struct backbone_state *s, const char *call_id, const char *tags);
 void backbone_send_answer(struct backbone_state *s, const char *call_id, const char *tags);
 void backbone_send_cancel(struct backbone_state *s, const char *call_id);
-void backbone_send_media(struct backbone_state *s, const char *call_id, int stream_id, const uint8_t *rtp, size_t len);
+void backbone_send_media(struct backbone_state *s, const char *call_id, const uint8_t *rtp, size_t len);
 void backbone_send_bye(struct backbone_state *s, const char *call_id);
 
 #endif

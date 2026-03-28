@@ -59,12 +59,8 @@ static int rtp_task(int64_t ts, struct pt_task *pt) {
         rp->learned_ext = 1;
     }
 
-    if (rp->is_backbone_dir && rp->backbone) {
-        backbone_send_media(rp->backbone, rp->call_id, rp->stream_id, buf, (size_t)n);
-    } else if (rp->peer && rp->peer->learned_ext) {
-        sendto(rp->peer->fd, buf, n, 0,
-               (struct sockaddr *)&rp->peer->ext_addr,
-               get_addrlen(&rp->peer->ext_addr));
+    if (rp->backbone) {
+        backbone_send_media(rp->backbone, rp->call_id, buf, (size_t)n);
     }
 
     return SCHED_RUNNING;
@@ -73,7 +69,6 @@ static int rtp_task(int64_t ts, struct pt_task *pt) {
 struct rtp_pair *rtp_alloc(struct rtp_alloc_ctx *ctx, int af) {
     struct rtp_pair *rp = calloc(1, sizeof(*rp));
     if (!rp) return NULL;
-    rp->stream_id = -1;
 
     int attempts = 0;
     int port_count = (ctx->port_max - ctx->port_min) / 2 + 1;

@@ -23,10 +23,10 @@
 #define PBKDF2_ITERATIONS   10000
 
 // Forward-declared callbacks from trunk (defined in trunk.c)
-extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id, const char *codec_tags);
-extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id, const char *codec_tags);
+extern void trunk_on_backbone_ringing(struct trunk_state *s, const char *call_id);
+extern void trunk_on_backbone_answer(struct trunk_state *s, const char *call_id);
 extern void trunk_on_backbone_cancel(struct trunk_state *s, const char *call_id);
-extern void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, int stream_id, const uint8_t *data, size_t len);
+extern void trunk_on_backbone_media(struct trunk_state *s, const char *call_id, const uint8_t *data, size_t len);
 extern void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id);
 
 // hex helpers
@@ -157,35 +157,20 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
             p = "";
         }
 
-        trunk_handle_backbone_invite(bs->trunk, call_id, did, cid, p);
+        trunk_on_backbone_invite(bs->trunk, call_id, did, cid, p);
     } else if (strcmp(cmd, "ringing") == 0) {
-        // Format: ringing <call_id> [<codec_tags>]
         char call_id[256] = {0};
-        const char *p = arg;
-        const char *space = strchr(p, ' ');
-        size_t id_len = space ? (size_t)(space - p) : strlen(p);
-        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
-        memcpy(call_id, p, id_len);
-        call_id[id_len] = '\0';
-        const char *tags = space ? space + 1 : "";
-        trunk_on_backbone_ringing(bs->trunk, call_id, tags);
+        if (sscanf(arg, "%255s", call_id) < 1) return;
+        trunk_on_backbone_ringing(bs->trunk, call_id);
     } else if (strcmp(cmd, "answer") == 0) {
-        // Format: answer <call_id> [<codec_tags>]
         char call_id[256] = {0};
-        const char *p = arg;
-        const char *space = strchr(p, ' ');
-        size_t id_len = space ? (size_t)(space - p) : strlen(p);
-        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
-        memcpy(call_id, p, id_len);
-        call_id[id_len] = '\0';
-        const char *tags = space ? space + 1 : "";
-        trunk_on_backbone_answer(bs->trunk, call_id, tags);
+        if (sscanf(arg, "%255s", call_id) < 1) return;
+        trunk_on_backbone_answer(bs->trunk, call_id);
     } else if (strcmp(cmd, "cancel") == 0) {
         trunk_on_backbone_cancel(bs->trunk, arg);
     } else if (strcmp(cmd, "media") == 0) {
-        // Format: media <call_id> [<stream_id>] data:;hex,<hex>
+        // Format: media <call_id> data:;hex,<hex>
         char call_id[256] = {0};
-        int stream_id = -1;
 
         const char *p = arg;
         const char *space1 = strchr(p, ' ');
@@ -195,21 +180,13 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
         memcpy(call_id, p, id_len);
         call_id[id_len] = '\0';
 
-        /* after call_id: either "data:;hex,<hex>" or "<stream_id> data:;hex,<hex>" */
         p = space1 + 1;
         while (*p == ' ') p++;
-
-        if (isdigit((unsigned char)*p)) {
-            stream_id = atoi(p);
-            while (isdigit((unsigned char)*p)) p++;
-            while (*p == ' ') p++;
-        }
 
         const char *hex_tag = "data:;";
         const char *found = strstr(p, hex_tag);
         if (!found) return;
         const char *hex_start = found + strlen(hex_tag);
-        /* skip datatype;hex, */
         const char *hex_comma = strchr(hex_start, ',');
         if (!hex_comma) return;
         hex_start = hex_comma + 1;
@@ -219,7 +196,7 @@ static void dispatch_line(struct backbone_state *bs, const char *line) {
         if (!raw) return;
         int raw_len = hex_decode(hex_start, raw, hex_len / 2 + 1);
         if (raw_len > 0) {
-            trunk_on_backbone_media(bs->trunk, call_id, stream_id, raw, (size_t)raw_len);
+            trunk_on_backbone_media(bs->trunk, call_id, raw, (size_t)raw_len);
         }
         free(raw);
     } else if (strcmp(cmd, "bye") == 0) {
@@ -276,7 +253,7 @@ void backbone_send_cancel(struct backbone_state *s, const char *call_id) {
     backbone_send_line(s, line, len);
 }
 
-void backbone_send_media(struct backbone_state *s, const char *call_id, int stream_id, const uint8_t *rtp, size_t len) {
+void backbone_send_media(struct backbone_state *s, const char *call_id, const uint8_t *rtp, size_t len) {
     size_t hex_len = len * 2 + 1;
     char *hex_buf = malloc(hex_len);
     if (!hex_buf) return;
@@ -285,11 +262,7 @@ void backbone_send_media(struct backbone_state *s, const char *call_id, int stre
     size_t line_cap = strlen(call_id) + hex_len + 48;
     char *line = malloc(line_cap);
     if (!line) { free(hex_buf); return; }
-    int line_len;
-    if (stream_id >= 0)
-        line_len = snprintf(line, line_cap, "media %s %d data:;hex,%s\n", call_id, stream_id, hex_buf);
-    else
-        line_len = snprintf(line, line_cap, "media %s data:;hex,%s\n", call_id, hex_buf);
+    int line_len = snprintf(line, line_cap, "media %s data:;hex,%s\n", call_id, hex_buf);
 
     backbone_send_line(s, line, line_len);
     free(line);

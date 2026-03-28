@@ -6,7 +6,7 @@
 #include <sys/socket.h>
 #include "finwo/scheduler.h"
 
-struct backbone_state; // forward
+struct backbone_state;
 
 struct rtp_pair {
     int fd;
@@ -16,12 +16,8 @@ struct rtp_pair {
     int addr_from_sdp;
     struct backbone_state *backbone;
     char call_id[64];
-    int stream_id;           // RTP payload type, -1 if unknown
-    int is_backbone_dir;
-    int logged_incoming;     // diagnostics: first inbound RTP logged
-    struct rtp_pair *peer;
+    int logged_incoming;
     pt_task_t *task;
-    struct rtp_pair *next;
 };
 
 struct rtp_alloc_ctx {
