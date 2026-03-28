@@ -504,6 +504,9 @@ static void handle_sip_invite(int fd, struct trunk_state *ts, struct sockaddr_st
     if (msg->from)    call->trunk_from    = strdup(msg->from);
     if (msg->contact) call->trunk_contact = strdup(msg->contact);
 
+    /* Generate branch for Via in subsequent requests (BYE, etc.) */
+    generate_hex_id(call->branch, sizeof(call->branch));
+
     /* Build to-tag */
     generate_hex_id(call->gw_tag, sizeof(call->gw_tag));
     {
@@ -1012,25 +1015,51 @@ void trunk_on_backbone_bye(struct trunk_state *s, const char *call_id) {
 
      /* Send BYE to trunk */
      if (call->trunk_fd >= 0) {
-         const char *host = s->config->target ? s->config->target->host : "0.0.0.0";
          char bye[1024];
-         int blen = snprintf(bye, sizeof(bye),
-             "BYE sip:%s@%s SIP/2.0\r\n"
-             "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
-             "Max-Forwards: 70\r\n"
-             "From: <sip:%s@%s>;tag=%s\r\n"
-             "To: %s\r\n"
-             "Call-ID: %s\r\n"
-             "CSeq: %d BYE\r\n"
-             "Content-Length: 0\r\n"
-             "\r\n",
-             call->trunk_did ? call->trunk_did : "?",
-             host,
-             s->listen_addr, call->branch,
-             call->trunk_cid ? call->trunk_cid : (s->config->target && s->config->target->username ? s->config->target->username : "trunk"), s->listen_addr, call->from_tag,
-             call->trunk_to ? call->trunk_to : "",
-             call->sip_call_id,
-             call->cseq_num + 1);
+         int blen;
+
+         if (call->direction == CALL_INCOMING) {
+             /* Incoming call: dialog was established with us as callee.
+              * From = our identity (trunk_to has full header with gw_tag),
+              * To = remote's identity (trunk_from has full header with their tag). */
+             blen = snprintf(bye, sizeof(bye),
+                 "BYE sip:%s SIP/2.0\r\n"
+                 "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
+                 "Max-Forwards: 70\r\n"
+                 "From: %s\r\n"
+                 "To: %s\r\n"
+                 "Call-ID: %s\r\n"
+                 "CSeq: %d BYE\r\n"
+                 "Content-Length: 0\r\n"
+                 "\r\n",
+                 call->trunk_did ? call->trunk_did : "?",
+                 s->listen_addr, call->branch,
+                 call->trunk_to ? call->trunk_to : "",
+                 call->trunk_from ? call->trunk_from : "",
+                 call->sip_call_id,
+                 call->cseq_num + 1);
+         } else {
+             /* Outgoing call: dialog was established with us as caller.
+              * From = username + from_tag, To = remote with tag from 200 OK. */
+             const char *host = s->config->target ? s->config->target->host : "0.0.0.0";
+             blen = snprintf(bye, sizeof(bye),
+                 "BYE sip:%s@%s SIP/2.0\r\n"
+                 "Via: SIP/2.0/UDP %s;branch=z9hG4bKbye%s\r\n"
+                 "Max-Forwards: 70\r\n"
+                 "From: <sip:%s@%s>;tag=%s\r\n"
+                 "To: %s\r\n"
+                 "Call-ID: %s\r\n"
+                 "CSeq: %d BYE\r\n"
+                 "Content-Length: 0\r\n"
+                 "\r\n",
+                 call->trunk_did ? call->trunk_did : "?",
+                 host,
+                 s->listen_addr, call->branch,
+                 call->trunk_cid ? call->trunk_cid : (s->config->target && s->config->target->username ? s->config->target->username : "trunk"), s->listen_addr, call->from_tag,
+                 call->trunk_to ? call->trunk_to : "",
+                 call->sip_call_id,
+                 call->cseq_num + 1);
+         }
         send_sip(call->trunk_fd, &call->trunk_addr, bye, blen);
         log_info("trunk: sent BYE to upstream for %s", call->backbone_call_id);
     }
